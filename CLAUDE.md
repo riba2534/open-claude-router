@@ -92,8 +92,8 @@ Claude Code 客户端会带 `anthropic-version`、`anthropic-beta`、`x-stainles
 | 改字段剥除规则 | `src/utils/strip.ts` |
 | 改超时 / abort / 错误映射 | `src/utils/upstream.ts` |
 | 改 token 估算 | `src/utils/tokenizer.ts` |
-| 改 Anthropic ↔ unified 协议转换 | `src/transformers/anthropic.ts`（外部移植代码，慎改） |
-| 改 unified ↔ Responses 协议转换 | `src/transformers/responses.ts`（外部移植代码，慎改） |
+| 改 Anthropic ↔ unified 协议转换 | `src/transformers/anthropic.ts`（vendor 自 [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router)，慎改） |
+| 改 unified ↔ Responses 协议转换 | `src/transformers/responses.ts`（vendor 自 [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router)，慎改） |
 
 模块系统是 ESM（`"type": "module"`），源码 import 必须带 `.js` 扩展名后缀（TS 编译后生效）。新功能优先看 transformer vendor 里是否已有可复用的方法，不要自己实现 SSE 解析。
 
@@ -106,15 +106,15 @@ Claude Code 客户端会带 `anthropic-version`、`anthropic-beta`、`x-stainles
 
 路由层、auth 层、utils 都不动——这是 `X-Upstream-Format` header 设计的扩展点。
 
-### 移植 transformer 的 cheat sheet
+### Vendor [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router) transformer 的 cheat sheet
 
-外部源码有 bug fix / 新能力时整体重新移植，避免局部 patch 与原版漂移。每次移植至少要做这些**类型层修复**（运行时等价）才能过 `tsc --strict`：
+上游有 bug fix / 新能力时整体重新 vendor（源文件在 `packages/core/src/transformer/`），避免局部 patch 与上游漂移。每次 vendor 至少要做这些**类型层修复**（运行时等价）才能过 `tsc --strict`：
 
 | 必修 | 位置 | 改成 |
 |---|---|---|
 | import 路径 | 文件头 | `@/types/...` → `../types/.../js`，`@/api/middleware` → `./errors.js`，`@/utils/...` → `./...js` |
 | `import { ChatCompletion }` | 头部 | `import type { ChatCompletion }` |
-| `logger?: any;` 字段声明 | 类定义内 | 显式声明，TS strict 才能编译过（原版常未声明） |
+| `logger?: any;` 字段声明 | 类定义内 | 显式声明，TS strict 才能编译过（上游原版常未声明） |
 | `this.logger.debug(...)` 无可选链 | 类内多处 | 改成 `this.logger?.debug(...)`（防御）；同时 `routes/messages.ts` 实例化时赋 logger 仍是必需 |
 | 残留 `console.log(...)` | 偶发 | 删除 |
 | Stream event 接口缺字段 | 接口定义 | 按代码实际访问的字段补齐（如 Responses 的 `annotation?` / `part?`） |
