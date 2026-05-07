@@ -1,0 +1,31 @@
+{
+  "name": "open-claude-router",
+  "version": "0.1.0",
+  "description": "Stateless Anthropic <-> OpenAI protocol bridge for Claude Code. All upstream info passed per-request via headers.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "esbuild src/server.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/server.js --packages=external",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "fastify": "^5.1.0",
+    "js-tiktoken": "^1.0.16",
+    "undici": "^7.1.0",
+    "uuid": "^11.0.3"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "@types/node": "^22.10.0",
+    "@types/uuid": "^10.0.0",
+    "esbuild": "^0.24.0",
+    "openai": "^4.73.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
