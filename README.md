@@ -51,26 +51,28 @@ flowchart LR
 
 ### 1. 启动服务
 
-使用预构建镜像（[Dockerhub](https://hub.docker.com/r/riba2534/open-claude-router)，amd64 + arm64）：
+推荐用 Docker 一键启动（镜像在 [Dockerhub](https://hub.docker.com/r/riba2534/open-claude-router)，amd64 + arm64 双架构）：
 
 ```bash
 docker run -d --name ocr --restart unless-stopped -p 3457:3457 \
   riba2534/open-claude-router:latest
 ```
 
-本地构建：
+服务监听 `:3457`，零配置即可使用。公网部署可加 `-e OCR_ACCESS_TOKENS=token1,token2` 启用访问鉴权。
+
+<details>
+<summary>开发者：自己构建 / 用 npm 跑</summary>
 
 ```bash
+# 自己构建镜像
 docker build -t open-claude-router .
 docker run -d --name ocr --restart unless-stopped -p 3457:3457 open-claude-router
-```
 
-或直接 npm（开发用）：
-
-```bash
+# 或直接用 npm 跑（tsx watch 模式）
 npm install
-npm run dev          # 默认监听 :3457
+npm run dev
 ```
+</details>
 
 ### 2. 配置 Claude Code alias
 
