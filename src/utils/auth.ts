@@ -7,6 +7,26 @@ export interface UpstreamConfig {
   model?: string;
 }
 
+export type UpstreamFormat = "chat-completions" | "responses";
+
+/**
+ * Parse the optional `X-Upstream-Format` header. Default `chat-completions`
+ * (current behaviour for all existing aliases). `responses` opts in to the
+ * OpenAI Responses API protocol path. Unknown values reject with 400.
+ */
+export function parseUpstreamFormat(req: FastifyRequest): UpstreamFormat {
+  const v = req.headers["x-upstream-format"];
+  const raw = (Array.isArray(v) ? v[0] : v ?? "").trim().toLowerCase();
+  if (raw === "" || raw === "chat-completions") return "chat-completions";
+  if (raw === "responses") return "responses";
+  throw createApiError(
+    `unknown X-Upstream-Format value: ${raw} (expected 'chat-completions' or 'responses')`,
+    400,
+    "invalid_upstream_format",
+    "invalid_request_error",
+  );
+}
+
 export function parseAccessTokens(env: string | undefined): Set<string> {
   if (!env) return new Set();
   return new Set(

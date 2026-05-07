@@ -28,6 +28,7 @@
 - **零配置**：服务侧不存任何 API Key，所有信息由客户端逐请求传入
 - **任意 Authorization 格式**：标准 `Bearer sk-...`、企业网关常见的非 Bearer 自定义协议头都能原样透传
 - **完整覆盖 Claude Code 协议**：流式 SSE、工具调用（`tool_use` / `tool_result` 双向增量）、多模态图片、prompt cache 字段、`thinking` 块
+- **同时支持 OpenAI 两套协议**：默认走 Chat Completions（兼容字节 AI Gateway / OpenRouter / Kimi / DeepSeek 等所有第三方上游），通过 `X-Upstream-Format: responses` opt-in 切到 Responses API（OpenAI o-series / gpt-5 原生协议，含 reasoning summary 转 Anthropic `thinking` 块）
 - **两种接入方式**：上游信息可以放 HTTP header，也可以直接拼在 URL path 里
 - **轻量好部署**：esbuild 打包后单文件 ~45 KB，Docker 镜像几十 MB，开箱即用
 
@@ -129,6 +130,23 @@ myocr
 
 正常对话、工具调用、`/model` 切换都会被透明转换。`ANTHROPIC_DEFAULT_*_MODEL` 各自对应不同场景（默认 / `/model sonnet` / `/model opus` / 后台 haiku 任务），上游收到的 model 字段就是当前场景对应的那个，可以填不同模型名分场景路由。
 
+### 接 OpenAI Responses API（o3 / gpt-5 等原生 reasoning 模型）
+
+OpenAI Chat Completions 是上面所有示例默认走的协议，覆盖绝大多数兼容上游。如果你接的是 OpenAI **Responses API**（`/v1/responses`，o-series / gpt-5 原生协议，含 reasoning summary），把 alias 改成下面这样即可——只多一个 `X-Upstream-Format: responses` header：
+
+```bash
+alias myo3="ANTHROPIC_BASE_URL=http://localhost:3457/https://api.openai.com/v1/responses \
+ANTHROPIC_AUTH_TOKEN='Bearer sk-proj-xxxxx' \
+ANTHROPIC_CUSTOM_HEADERS='X-Upstream-Format: responses' \
+ANTHROPIC_MODEL=o3 \
+ANTHROPIC_DEFAULT_SONNET_MODEL=o3 \
+ANTHROPIC_DEFAULT_OPUS_MODEL=o3 \
+ANTHROPIC_DEFAULT_HAIKU_MODEL=o3-mini \
+claude"
+```
+
+服务侧会把 OpenAI Responses 的 `response.reasoning_summary_text.delta` 等事件转成 Anthropic 的 `thinking` 块返回给 Claude Code。其他所有 alias（不带 `X-Upstream-Format` 或显式 `chat-completions`）行为完全不变。
+
 ## API
 
 | Method | Path | 说明 |
@@ -148,6 +166,7 @@ myocr
 | `X-Upstream-Model` | （可选）真实上游模型名；提供则覆盖 body 里的 `model` |
 | `Authorization: Bearer <token>` | （可选）服务自身访问鉴权，仅在 header 模式 + 设置 `OCR_ACCESS_TOKENS` 时校验 |
 | `X-OCR-Token` | （可选）path 模式下的服务自身访问鉴权，仅在 path 模式 + 设置 `OCR_ACCESS_TOKENS` 时校验 |
+| `X-Upstream-Format` | （可选）`chat-completions`（默认）或 `responses`。声明上游用 OpenAI 哪套协议——前者是绝大多数兼容上游用的 `/v1/chat/completions`，后者是 OpenAI o-series / gpt-5 原生的 `/v1/responses` |
 
 ### Path 模式
 

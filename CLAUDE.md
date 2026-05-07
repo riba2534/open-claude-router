@@ -34,13 +34,37 @@ open-claude-router 是一个**无状态**的 Anthropic Messages API ↔ OpenAI C
    - 解析：`src/utils/auth.ts` 的 `parseUpstreamFromEmbeddedPath`
    - **此模式下 Authorization 即上游凭证**。服务自身鉴权（`OCR_ACCESS_TOKENS` 启用时）改读 `X-OCR-Token` header，由 `checkServiceAuthFromOcrTokenHeader` 处理
 
-### 协议转换核心
+### 协议转换核心：双 transformer 协作
 
-`src/transformers/anthropic.ts`（约 1069 行）是 Anthropic ↔ OpenAI 双向转换的实现，包含完整的 SSE 流式状态机（thinking / text / tool_use 三类 content_block 增量对齐）。配套有 `transformers/{thinking,image,errors}.ts` 和 `types/{llm,transformer}.ts`。
+服务有两个 transformer 实例，按对称方向分工：
+
+| Transformer | 文件 | 方向 | 何时介入 |
+|---|---|---|---|
+| `AnthropicTransformer` | `src/transformers/anthropic.ts`（~1069 行） | 客户端方向：Anthropic ↔ unified（unified 形态等同 OpenAI Chat Completions） | **永远介入** |
+| `OpenAIResponsesTransformer` | `src/transformers/responses.ts`（~800 行） | 上游方向：unified ↔ OpenAI Responses 协议 | 仅当 `X-Upstream-Format: responses` |
+
+请求处理流水线（`forwardMessages`）：
+
+```
+client body
+  ↓ anthropic.transformRequestOut
+unified
+  ↓ [if format=responses] responses.transformRequestIn
+upstream-shaped body
+  ↓ fetch upstream
+upstream response
+  ↓ [if format=responses] responses.transformResponseOut
+unified-shaped response
+  ↓ anthropic.transformResponseIn
+client SSE / JSON
+```
+
+`format=chat-completions`（默认）时跳过两个 responses 步骤，unified body / response 直接当 Chat Completions 用——这是绝大多数第三方上游的路径。
 
 修改注意：
-- `transformer.logger` 字段**必须**赋值，类内多处 `this.logger.debug(...)` 不带可选链，未赋值会 runtime crash。`routes/messages.ts` 实例化时已通过 `transformer.logger = fastify.log` 处理。
-- 这部分代码是协议转换的核心、改动有明显的退化风险（流式状态机隐含很多边界条件）。新增上游兼容性问题应优先在 `utils/strip.ts`、`routes/messages.ts` 这一层解决，而不是直接改 transformer。
+- 两个 transformer 的 `logger` 字段都**必须**赋值，类内多处 `this.logger.debug(...)` 不带可选链（responses transformer vendor 时已修成 `?.debug`，但安全起见在 `routes/messages.ts` 中两个实例都统一赋值）。
+- 协议转换是核心、改动有明显退化风险（流式状态机隐含很多边界条件）。新增上游兼容性问题应优先在 `utils/strip.ts`、`routes/messages.ts` 这一层解决，而不是直接改 transformer。
+- `forwardMessages` 的 `format` 参数由 `parseUpstreamFormat(req)` 提取自 `X-Upstream-Format` header，未来如果加新协议（Gemini、Vertex）扩展这一处 + 一个新 transformer 即可，路由层不动。
 
 ### 请求处理流水线
 

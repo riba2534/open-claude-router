@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { AnthropicTransformer } from "../transformers/anthropic.js";
+import { OpenAIResponsesTransformer } from "../transformers/responses.js";
 import { createApiError } from "../transformers/errors.js";
 import {
   checkServiceAuth,
@@ -7,8 +8,10 @@ import {
   isEmbeddedUpstreamPath,
   parseUpstreamConfig,
   parseUpstreamFromEmbeddedPath,
+  parseUpstreamFormat,
   parseAccessTokens,
   type UpstreamConfig,
+  type UpstreamFormat,
 } from "../utils/auth.js";
 import { scrubAnthropicOnlyFields } from "../utils/strip.js";
 import {
@@ -27,7 +30,9 @@ interface MessagesBody {
 async function forwardMessages(
   req: FastifyRequest<{ Body: MessagesBody }>,
   reply: FastifyReply,
-  transformer: AnthropicTransformer,
+  anthropicT: AnthropicTransformer,
+  responsesT: OpenAIResponsesTransformer,
+  format: UpstreamFormat,
   upstream: UpstreamConfig,
 ) {
   const body = req.body;
@@ -41,24 +46,39 @@ async function forwardMessages(
   }
   const wantsStream = body.stream === true;
 
-  const unified = await transformer.transformRequestOut!(body);
+  // Step 1: Anthropic body -> unified (== OpenAI Chat Completions shape)
+  const unified = await anthropicT.transformRequestOut!(body);
   if (upstream.model) {
     unified.model = upstream.model;
   }
   scrubAnthropicOnlyFields(unified as unknown as Record<string, unknown>);
 
+  // Step 2: unified -> upstream-specific shape (only needed for Responses API).
+  // For chat-completions, unified IS already the OpenAI Chat Completions format,
+  // so we send it directly.
+  let outboundBody: any = unified;
+  if (format === "responses") {
+    outboundBody = await responsesT.transformRequestIn!(unified as any);
+  }
+
   req.log.info(
-    { model: unified.model, stream: wantsStream, upstream: upstream.url },
+    {
+      model: unified.model,
+      stream: wantsStream,
+      upstream: upstream.url,
+      format,
+    },
     "forwarding",
   );
 
+  // Step 3: fetch upstream
   const signal = buildUpstreamSignal(req);
   let upstreamResponse: Response;
   try {
     upstreamResponse = await callUpstream({
       url: upstream.url,
       authorization: upstream.authorization,
-      body: unified,
+      body: outboundBody,
       signal,
     });
   } catch (err: any) {
@@ -80,8 +100,17 @@ async function forwardMessages(
     return errBody;
   }
 
-  const finalResponse = await transformer.transformResponseIn!(
-    upstreamResponse,
+  // Step 4: upstream response -> unified (only needed for Responses API).
+  let upstreamForAnthropic = upstreamResponse;
+  if (format === "responses") {
+    upstreamForAnthropic = await responsesT.transformResponseOut!(
+      upstreamResponse,
+    );
+  }
+
+  // Step 5: unified -> Anthropic SSE / JSON
+  const finalResponse = await anthropicT.transformResponseIn!(
+    upstreamForAnthropic,
     { req },
   );
 
@@ -133,10 +162,15 @@ export async function registerMessagesRoute(fastify: FastifyInstance) {
     );
   }
 
-  const transformer = new AnthropicTransformer({});
-  // The transformer calls this.logger.debug(...) without optional chaining
-  // in several places, so a logger must be assigned before any request hits.
-  transformer.logger = fastify.log;
+  // Anthropic transformer: client-side direction (Anthropic <-> unified).
+  // Always involved.
+  const anthropicTransformer = new AnthropicTransformer({});
+  anthropicTransformer.logger = fastify.log;
+
+  // Responses transformer: upstream-side direction (unified <-> OpenAI Responses).
+  // Engaged only when X-Upstream-Format: responses.
+  const responsesTransformer = new OpenAIResponsesTransformer();
+  responsesTransformer.logger = fastify.log;
 
   // Header mode: explicit X-Upstream-* headers; service token whitelist applies.
   fastify.post(
@@ -146,8 +180,16 @@ export async function registerMessagesRoute(fastify: FastifyInstance) {
       reply: FastifyReply,
     ) => {
       checkServiceAuth(req, accessTokens);
+      const format = parseUpstreamFormat(req);
       const upstream = parseUpstreamConfig(req);
-      return forwardMessages(req, reply, transformer, upstream);
+      return forwardMessages(
+        req,
+        reply,
+        anthropicTransformer,
+        responsesTransformer,
+        format,
+        upstream,
+      );
     },
   );
 
@@ -177,11 +219,19 @@ export async function registerMessagesRoute(fastify: FastifyInstance) {
         );
       }
       checkServiceAuthFromOcrTokenHeader(req, accessTokens);
+      const format = parseUpstreamFormat(req);
       const { upstream, endpoint } = parseUpstreamFromEmbeddedPath(req);
       if (endpoint === "count_tokens") {
         return handleCountTokens(req, reply);
       }
-      return forwardMessages(req, reply, transformer, upstream);
+      return forwardMessages(
+        req,
+        reply,
+        anthropicTransformer,
+        responsesTransformer,
+        format,
+        upstream,
+      );
     },
   );
 }
