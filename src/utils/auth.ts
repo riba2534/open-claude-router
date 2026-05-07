@@ -43,6 +43,32 @@ export function checkServiceAuth(
   }
 }
 
+/**
+ * Service-side access-token check for embedded-path mode. The standard
+ * `Authorization` header is consumed as the upstream credential in this mode,
+ * so we read the service-side token from `X-OCR-Token` instead.
+ *
+ * No-op when the whitelist is empty (i.e. `OCR_ACCESS_TOKENS` unset).
+ */
+export function checkServiceAuthFromOcrTokenHeader(
+  req: FastifyRequest,
+  allowed: Set<string>,
+): void {
+  if (allowed.size === 0) return;
+
+  const v = req.headers["x-ocr-token"];
+  const token = Array.isArray(v) ? v[0] : v;
+  if (!token || !allowed.has(token.trim())) {
+    throw createApiError(
+      "missing or invalid X-OCR-Token header " +
+        "(required in embedded-path mode when OCR_ACCESS_TOKENS is enabled)",
+      401,
+      "unauthorized",
+      "authentication_error",
+    );
+  }
+}
+
 const HEADER_INJECTION_RE = /[\r\n]/;
 
 function readHeader(req: FastifyRequest, name: string): string | undefined {

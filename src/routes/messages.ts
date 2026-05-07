@@ -3,6 +3,7 @@ import { AnthropicTransformer } from "../transformers/anthropic.js";
 import { createApiError } from "../transformers/errors.js";
 import {
   checkServiceAuth,
+  checkServiceAuthFromOcrTokenHeader,
   isEmbeddedUpstreamPath,
   parseUpstreamConfig,
   parseUpstreamFromEmbeddedPath,
@@ -123,7 +124,8 @@ export async function registerMessagesRoute(fastify: FastifyInstance) {
   if (accessTokens.size > 0) {
     fastify.log.info(
       { count: accessTokens.size },
-      "service access token whitelist enabled (header mode only)",
+      "service access token whitelist enabled " +
+        "(header mode: Authorization Bearer; embedded-path mode: X-OCR-Token)",
     );
   } else {
     fastify.log.warn(
@@ -155,8 +157,8 @@ export async function registerMessagesRoute(fastify: FastifyInstance) {
   // leading "/", treats the rest as the upstream URL, and forwards.
   // Authorization: Bearer <upstream-auth-value>  (Bearer prefix stripped, value
   // forwarded verbatim — supports non-Bearer upstream auth schemes).
-  // NOTE: In this mode the Authorization header *is* the upstream credential;
-  // service-side OCR_ACCESS_TOKENS whitelisting is therefore disabled.
+  // NOTE: Authorization is the upstream credential in this mode, so the
+  // service-side access-token check reads `X-OCR-Token` instead.
   // Use a catch-all POST route so we go through the standard request lifecycle
   // (setNotFoundHandler doesn't play well with streamed Web ReadableStream
   // responses). Static routes above take precedence over wildcard.
@@ -174,6 +176,7 @@ export async function registerMessagesRoute(fastify: FastifyInstance) {
           "not_found_error",
         );
       }
+      checkServiceAuthFromOcrTokenHeader(req, accessTokens);
       const { upstream, endpoint } = parseUpstreamFromEmbeddedPath(req);
       if (endpoint === "count_tokens") {
         return handleCountTokens(req, reply);

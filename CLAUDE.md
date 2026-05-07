@@ -32,7 +32,7 @@ open-claude-router 是一个**无状态**的 Anthropic Messages API ↔ OpenAI C
    - 服务端砍前导 `/` 和末尾 `/v1/messages`（或 `/v1/messages/count_tokens`），剩下的就是上游 URL
    - 上游 Authorization：`Authorization: Bearer <value>` 剥 Bearer 前缀后原样透传（支持非 Bearer 格式）
    - 解析：`src/utils/auth.ts` 的 `parseUpstreamFromEmbeddedPath`
-   - **此模式下 Authorization 即上游凭证，因此 `OCR_ACCESS_TOKENS` 服务自身鉴权在 embedded 模式下不生效**
+   - **此模式下 Authorization 即上游凭证**。服务自身鉴权（`OCR_ACCESS_TOKENS` 启用时）改读 `X-OCR-Token` header，由 `checkServiceAuthFromOcrTokenHeader` 处理
 
 ### 协议转换核心
 
