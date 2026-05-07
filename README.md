@@ -9,7 +9,7 @@
 - **零配置**：服务侧不存任何 API Key，所有信息由客户端逐请求传入
 - **任意 Authorization 格式**：标准 `Bearer sk-...`、企业网关常见的非 Bearer 自定义协议头都能原样透传
 - **完整覆盖 Claude Code 协议**：流式 SSE、工具调用（`tool_use` / `tool_result` 双向增量）、多模态图片、prompt cache 字段、`thinking` 块
-- **两种接入方式**：上游信息可以放 HTTP header，也可以直接拼在 URL path 里（ghfast.top 风格）
+- **两种接入方式**：上游信息可以放 HTTP header，也可以直接拼在 URL path 里
 
 ## 快速开始
 

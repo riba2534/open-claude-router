@@ -149,7 +149,7 @@ export async function registerMessagesRoute(fastify: FastifyInstance) {
     },
   );
 
-  // Embedded-path mode (ghfast.top style):
+  // Embedded-path mode:
   //     ANTHROPIC_BASE_URL=http://host:port/https://upstream.example.com/path/to/chat/completions
   // Claude Code appends /v1/messages, the bridge strips that suffix and the
   // leading "/", treats the rest as the upstream URL, and forwards.

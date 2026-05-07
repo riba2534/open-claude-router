@@ -27,7 +27,7 @@ open-claude-router 是一个**无状态**的 Anthropic Messages API ↔ OpenAI C
    - 服务自身鉴权：`Authorization: Bearer ...` + 环境变量 `OCR_ACCESS_TOKENS` 白名单
    - 解析：`src/utils/auth.ts` 的 `parseUpstreamConfig`
 
-2. **Embedded-path 模式（ghfast.top 风格）** — `POST /*` catch-all 路由
+2. **Embedded-path 模式** — `POST /*` catch-all 路由
    - 客户端 `ANTHROPIC_BASE_URL=http://host:port/<完整上游 URL>`，Claude Code 自动追加 `/v1/messages`
    - 服务端砍前导 `/` 和末尾 `/v1/messages`（或 `/v1/messages/count_tokens`），剩下的就是上游 URL
    - 上游 Authorization：`Authorization: Bearer <value>` 剥 Bearer 前缀后原样透传（支持非 Bearer 格式）

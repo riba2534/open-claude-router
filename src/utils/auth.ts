@@ -52,7 +52,7 @@ function readHeader(req: FastifyRequest, name: string): string | undefined {
 }
 
 /**
- * Returns true iff the request path looks like the ghfast-style embedded form:
+ * Returns true iff the request path embeds the upstream URL directly, e.g.:
  *     /https://upstream.example.com/path/v1/messages
  *     /http://...
  * (NOT to be confused with the standard /v1/messages route.)
@@ -63,7 +63,7 @@ export function isEmbeddedUpstreamPath(rawUrl: string): boolean {
 }
 
 /**
- * Parse upstream from a ghfast-style embedded path:
+ * Parse upstream from an embedded-URL path, e.g.:
  *     /https://upstream.example.com/foo/bar/v1/messages
  *     /https://upstream.example.com/foo/bar/v1/messages/count_tokens
  *
