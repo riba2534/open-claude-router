@@ -55,9 +55,11 @@ claude"
 ```bash
 alias myocr="ANTHROPIC_BASE_URL=http://localhost:3457 \
 ANTHROPIC_AUTH_TOKEN=service-access-token \
-ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Url: https://api.openai.com/v1/chat/completions\nX-Upstream-Authorization: Bearer sk-proj-xxxxx\nX-Upstream-Model: gpt-4o' \
-ANTHROPIC_MODEL=gpt-4o \
-ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-4o \
+ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Url: https://api.openai.com/v1/chat/completions\nX-Upstream-Authorization: Bearer sk-proj-xxxxx\nX-Upstream-Model: claude-opus-4-7' \
+ANTHROPIC_MODEL=claude-opus-4-7 \
+ANTHROPIC_DEFAULT_SONNET_MODEL=claude-opus-4-7 \
+ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7 \
+ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-opus-4-7 \
 claude"
 ```
 
