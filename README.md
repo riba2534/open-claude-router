@@ -84,10 +84,10 @@ npm run dev
 ```bash
 alias myocr="ANTHROPIC_BASE_URL=http://localhost:3457/https://api.openai.com/v1/chat/completions \
 ANTHROPIC_AUTH_TOKEN='Bearer sk-proj-xxxxx' \
-ANTHROPIC_MODEL=gpt-4o \
-ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-4o \
-ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-4o \
-ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-4o-mini \
+ANTHROPIC_MODEL=gpt-5.5 \
+ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.5 \
+ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5 \
+ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.5-mini \
 claude"
 ```
 
@@ -102,7 +102,7 @@ claude"
 alias myocr="ANTHROPIC_BASE_URL=http://your-bridge.example.com/https://api.openai.com/v1/chat/completions \
 ANTHROPIC_AUTH_TOKEN='Bearer sk-proj-xxxxx' \
 ANTHROPIC_CUSTOM_HEADERS='X-OCR-Token: mytoken1' \
-ANTHROPIC_MODEL=gpt-4o \
+ANTHROPIC_MODEL=gpt-5.5 \
 ... \
 claude"
 ```
@@ -112,11 +112,11 @@ claude"
 ```bash
 alias myocr="ANTHROPIC_BASE_URL=http://localhost:3457 \
 ANTHROPIC_AUTH_TOKEN=service-access-token \
-ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Url: https://api.openai.com/v1/chat/completions\nX-Upstream-Authorization: Bearer sk-proj-xxxxx\nX-Upstream-Model: gpt-4o' \
-ANTHROPIC_MODEL=gpt-4o \
-ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-4o \
-ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-4o \
-ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-4o-mini \
+ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Url: https://api.openai.com/v1/chat/completions\nX-Upstream-Authorization: Bearer sk-proj-xxxxx\nX-Upstream-Model: gpt-5.5' \
+ANTHROPIC_MODEL=gpt-5.5 \
+ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.5 \
+ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5 \
+ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.5-mini \
 claude"
 ```
 
