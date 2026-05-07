@@ -19,16 +19,26 @@
 
 ## 这是什么
 
-一个**完全无状态**的协议转换服务：不读本地配置、不存任何凭证、不维护 provider 列表。所有上游信息（URL、Authorization、模型名）由请求方逐请求传过来，因此一份部署可以服务任意客户端、任意上游。
+[Claude Code](https://docs.anthropic.com/claude/docs/claude-code) 只接受 Anthropic Messages API，但你想用的模型可能跑在 OpenAI 协议上——OpenAI 官方、第三方聚合网关、自托管推理服务。这个项目就是夹在中间的**协议转换桥梁**：
 
-把它部署一次，全公司同事改改 shell alias 就能用上各家 OpenAI 兼容的大模型 API；不需要每个人本地装路由器、不需要服务端维护一份 provider 列表，**配置完全留在客户端**。
+```
+Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(OpenAI Chat Completions / Responses)──▶  上游
+```
+
+跟其他类似工具最大的差异：**服务端零状态**。所有上游信息（URL、Authorization、模型名）由客户端逐请求通过 HTTP header 或 URL path 传入——服务端不读本地配置、不存任何 API Key、不维护 provider 列表。一份部署可以同时服务任意客户端、任意上游。
+
+典型场景：
+
+- **个人自部署**：`docker run` 一行起，shell alias 里写你的上游凭证
+- **团队共享**：内网起一份部署，每人 alias 里写各自的上游和 token，**凭证完全留在客户端，服务端无需集中管理**
+- **多家上游切换**：不同 alias 指向不同上游 / 模型，无需重启服务
 
 ## 特性
 
 - **零配置**：服务侧不存任何 API Key，所有信息由客户端逐请求传入
 - **任意 Authorization 格式**：标准 `Bearer sk-...`、企业网关常见的非 Bearer 自定义协议头都能原样透传
 - **完整覆盖 Claude Code 协议**：流式 SSE、工具调用（`tool_use` / `tool_result` 双向增量）、多模态图片、`thinking` 块
-- **同时支持 OpenAI 两套协议**：默认走 Chat Completions（兼容字节 AI Gateway / OpenRouter / Kimi / DeepSeek 等所有第三方上游），通过 `X-Upstream-Format: responses` opt-in 切到 Responses API（OpenAI o-series / gpt-5 原生协议，含 reasoning summary 转 Anthropic `thinking` 块）
+- **同时支持 OpenAI 两套协议**：默认走 Chat Completions（兼容 OpenAI 官方、OpenRouter、各类 OpenAI 兼容网关 / Kimi / DeepSeek 等），通过 `X-Upstream-Format: responses` opt-in 切到 Responses API（OpenAI o-series / gpt-5 原生协议，含 reasoning summary 转 Anthropic `thinking` 块）
 - **两种接入方式**：上游信息可以放 HTTP header，也可以直接拼在 URL path 里
 - **轻量好部署**：esbuild 打包后单文件 ~70 KB，Docker 镜像几十 MB，开箱即用
 
