@@ -38,10 +38,10 @@ docker run -d -p 3457:3457 --name ocr open-claude-router
 ```bash
 alias myocr="ANTHROPIC_BASE_URL=http://localhost:3457/https://api.openai.com/v1/chat/completions \
 ANTHROPIC_AUTH_TOKEN='Bearer sk-proj-xxxxx' \
-ANTHROPIC_MODEL=gpt-4o \
-ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-4o \
-ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-4o \
-ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-4o-mini \
+ANTHROPIC_MODEL=claude-opus-4-7 \
+ANTHROPIC_DEFAULT_SONNET_MODEL=claude-opus-4-7 \
+ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7 \
+ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-opus-4-7 \
 claude"
 ```
 
