@@ -27,10 +27,10 @@
 
 - **零配置**：服务侧不存任何 API Key，所有信息由客户端逐请求传入
 - **任意 Authorization 格式**：标准 `Bearer sk-...`、企业网关常见的非 Bearer 自定义协议头都能原样透传
-- **完整覆盖 Claude Code 协议**：流式 SSE、工具调用（`tool_use` / `tool_result` 双向增量）、多模态图片、prompt cache 字段、`thinking` 块
+- **完整覆盖 Claude Code 协议**：流式 SSE、工具调用（`tool_use` / `tool_result` 双向增量）、多模态图片、`thinking` 块
 - **同时支持 OpenAI 两套协议**：默认走 Chat Completions（兼容字节 AI Gateway / OpenRouter / Kimi / DeepSeek 等所有第三方上游），通过 `X-Upstream-Format: responses` opt-in 切到 Responses API（OpenAI o-series / gpt-5 原生协议，含 reasoning summary 转 Anthropic `thinking` 块）
 - **两种接入方式**：上游信息可以放 HTTP header，也可以直接拼在 URL path 里
-- **轻量好部署**：esbuild 打包后单文件 ~45 KB，Docker 镜像几十 MB，开箱即用
+- **轻量好部署**：esbuild 打包后单文件 ~70 KB，Docker 镜像几十 MB，开箱即用
 
 ## 架构
 
@@ -38,15 +38,15 @@
 flowchart LR
     Client["Claude Code CLI<br/>shell alias"]
     Bridge["open-claude-router<br/>无状态服务"]
-    Upstream[("OpenAI 兼容上游")]
+    Upstream[("OpenAI 协议上游<br/>Chat Completions 或 Responses")]
 
     Client -- "Anthropic Messages API<br/>POST /v1/messages" --> Bridge
-    Bridge -- "OpenAI Chat Completions<br/>POST /v1/chat/completions" --> Upstream
+    Bridge -- "POST /v1/chat/completions<br/>或 /v1/responses" --> Upstream
     Upstream -. "OpenAI SSE / JSON" .-> Bridge
     Bridge -. "Anthropic SSE / JSON" .-> Client
 ```
 
-服务收到 Anthropic 协议的请求后，从 HTTP header 或 URL path 解析出真实上游 URL 和 Authorization，把请求体转成 OpenAI Chat Completions 格式调用上游，再把上游响应（SSE 流或 JSON）转回 Anthropic 格式返回。整个过程不读本地配置、不存任何凭证、不维护 provider 表，因此**无状态、可任意水平扩展**。
+服务收到 Anthropic 协议的请求后，从 HTTP header 或 URL path 解析出真实上游 URL 和 Authorization，把请求体转成对应的 OpenAI 协议（默认 Chat Completions，可通过 `X-Upstream-Format: responses` 切到 Responses API）调用上游，再把上游响应（SSE 流或 JSON）转回 Anthropic 格式返回。整个过程不读本地配置、不存任何凭证、不维护 provider 表，因此**无状态、可任意水平扩展**。
 
 ## 快速开始
 
@@ -84,55 +84,47 @@ npm run dev
 ```bash
 alias myocr="ANTHROPIC_BASE_URL=http://localhost:3457/https://api.openai.com/v1/chat/completions \
 ANTHROPIC_AUTH_TOKEN='Bearer sk-proj-xxxxx' \
-ANTHROPIC_MODEL=claude-opus-4-7 \
-ANTHROPIC_DEFAULT_SONNET_MODEL=claude-opus-4-7 \
-ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7 \
-ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-opus-4-7 \
+ANTHROPIC_MODEL=gpt-4o \
+ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-4o \
+ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-4o \
+ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-4o-mini \
 claude"
 ```
 
-> **重要**：`ANTHROPIC_AUTH_TOKEN` 应填**上游需要的完整 Authorization header 值**（Claude Code 客户端会自动加 `Bearer ` 前缀，服务在 path 模式下会剥掉这一层后透传给上游）。
+> **`ANTHROPIC_AUTH_TOKEN` 应填上游需要的完整 Authorization header 值。** Claude Code 客户端会自动加 `Bearer ` 前缀，服务在 path 模式下会剥掉这一层后透传给上游：
 >
-> - 上游期望 Bearer 鉴权（OpenAI 等）：写 `'Bearer sk-...'`
-> - 上游期望非 Bearer 自定义协议头：写 `'custom-scheme://...?key=...'`
->
-> 如果服务端启用了 `OCR_ACCESS_TOKENS` 白名单（公网部署强烈建议），path 模式下 `Authorization` 已经被上游凭证占用，需要额外通过 `ANTHROPIC_CUSTOM_HEADERS` 传 `X-OCR-Token` 做服务侧鉴权：
->
-> ```bash
-> alias myocr="ANTHROPIC_BASE_URL=http://your-bridge.example.com/https://api.openai.com/v1/chat/completions \
-> ANTHROPIC_AUTH_TOKEN='Bearer sk-proj-xxxxx' \
-> ANTHROPIC_CUSTOM_HEADERS='X-OCR-Token: mytoken1' \
-> ANTHROPIC_MODEL=claude-opus-4-7 \
-> ... \
-> claude"
-> ```
+> - 上游期望 Bearer 鉴权（OpenAI 等）→ 写 `'Bearer sk-...'`
+> - 上游期望非 Bearer 自定义协议头 → 写 `'custom-scheme://...?key=...'`
+
+如果服务端启用了 `OCR_ACCESS_TOKENS` 白名单（公网部署强烈建议），path 模式下 `Authorization` 已经被上游凭证占用，需要额外通过 `ANTHROPIC_CUSTOM_HEADERS` 传 `X-OCR-Token` 做服务侧鉴权：
+
+```bash
+alias myocr="ANTHROPIC_BASE_URL=http://your-bridge.example.com/https://api.openai.com/v1/chat/completions \
+ANTHROPIC_AUTH_TOKEN='Bearer sk-proj-xxxxx' \
+ANTHROPIC_CUSTOM_HEADERS='X-OCR-Token: mytoken1' \
+ANTHROPIC_MODEL=gpt-4o \
+... \
+claude"
+```
 
 #### 方式 B：自定义 header 传上游（更灵活，支持服务自身鉴权）
 
 ```bash
 alias myocr="ANTHROPIC_BASE_URL=http://localhost:3457 \
 ANTHROPIC_AUTH_TOKEN=service-access-token \
-ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Url: https://api.openai.com/v1/chat/completions\nX-Upstream-Authorization: Bearer sk-proj-xxxxx\nX-Upstream-Model: claude-opus-4-7' \
-ANTHROPIC_MODEL=claude-opus-4-7 \
-ANTHROPIC_DEFAULT_SONNET_MODEL=claude-opus-4-7 \
-ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7 \
-ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-opus-4-7 \
+ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Url: https://api.openai.com/v1/chat/completions\nX-Upstream-Authorization: Bearer sk-proj-xxxxx\nX-Upstream-Model: gpt-4o' \
+ANTHROPIC_MODEL=gpt-4o \
+ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-4o \
+ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-4o \
+ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-4o-mini \
 claude"
 ```
 
 > 服务自身鉴权与上游凭证完全分离；可配合环境变量 `OCR_ACCESS_TOKENS=token1,token2,...` 启用服务侧 Bearer 白名单（header 模式校验 `Authorization: Bearer ...`，path 模式校验 `X-OCR-Token`）。
 
-### 3. 启动 Claude Code
+#### 方式 C：接 OpenAI Responses API（o3 / gpt-5 等原生 reasoning 模型）
 
-```bash
-myocr
-```
-
-正常对话、工具调用、`/model` 切换都会被透明转换。`ANTHROPIC_DEFAULT_*_MODEL` 各自对应不同场景（默认 / `/model sonnet` / `/model opus` / 后台 haiku 任务），上游收到的 model 字段就是当前场景对应的那个，可以填不同模型名分场景路由。
-
-### 接 OpenAI Responses API（o3 / gpt-5 等原生 reasoning 模型）
-
-OpenAI Chat Completions 是上面所有示例默认走的协议，覆盖绝大多数兼容上游。如果你接的是 OpenAI **Responses API**（`/v1/responses`，o-series / gpt-5 原生协议，含 reasoning summary），把 alias 改成下面这样即可——只多一个 `X-Upstream-Format: responses` header：
+OpenAI 在 2025 年推出 **Responses API**（`/v1/responses`），是 o-series / gpt-5 的原生协议，含 reasoning summary。把方式 A 的 alias 多加一个 `X-Upstream-Format: responses` header 即可——其他保持不变：
 
 ```bash
 alias myo3="ANTHROPIC_BASE_URL=http://localhost:3457/https://api.openai.com/v1/responses \
@@ -145,7 +137,28 @@ ANTHROPIC_DEFAULT_HAIKU_MODEL=o3-mini \
 claude"
 ```
 
-服务侧会把 OpenAI Responses 的 `response.reasoning_summary_text.delta` 等事件转成 Anthropic 的 `thinking` 块返回给 Claude Code。其他所有 alias（不带 `X-Upstream-Format` 或显式 `chat-completions`）行为完全不变。
+服务侧会把 OpenAI 的 `response.reasoning_summary_text.delta` 等事件转成 Anthropic 的 `thinking` 块返回给 Claude Code。**其他所有 alias（不带 `X-Upstream-Format` 或显式 `chat-completions`）行为完全不变**。
+
+### 3. 启动 Claude Code
+
+```bash
+myocr
+```
+
+正常对话、工具调用、`/model` 切换都会被透明转换。`ANTHROPIC_DEFAULT_*_MODEL` 各自对应不同场景（默认 / `/model sonnet` / `/model opus` / 后台 haiku 任务），上游收到的 model 字段就是当前场景对应的那个，可以填不同模型名分场景路由。
+
+## 协议覆盖与边界
+
+| 能力 | 默认（Chat Completions） | Responses API |
+|---|---|---|
+| 文本流式 SSE | ✅ 完整 | ✅ 完整 |
+| 工具调用（`tool_use` / `tool_result` 双向增量） | ✅ 完整 | ✅ 完整 |
+| 多模态图片（`image` content block） | ✅ 完整 | ✅ 完整 |
+| `/model sonnet` / `opus` / haiku 切换 | ✅ body.model 字段透传 | ✅ 同 |
+| 客户端中断（Ctrl+C） | ✅ AbortSignal 传到上游 | ✅ 同 |
+| `thinking` 块 | ⚠️ 字段会被剥（绝大多数 Chat Completions 上游不识别） | ✅ 上游 reasoning summary 自动转 Anthropic `thinking` |
+| Prompt cache（`cache_control`） | ⚠️ 字段会被剥（避免严格上游 400），返回不会有 `cache_read_input_tokens` | 同左 |
+| `count_tokens` 端点 | ⚠️ 服务本地 `js-tiktoken` 粗略估算（非上游精确值） | 同左 |
 
 ## API
 
@@ -157,16 +170,16 @@ claude"
 | `POST` | `/<完整上游 URL>/v1/messages/count_tokens` | path 模式 token 估算 |
 | `GET`  | `/healthz` | 健康检查 |
 
-### Header 模式必需的请求头
+### 请求头
 
-| Header | 说明 |
-|---|---|
-| `X-Upstream-Url` | 完整上游 URL（含 `/chat/completions` 路径） |
-| `X-Upstream-Authorization` | 上游 Authorization 原值（原样透传，支持任意格式） |
-| `X-Upstream-Model` | （可选）真实上游模型名；提供则覆盖 body 里的 `model` |
-| `Authorization: Bearer <token>` | （可选）服务自身访问鉴权，仅在 header 模式 + 设置 `OCR_ACCESS_TOKENS` 时校验 |
-| `X-OCR-Token` | （可选）path 模式下的服务自身访问鉴权，仅在 path 模式 + 设置 `OCR_ACCESS_TOKENS` 时校验 |
-| `X-Upstream-Format` | （可选）`chat-completions`（默认）或 `responses`。声明上游用 OpenAI 哪套协议——前者是绝大多数兼容上游用的 `/v1/chat/completions`，后者是 OpenAI o-series / gpt-5 原生的 `/v1/responses` |
+| Header | 适用模式 | 必需性 | 说明 |
+|---|---|---|---|
+| `X-Upstream-Url` | header | ✅ 必需 | 完整上游 URL（含 `/chat/completions` 或 `/responses` 路径） |
+| `X-Upstream-Authorization` | header | ✅ 必需 | 上游 Authorization 原值（原样透传，支持任意格式） |
+| `X-Upstream-Model` | header | 可选 | 真实上游模型名；提供则覆盖 body 里的 `model` |
+| `Authorization: Bearer <token>` | header | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | 服务自身访问鉴权 |
+| `X-OCR-Token` | path | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | path 模式下 `Authorization` 被上游凭证占用，服务鉴权改走此 header |
+| `X-Upstream-Format` | 两种模式都可用 | 可选 | `chat-completions`（默认）或 `responses`，声明上游 OpenAI 协议变体 |
 
 ### Path 模式
 
