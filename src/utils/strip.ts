@@ -19,13 +19,20 @@ export function stripFields(obj: unknown, fields: ReadonlySet<string>): void {
   }
 }
 
-const ANTHROPIC_ONLY = new Set([
-  "cache_control",
-  // Some OpenAI-compatible gateways accept a top-level `reasoning` field, but
-  // vanilla /chat/completions rejects it as unknown. Stripping is the safe default.
-  "reasoning",
-]);
+// Always rejected by OpenAI-shape upstreams (both Chat Completions and Responses).
+const ALWAYS_STRIP = new Set(["cache_control"]);
+
+// `reasoning` is emitted by AnthropicTransformer from `request.thinking` and
+// consumed by OpenAIResponsesTransformer.transformRequestIn — strip only on
+// the Chat Completions path, where vanilla upstreams 400 on unknown keys.
+const CHAT_COMPLETIONS_REJECT = new Set(["reasoning"]);
 
 export function scrubAnthropicOnlyFields(body: Record<string, unknown>): void {
-  stripFields(body, ANTHROPIC_ONLY);
+  stripFields(body, ALWAYS_STRIP);
+}
+
+export function scrubChatCompletionsIncompatibleFields(
+  body: Record<string, unknown>,
+): void {
+  stripFields(body, CHAT_COMPLETIONS_REJECT);
 }

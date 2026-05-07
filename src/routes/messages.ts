@@ -13,7 +13,10 @@ import {
   type UpstreamConfig,
   type UpstreamFormat,
 } from "../utils/auth.js";
-import { scrubAnthropicOnlyFields } from "../utils/strip.js";
+import {
+  scrubAnthropicOnlyFields,
+  scrubChatCompletionsIncompatibleFields,
+} from "../utils/strip.js";
 import {
   buildUpstreamSignal,
   callUpstream,
@@ -55,10 +58,16 @@ async function forwardMessages(
 
   // Step 2: unified -> upstream-specific shape (only needed for Responses API).
   // For chat-completions, unified IS already the OpenAI Chat Completions format,
-  // so we send it directly.
+  // so we send it directly. The `reasoning` field is consumed by the Responses
+  // transformer to enable reasoning summaries upstream; on the chat-completions
+  // path it must be stripped (vanilla /chat/completions 400s on unknown keys).
   let outboundBody: any = unified;
   if (format === "responses") {
     outboundBody = await responsesT.transformRequestIn!(unified as any);
+  } else {
+    scrubChatCompletionsIncompatibleFields(
+      unified as unknown as Record<string, unknown>,
+    );
   }
 
   req.log.info(
