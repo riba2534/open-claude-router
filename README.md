@@ -10,6 +10,7 @@
 
 <p align="center">
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-20+-3B82A6?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js" /></a>
+  <a href="https://hub.docker.com/r/riba2534/open-claude-router"><img src="https://img.shields.io/docker/pulls/riba2534/open-claude-router?style=for-the-badge&color=2496ED&logo=docker&logoColor=white" alt="Docker Pulls" /></a>
   <a href="https://github.com/riba2534/open-claude-router/stargazers"><img src="https://img.shields.io/github/stars/riba2534/open-claude-router?style=for-the-badge&color=f5a623" alt="Stars" /></a>
   <a href="https://github.com/riba2534/open-claude-router/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-teal.svg?style=for-the-badge" alt="License" /></a>
 </p>
@@ -50,18 +51,25 @@ flowchart LR
 
 ### 1. 启动服务
 
-本地：
+使用预构建镜像（[Dockerhub](https://hub.docker.com/r/riba2534/open-claude-router)，amd64 + arm64）：
+
+```bash
+docker run -d --name ocr --restart unless-stopped -p 3457:3457 \
+  riba2534/open-claude-router:latest
+```
+
+本地构建：
+
+```bash
+docker build -t open-claude-router .
+docker run -d --name ocr --restart unless-stopped -p 3457:3457 open-claude-router
+```
+
+或直接 npm（开发用）：
 
 ```bash
 npm install
 npm run dev          # 默认监听 :3457
-```
-
-Docker：
-
-```bash
-docker build -t open-claude-router .
-docker run -d -p 3457:3457 --name ocr open-claude-router
 ```
 
 ### 2. 配置 Claude Code alias
