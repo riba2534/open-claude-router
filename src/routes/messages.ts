@@ -236,9 +236,7 @@ export async function registerMessagesRoute(fastify: FastifyInstance) {
       if (endpoint === "count_tokens") {
         return handleCountTokens(req, reply);
       }
-      const upstreamModelHeader = req.headers["x-upstream-model"];
-      const upstreamModel = Array.isArray(upstreamModelHeader) ? upstreamModelHeader[0] : upstreamModelHeader;
-      upstream.model = resolveUpstreamModel(req.body?.model, upstreamModel || upstream.model, parseModelMap(req));
+      upstream.model = resolveUpstreamModel(req.body?.model, upstream.model, parseModelMap(req));
       return forwardMessages(
         req,
         reply,

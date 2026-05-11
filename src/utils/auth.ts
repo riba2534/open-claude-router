@@ -198,7 +198,11 @@ export function parseUpstreamFromEmbeddedPath(req: FastifyRequest): {
   }
 
   return {
-    upstream: { url: pathPart, authorization: upstreamAuth },
+    upstream: {
+      url: pathPart,
+      authorization: upstreamAuth,
+      model: readHeader(req, "x-upstream-model") || undefined,
+    },
     endpoint,
   };
 }
