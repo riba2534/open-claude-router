@@ -249,7 +249,7 @@ export function resolveUpstreamModel(
   modelMap: Map<string, string>,
 ): string | undefined {
   const mapped = bodyModel ? modelMap.get(bodyModel) : undefined;
-  return mapped ?? upstreamModel ?? undefined;
+  return mapped ?? upstreamModel;
 }
 
 export function parseUpstreamConfig(req: FastifyRequest): UpstreamConfig {
