@@ -205,7 +205,7 @@ myocr
 |---|---|---|---|
 | `X-Upstream-Url` | header | ✅ 必需 | 完整上游 URL（含 `/chat/completions` 或 `/responses` 路径） |
 | `X-Upstream-Authorization` | header | ✅ 必需 | 上游 Authorization 原值（原样透传，支持任意格式） |
-| `X-Upstream-Model` | header | 可选 | 真实上游模型名；提供则覆盖 body 里的 `model` |
+| `X-Upstream-Model` | 两种模式都可用 | 可选 | 真实上游模型名；提供则覆盖 body 里的 `model` |
 | `X-Upstream-Model-Map` | 两种模式都可用 | 可选 | 模型名映射表，格式 `from1=to1,from2=to2`；按请求 body 中的 model 匹配后替换。优先级：model-map 匹配 > `X-Upstream-Model` > body 原值透传 |
 | `Authorization: Bearer <token>` | header | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | 服务自身访问鉴权 |
 | `X-OCR-Token` | path | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | path 模式下 `Authorization` 被上游凭证占用，服务鉴权改走此 header |
