@@ -149,6 +149,25 @@ claude"
 
 服务侧会把 OpenAI 的 `response.reasoning_summary_text.delta` 等事件转成 Anthropic 的 `thinking` 块返回给 Claude Code。**其他所有 alias（不带 `X-Upstream-Format` 或显式 `chat-completions`）行为完全不变**。
 
+#### 模型名映射（`X-Upstream-Model-Map`）
+
+Claude Code 按模型名模式匹配启用 extended thinking 等高级能力，填非 `claude-*` 名称时这些功能会被静默禁用。`X-Upstream-Model-Map` 让你**客户端侧保留 `claude-*` 名称获得完整能力，上游收到真实目标模型名**：
+
+```bash
+alias myocr="ANTHROPIC_BASE_URL=http://localhost:3457 \
+ANTHROPIC_AUTH_TOKEN=service-token \
+ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Url: https://api.openai.com/v1/chat/completions\nX-Upstream-Authorization: Bearer sk-xxx\nX-Upstream-Model-Map: claude-opus-4-6=gpt-5.5,claude-sonnet-4-6=gpt-5.4,claude-haiku-4-5-20251001=gpt-5.4-mini' \
+ANTHROPIC_MODEL=claude-sonnet-4-6 \
+ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 \
+ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-6 \
+ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001 \
+claude"
+```
+
+客户端使用 `claude-sonnet-4-6` 正常交互，上游实际收到 `gpt-5.4`；`/model opus` 切到 `claude-opus-4-6` 时上游收 `gpt-5.5`。
+
+> 优先级：`X-Upstream-Model-Map` 匹配到的映射 > `X-Upstream-Model`（全局覆盖） > body 原始 model 透传。两种接入模式（header / path）均支持。
+
 ### 3. 启动 Claude Code
 
 ```bash
@@ -186,7 +205,8 @@ myocr
 |---|---|---|---|
 | `X-Upstream-Url` | header | ✅ 必需 | 完整上游 URL（含 `/chat/completions` 或 `/responses` 路径） |
 | `X-Upstream-Authorization` | header | ✅ 必需 | 上游 Authorization 原值（原样透传，支持任意格式） |
-| `X-Upstream-Model` | header | 可选 | 真实上游模型名；提供则覆盖 body 里的 `model` |
+| `X-Upstream-Model` | 两种模式都可用 | 可选 | 真实上游模型名；提供则覆盖 body 里的 `model` |
+| `X-Upstream-Model-Map` | 两种模式都可用 | 可选 | 模型名映射表，格式 `from1=to1,from2=to2`；按请求 body 中的 model 匹配后替换。优先级：model-map 匹配 > `X-Upstream-Model` > body 原值透传 |
 | `Authorization: Bearer <token>` | header | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | 服务自身访问鉴权 |
 | `X-OCR-Token` | path | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | path 模式下 `Authorization` 被上游凭证占用，服务鉴权改走此 header |
 | `X-Upstream-Format` | 两种模式都可用 | 可选 | `chat-completions`（默认）或 `responses`，声明上游 OpenAI 协议变体 |
