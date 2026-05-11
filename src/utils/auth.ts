@@ -203,6 +203,51 @@ export function parseUpstreamFromEmbeddedPath(req: FastifyRequest): {
   };
 }
 
+/**
+ * Parse `X-Upstream-Model-Map` header into a Map<clientModel, upstreamModel>.
+ * Format: `claude-opus-4-6=gpt-5.5,claude-sonnet-4-6=gpt-5.4`
+ * Returns an empty map if the header is absent or empty.
+ * Throws 400 if the header is present but contains no valid mappings.
+ */
+export function parseModelMap(req: FastifyRequest): Map<string, string> {
+  const v = readHeader(req, "x-upstream-model-map");
+  if (!v || !v.trim()) return new Map();
+  const map = new Map<string, string>();
+  for (const pair of v.split(",")) {
+    const trimmed = pair.trim();
+    if (!trimmed) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const from = trimmed.slice(0, eq).trim();
+    const to = trimmed.slice(eq + 1).trim();
+    if (from && to) map.set(from, to);
+  }
+  if (map.size === 0) {
+    throw createApiError(
+      "X-Upstream-Model-Map header is present but contains no valid mappings " +
+        "(expected format: model-a=upstream-a,model-b=upstream-b)",
+      400,
+      "invalid_model_map",
+      "invalid_request_error",
+    );
+  }
+  return map;
+}
+
+/**
+ * Resolve upstream model override.
+ * Priority: model-map match > X-Upstream-Model.
+ * Returns undefined when neither applies (body model passes through unchanged).
+ */
+export function resolveUpstreamModel(
+  bodyModel: string | undefined,
+  upstreamModel: string | undefined,
+  modelMap: Map<string, string>,
+): string | undefined {
+  const mapped = bodyModel ? modelMap.get(bodyModel) : undefined;
+  return mapped ?? upstreamModel ?? undefined;
+}
+
 export function parseUpstreamConfig(req: FastifyRequest): UpstreamConfig {
   const url = readHeader(req, "x-upstream-url");
   const auth = readHeader(req, "x-upstream-authorization");

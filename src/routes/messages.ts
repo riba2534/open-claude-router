@@ -10,6 +10,8 @@ import {
   parseUpstreamFromEmbeddedPath,
   parseUpstreamFormat,
   parseAccessTokens,
+  parseModelMap,
+  resolveUpstreamModel,
   type UpstreamConfig,
   type UpstreamFormat,
 } from "../utils/auth.js";
@@ -191,6 +193,7 @@ export async function registerMessagesRoute(fastify: FastifyInstance) {
       checkServiceAuth(req, accessTokens);
       const format = parseUpstreamFormat(req);
       const upstream = parseUpstreamConfig(req);
+      upstream.model = resolveUpstreamModel(req.body?.model, upstream.model, parseModelMap(req));
       return forwardMessages(
         req,
         reply,
@@ -233,6 +236,7 @@ export async function registerMessagesRoute(fastify: FastifyInstance) {
       if (endpoint === "count_tokens") {
         return handleCountTokens(req, reply);
       }
+      upstream.model = resolveUpstreamModel(req.body?.model, upstream.model, parseModelMap(req));
       return forwardMessages(
         req,
         reply,
