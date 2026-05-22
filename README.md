@@ -132,7 +132,9 @@ claude"
 
 > 服务自身鉴权与上游凭证完全分离；可配合环境变量 `OCR_ACCESS_TOKENS=token1,token2,...` 启用服务侧 Bearer 白名单（header 模式校验 `Authorization: Bearer ...`，path 模式校验 `X-OCR-Token`）。
 
-如果上游网关需要少量额外 header 做路由、租户识别或会话粘性，可以通过 `X-Upstream-Headers` 显式声明一个 JSON object，例如 `X-Upstream-Headers: {"extra":"{\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\"}"}`；服务只会转发这里列出的 header，不会透传 Claude Code 原始请求头，也不能覆盖 `authorization`、`content-type`、`accept`、`host`、`connection`、`content-length`、`transfer-encoding`、`x-ocr-token`、`x-upstream-*` 等受保护 header
+如果上游网关需要少量额外 header 做路由、租户识别或会话粘性，可以通过 `X-Upstream-Headers` 显式声明一个 JSON object，例如 `X-Upstream-Headers: {"extra":"{\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\"}"}`；服务只会转发这里列出的 header，不会透传 Claude Code 原始请求头，也不能覆盖 `authorization`、`content-type`、`accept`、`host`、`x-ocr-token`、`x-upstream-*` 以及完整的 hop-by-hop header（`connection`、`keep-alive`、`proxy-authenticate`、`proxy-authorization`、`proxy-connection`、`te`、`trailer`、`transfer-encoding`、`upgrade`、`expect`、`content-length`）等受保护 header
+
+> ⚠️ **不要把服务侧鉴权 header（如 `X-OCR-Token`）放进 `X-Upstream-Headers`**——这样会把服务访问令牌泄漏给上游甚至被上游日志记录。`x-ocr-token` 已被列入受保护 header，显式列出会被服务返回 400 拒绝。
 
 #### 方式 C：接 OpenAI Responses API（o3 / gpt-5 等原生 reasoning 模型）
 

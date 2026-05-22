@@ -90,20 +90,41 @@ export function checkServiceAuthFromOcrTokenHeader(
 }
 
 const HEADER_INJECTION_RE = /[\r\n]/;
+// Reject any C0/C1 control character or DEL in header values. CR/LF were
+// already rejected; this is a stricter check that also catches NUL and
+// other CTLs that undici/Node fetch will refuse, so we surface the error
+// as a 400 at parse time instead of a 502 from a failed fetch.
+const HEADER_VALUE_INVALID_RE = /[\x00-\x08\x0A-\x1F\x7F]/;
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const PROTOTYPE_POLLUTION_KEYS = new Set([
   "__proto__",
   "constructor",
   "prototype",
 ]);
+// Headers that must not be overridden via X-Upstream-Headers. Includes:
+//   - Protocol-critical request headers we set ourselves: accept, authorization,
+//     content-type, content-length, host.
+//   - Service-side auth headers that must not leak to the upstream: x-ocr-token.
+//   - The full RFC 7230 hop-by-hop set (connection, keep-alive, proxy-authenticate,
+//     proxy-authorization, te, trailer, transfer-encoding, upgrade) plus the
+//     HTTP/1.0 alias proxy-connection and the load-bearing expect/100-continue
+//     header. These can change transport semantics and are unsafe to forward.
 const PROTECTED_UPSTREAM_HEADERS = new Set([
   "accept",
   "authorization",
   "connection",
   "content-length",
   "content-type",
+  "expect",
   "host",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
   "transfer-encoding",
+  "upgrade",
   "x-ocr-token",
 ]);
 
@@ -172,7 +193,7 @@ export function parseUpstreamHeaders(
         "invalid_request_error",
       );
     }
-    if (typeof value !== "string" || HEADER_INJECTION_RE.test(value)) {
+    if (typeof value !== "string" || HEADER_VALUE_INVALID_RE.test(value)) {
       throw createApiError(
         `invalid value for upstream header: ${name}`,
         400,

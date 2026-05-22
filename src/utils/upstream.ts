@@ -44,6 +44,9 @@ export async function callUpstream(
     method: "POST",
     headers: {
       ...opts.headers,
+      // Protected defaults must win over caller-supplied headers; the route
+      // layer already rejects these via parseUpstreamHeaders, this is a
+      // belt-and-braces guard against future refactors.
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
       authorization: opts.authorization,

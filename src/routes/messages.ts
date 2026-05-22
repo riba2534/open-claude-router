@@ -82,8 +82,11 @@ async function forwardMessages(
   );
 
   // Step 3: fetch upstream
-  const signal = buildUpstreamSignal(req);
+  // Parse upstream headers BEFORE the try block — parseUpstreamHeaders throws
+  // ApiError(400) on invalid input, and we don't want that rewritten as
+  // upstream_unreachable/502 by the catch below.
   const upstreamHeaders = parseUpstreamHeaders(req);
+  const signal = buildUpstreamSignal(req);
   let upstreamResponse: Response;
   try {
     upstreamResponse = await callUpstream({
