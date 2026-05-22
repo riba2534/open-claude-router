@@ -94,7 +94,9 @@ const HEADER_INJECTION_RE = /[\r\n]/;
 // already rejected; this is a stricter check that also catches NUL and
 // other CTLs that undici/Node fetch will refuse, so we surface the error
 // as a 400 at parse time instead of a 502 from a failed fetch.
-const HEADER_VALUE_INVALID_RE = /[\x00-\x08\x0A-\x1F\x7F]/;
+// Range: C0 (0x00-0x08, 0x0A-0x1F; HTAB 0x09 allowed), DEL (0x7F),
+// C1 (0x80-0x9F).
+const HEADER_VALUE_INVALID_RE = /[\x00-\x08\x0A-\x1F\x7F-\x9F]/;
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const PROTOTYPE_POLLUTION_KEYS = new Set([
   "__proto__",
