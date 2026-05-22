@@ -99,6 +99,7 @@ const PROTECTED_UPSTREAM_HEADERS = new Set([
   "content-type",
   "host",
   "transfer-encoding",
+  "x-ocr-token",
 ]);
 
 function readHeader(req: FastifyRequest, name: string): string | undefined {
@@ -144,7 +145,10 @@ export function parseUpstreamHeaders(
         "invalid_request_error",
       );
     }
-    if (PROTECTED_UPSTREAM_HEADERS.has(normalizedName)) {
+    if (
+      PROTECTED_UPSTREAM_HEADERS.has(normalizedName) ||
+      normalizedName.startsWith("x-upstream-")
+    ) {
       throw createApiError(
         `protected upstream header cannot be overridden: ${normalizedName}`,
         400,
