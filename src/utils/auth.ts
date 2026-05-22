@@ -90,11 +90,79 @@ export function checkServiceAuthFromOcrTokenHeader(
 }
 
 const HEADER_INJECTION_RE = /[\r\n]/;
+const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const PROTECTED_UPSTREAM_HEADERS = new Set([
+  "accept",
+  "authorization",
+  "connection",
+  "content-length",
+  "content-type",
+  "host",
+  "transfer-encoding",
+]);
 
 function readHeader(req: FastifyRequest, name: string): string | undefined {
   const v = req.headers[name.toLowerCase()];
   if (Array.isArray(v)) return v[0];
   return v;
+}
+
+export function parseUpstreamHeaders(
+  req: FastifyRequest,
+): Record<string, string> | undefined {
+  const raw = readHeader(req, "x-upstream-headers");
+  if (!raw) return undefined;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw createApiError(
+      "X-Upstream-Headers must be a JSON object",
+      400,
+      "invalid_upstream_headers",
+      "invalid_request_error",
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw createApiError(
+      "X-Upstream-Headers must be a JSON object",
+      400,
+      "invalid_upstream_headers",
+      "invalid_request_error",
+    );
+  }
+
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(parsed)) {
+    const normalizedName = name.toLowerCase();
+    if (!HEADER_NAME_RE.test(name)) {
+      throw createApiError(
+        `invalid upstream header name: ${name}`,
+        400,
+        "invalid_upstream_header",
+        "invalid_request_error",
+      );
+    }
+    if (PROTECTED_UPSTREAM_HEADERS.has(normalizedName)) {
+      throw createApiError(
+        `protected upstream header cannot be overridden: ${normalizedName}`,
+        400,
+        "protected_upstream_header",
+        "invalid_request_error",
+      );
+    }
+    if (typeof value !== "string" || HEADER_INJECTION_RE.test(value)) {
+      throw createApiError(
+        `invalid value for upstream header: ${name}`,
+        400,
+        "invalid_upstream_header",
+        "invalid_request_error",
+      );
+    }
+    headers[normalizedName] = value;
+  }
+  return Object.keys(headers).length ? headers : undefined;
 }
 
 /**

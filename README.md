@@ -132,6 +132,8 @@ claude"
 
 > 服务自身鉴权与上游凭证完全分离；可配合环境变量 `OCR_ACCESS_TOKENS=token1,token2,...` 启用服务侧 Bearer 白名单（header 模式校验 `Authorization: Bearer ...`，path 模式校验 `X-OCR-Token`）。
 
+如果上游网关需要少量额外 header 做路由、租户识别或会话粘性，可以通过 `X-Upstream-Headers` 显式声明一个 JSON object，例如 `X-Upstream-Headers: {"extra":"{\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\"}"}`；服务只会转发这里列出的 header，不会透传 Claude Code 原始请求头，也不能覆盖 `authorization`、`content-type`、`accept`、`host`、`connection`、`content-length`、`transfer-encoding` 等受保护 header
+
 #### 方式 C：接 OpenAI Responses API（o3 / gpt-5 等原生 reasoning 模型）
 
 OpenAI 在 2025 年推出 **Responses API**（`/v1/responses`），是 o-series / gpt-5 的原生协议，含 reasoning summary。把方式 A 的 alias 多加一个 `X-Upstream-Format: responses` header 即可——其他保持不变：
@@ -187,6 +189,7 @@ myocr
 | `X-Upstream-Url` | header | ✅ 必需 | 完整上游 URL（含 `/chat/completions` 或 `/responses` 路径） |
 | `X-Upstream-Authorization` | header | ✅ 必需 | 上游 Authorization 原值（原样透传，支持任意格式） |
 | `X-Upstream-Model` | header | 可选 | 真实上游模型名；提供则覆盖 body 里的 `model` |
+| `X-Upstream-Headers` | 两种模式都可用 | 可选 | JSON object，显式声明要额外转发给上游的 header；不能覆盖受保护 header |
 | `Authorization: Bearer <token>` | header | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | 服务自身访问鉴权 |
 | `X-OCR-Token` | path | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | path 模式下 `Authorization` 被上游凭证占用，服务鉴权改走此 header |
 | `X-Upstream-Format` | 两种模式都可用 | 可选 | `chat-completions`（默认）或 `responses`，声明上游 OpenAI 协议变体 |

@@ -7,6 +7,7 @@ import {
   checkServiceAuthFromOcrTokenHeader,
   isEmbeddedUpstreamPath,
   parseUpstreamConfig,
+  parseUpstreamHeaders,
   parseUpstreamFromEmbeddedPath,
   parseUpstreamFormat,
   parseAccessTokens,
@@ -82,11 +83,13 @@ async function forwardMessages(
 
   // Step 3: fetch upstream
   const signal = buildUpstreamSignal(req);
+  const upstreamHeaders = parseUpstreamHeaders(req);
   let upstreamResponse: Response;
   try {
     upstreamResponse = await callUpstream({
       url: upstream.url,
       authorization: upstream.authorization,
+      headers: upstreamHeaders,
       body: outboundBody,
       signal,
     });
