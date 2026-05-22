@@ -117,7 +117,15 @@ export function parseUpstreamHeaders(
   req: FastifyRequest,
 ): Record<string, string> | undefined {
   const raw = readHeader(req, "x-upstream-headers");
-  if (!raw) return undefined;
+  if (raw === undefined) return undefined;
+  if (raw.trim() === "") {
+    throw createApiError(
+      "X-Upstream-Headers must be a non-empty JSON object",
+      400,
+      "invalid_upstream_headers",
+      "invalid_request_error",
+    );
+  }
 
   let parsed: unknown;
   try {
