@@ -91,6 +91,11 @@ export function checkServiceAuthFromOcrTokenHeader(
 
 const HEADER_INJECTION_RE = /[\r\n]/;
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const PROTOTYPE_POLLUTION_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
 const PROTECTED_UPSTREAM_HEADERS = new Set([
   "accept",
   "authorization",
@@ -134,10 +139,13 @@ export function parseUpstreamHeaders(
     );
   }
 
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = Object.create(null);
   for (const [name, value] of Object.entries(parsed)) {
     const normalizedName = name.toLowerCase();
-    if (!HEADER_NAME_RE.test(name)) {
+    if (
+      !HEADER_NAME_RE.test(name) ||
+      PROTOTYPE_POLLUTION_KEYS.has(normalizedName)
+    ) {
       throw createApiError(
         `invalid upstream header name: ${name}`,
         400,
