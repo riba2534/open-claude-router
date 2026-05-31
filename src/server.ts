@@ -14,6 +14,7 @@ const fastify = Fastify({
       paths: [
         "req.headers.authorization",
         'req.headers["x-upstream-authorization"]',
+        'req.headers["x-upstream-headers"]',
         'req.headers["x-api-key"]',
       ],
       censor: "[REDACTED]",

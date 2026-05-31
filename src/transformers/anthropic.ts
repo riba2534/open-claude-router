@@ -201,6 +201,10 @@ export class AnthropicTransformer implements Transformer {
           type: "function",
           function: { name: request.tool_choice.name },
         };
+      } else if (request.tool_choice.type === "any") {
+        // Anthropic "any" (model must call a tool) == OpenAI "required".
+        // Passing the literal "any" through 400s on OpenAI-shaped upstreams.
+        result.tool_choice = "required";
       } else {
         result.tool_choice = request.tool_choice.type;
       }
@@ -273,6 +277,10 @@ export class AnthropicTransformer implements Transformer {
         let toolCallChunks = 0;
         let isClosed = false;
         let isThinkingStarted = false;
+        // Tracks reasoning_content-derived thinking that still needs a synthetic
+        // signature_delta to seal the thinking block (see normalization below).
+        let reasoningThinkingActive = false;
+        let reasoningSignatureSent = false;
         let contentIndex = 0;
         let currentContentBlockIndex = -1; // Track the current content block index
 
@@ -506,6 +514,36 @@ export class AnthropicTransformer implements Transformer {
                 }
                 if (!choice) {
                   continue;
+                }
+
+                // DeepSeek/Kimi-style upstreams stream reasoning as a
+                // `reasoning_content` string rather than Anthropic's `thinking`
+                // object. Normalize it so the thinking-block handling below
+                // renders it as Anthropic thinking deltas instead of dropping it.
+                if (
+                  (choice?.delta as any)?.reasoning_content &&
+                  !(choice.delta as any).thinking
+                ) {
+                  (choice.delta as any).thinking = {
+                    content: (choice.delta as any).reasoning_content,
+                  };
+                  reasoningThinkingActive = true;
+                } else if (
+                  reasoningThinkingActive &&
+                  !reasoningSignatureSent &&
+                  !(choice?.delta as any)?.thinking &&
+                  (choice?.delta?.content || choice?.delta?.tool_calls)
+                ) {
+                  // First content/tool_call after a reasoning_content run: the
+                  // thinking block must be sealed with a signature_delta before
+                  // content_block_stop. The upstream gave none, so synthesize one
+                  // (matches the reference reasoning transformer's Date.now()
+                  // signature). Routed through the signature branch below.
+                  (choice.delta as any).thinking = {
+                    signature: `sig_${Date.now()}`,
+                  };
+                  reasoningSignatureSent = true;
+                  reasoningThinkingActive = false;
                 }
 
                 if (choice?.delta?.thinking && !isClosed && !hasFinished) {
@@ -848,7 +886,7 @@ export class AnthropicTransformer implements Transformer {
                             )
                           );
                         } catch (fixError) {
-                          console.error(fixError);
+                          this.logger?.error({ err: fixError }, "failed to fix tool arguments");
                         }
                       }
                     }
@@ -857,7 +895,7 @@ export class AnthropicTransformer implements Transformer {
 
                 if (choice?.finish_reason && !isClosed && !hasFinished) {
                   if (contentChunks === 0 && toolCallChunks === 0) {
-                    console.error(
+                    this.logger?.error(
                       "Warning: No content in the stream response!"
                     );
                   }
@@ -923,7 +961,7 @@ export class AnthropicTransformer implements Transformer {
             try {
               controller.error(error);
             } catch (controllerError) {
-              console.error(controllerError);
+              this.logger?.error({ err: controllerError }, "controller.error failed");
             }
           }
         } finally {
@@ -931,7 +969,7 @@ export class AnthropicTransformer implements Transformer {
             try {
               reader.releaseLock();
             } catch (releaseError) {
-              console.error(releaseError);
+              this.logger?.error({ err: releaseError }, "reader.releaseLock failed");
             }
           }
         }
@@ -941,7 +979,7 @@ export class AnthropicTransformer implements Transformer {
           {
             reqId: context.req.id,
           },
-          `cancle stream: ${reason}`
+          `cancel stream: ${reason}`
         );
       },
     });
@@ -1017,11 +1055,17 @@ export class AnthropicTransformer implements Transformer {
           });
         });
       }
-      if ((choice.message as any)?.thinking?.content) {
+      // DeepSeek/Kimi-style upstreams return reasoning as `reasoning_content`
+      // rather than Anthropic's `thinking` object; surface either as a thinking
+      // block so the reasoning isn't silently dropped.
+      const messageThinking =
+        (choice.message as any)?.thinking?.content ??
+        (choice.message as any)?.reasoning_content;
+      if (messageThinking) {
         content.push({
           type: "thinking",
-          thinking: (choice.message as any).thinking.content,
-          signature: (choice.message as any).thinking.signature,
+          thinking: messageThinking,
+          signature: (choice.message as any)?.thinking?.signature,
         });
       }
       const result = {

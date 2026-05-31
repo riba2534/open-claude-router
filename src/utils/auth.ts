@@ -90,11 +90,112 @@ export function checkServiceAuthFromOcrTokenHeader(
 }
 
 const HEADER_INJECTION_RE = /[\r\n]/;
+// Reject C0 control characters (except TAB, 0x09) and DEL in header values.
+// CR/LF are already rejected elsewhere; this also catches NUL and other CTLs
+// that undici rejects, so clients get a 400 instead of a later upstream fetch
+// failure.
+const HEADER_VALUE_INVALID_RE = /[\x00-\x08\x0A-\x1F\x7F]/;
+const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const PROTOTYPE_POLLUTION_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
+const PROTECTED_UPSTREAM_HEADERS = new Set([
+  "accept",
+  "authorization",
+  "connection",
+  "content-length",
+  "content-type",
+  "expect",
+  "host",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "x-ocr-token",
+]);
 
 function readHeader(req: FastifyRequest, name: string): string | undefined {
   const v = req.headers[name.toLowerCase()];
   if (Array.isArray(v)) return v[0];
   return v;
+}
+
+export function parseUpstreamHeaders(
+  req: FastifyRequest,
+): Record<string, string> | undefined {
+  const raw = readHeader(req, "x-upstream-headers");
+  if (raw === undefined) return undefined;
+  if (raw.trim() === "") {
+    throw createApiError(
+      "X-Upstream-Headers must be a non-empty JSON object",
+      400,
+      "invalid_upstream_headers",
+      "invalid_request_error",
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw createApiError(
+      "X-Upstream-Headers must be a JSON object",
+      400,
+      "invalid_upstream_headers",
+      "invalid_request_error",
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw createApiError(
+      "X-Upstream-Headers must be a JSON object",
+      400,
+      "invalid_upstream_headers",
+      "invalid_request_error",
+    );
+  }
+
+  const headers: Record<string, string> = Object.create(null);
+  for (const [name, value] of Object.entries(parsed)) {
+    const normalizedName = name.toLowerCase();
+    if (
+      !HEADER_NAME_RE.test(name) ||
+      PROTOTYPE_POLLUTION_KEYS.has(normalizedName)
+    ) {
+      throw createApiError(
+        `invalid upstream header name: ${name}`,
+        400,
+        "invalid_upstream_header",
+        "invalid_request_error",
+      );
+    }
+    if (
+      PROTECTED_UPSTREAM_HEADERS.has(normalizedName) ||
+      normalizedName.startsWith("x-upstream-")
+    ) {
+      throw createApiError(
+        `protected upstream header cannot be overridden: ${normalizedName}`,
+        400,
+        "protected_upstream_header",
+        "invalid_request_error",
+      );
+    }
+    if (typeof value !== "string" || HEADER_VALUE_INVALID_RE.test(value)) {
+      throw createApiError(
+        `invalid value for upstream header: ${name}`,
+        400,
+        "invalid_upstream_header",
+        "invalid_request_error",
+      );
+    }
+    headers[normalizedName] = value;
+  }
+  return Object.keys(headers).length ? headers : undefined;
 }
 
 /**
@@ -198,9 +299,63 @@ export function parseUpstreamFromEmbeddedPath(req: FastifyRequest): {
   }
 
   return {
-    upstream: { url: pathPart, authorization: upstreamAuth },
+    upstream: {
+      url: pathPart,
+      authorization: upstreamAuth,
+      model: readHeader(req, "x-upstream-model") || undefined,
+    },
     endpoint,
   };
+}
+
+/**
+ * Parse `X-Upstream-Model-Map` into Map<clientModel, upstreamModel>.
+ * Format: `claude-opus-4-6=gpt-5.5,claude-sonnet-4-6=gpt-5.4`.
+ */
+export function parseModelMap(req: FastifyRequest): Map<string, string> {
+  const raw = readHeader(req, "x-upstream-model-map");
+  if (raw === undefined || raw.trim() === "") return new Map();
+
+  const map = new Map<string, string>();
+  for (const pair of raw.split(",")) {
+    const trimmed = pair.trim();
+    const eq = trimmed.indexOf("=");
+    if (!trimmed || eq <= 0 || eq === trimmed.length - 1) {
+      throw createApiError(
+        "X-Upstream-Model-Map contains an invalid mapping " +
+          "(expected format: model-a=upstream-a,model-b=upstream-b)",
+        400,
+        "invalid_model_map",
+        "invalid_request_error",
+      );
+    }
+    const from = trimmed.slice(0, eq).trim();
+    const to = trimmed.slice(eq + 1).trim();
+    if (!from || !to || HEADER_VALUE_INVALID_RE.test(from + to)) {
+      throw createApiError(
+        "X-Upstream-Model-Map contains an invalid mapping " +
+          "(expected format: model-a=upstream-a,model-b=upstream-b)",
+        400,
+        "invalid_model_map",
+        "invalid_request_error",
+      );
+    }
+    map.set(from, to);
+  }
+  return map;
+}
+
+/**
+ * Resolve upstream model override. Undefined means "do not override"; the
+ * transformed request keeps its original body model.
+ */
+export function resolveUpstreamModel(
+  bodyModel: string | undefined,
+  upstreamModel: string | undefined,
+  modelMap: Map<string, string>,
+): string | undefined {
+  const mapped = bodyModel ? modelMap.get(bodyModel) : undefined;
+  return mapped ?? upstreamModel;
 }
 
 export function parseUpstreamConfig(req: FastifyRequest): UpstreamConfig {

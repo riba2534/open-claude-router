@@ -34,6 +34,7 @@ export interface UpstreamCallOptions {
   authorization: string;
   body: unknown;
   signal: AbortSignal;
+  headers?: Record<string, string>;
 }
 
 export async function callUpstream(
@@ -42,6 +43,7 @@ export async function callUpstream(
   return fetch(opts.url, {
     method: "POST",
     headers: {
+      ...opts.headers,
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
       authorization: opts.authorization,

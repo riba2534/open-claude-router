@@ -86,6 +86,10 @@ export class OpenAIResponsesTransformer implements Transformer {
     request: UnifiedChatRequest
   ): Promise<UnifiedChatRequest> {
     delete request.temperature;
+    // max_tokens → max_output_tokens（Responses API 使用后者控制输出长度）
+    if (request.max_tokens != null) {
+      (request as any).max_output_tokens = request.max_tokens;
+    }
     delete request.max_tokens;
 
     // 处理 reasoning 参数
@@ -212,6 +216,19 @@ export class OpenAIResponsesTransformer implements Transformer {
       }
     }
 
+    // tool_choice 格式转换：unified { type: "function", function: { name } }
+    // → Responses { type: "function", name }（扁平结构，无 function 嵌套）
+    if (request.tool_choice) {
+      const tc = request.tool_choice as any;
+      if (tc.type === "function" && tc.function?.name) {
+        (request as any).tool_choice = {
+          type: "function",
+          name: tc.function.name,
+        };
+      }
+      // "auto" / "none" / "required" 等简单值直接透传
+    }
+
     (request as any).parallel_tool_calls = false;
 
     return request;
@@ -266,6 +283,17 @@ export class OpenAIResponsesTransformer implements Transformer {
               lastEventType = eventType;
             }
             return currentIndex;
+          };
+
+          // tool_call index 映射：按 item_id 路由到递增的 tool_calls 数组索引
+          // 支持多工具并行调用场景
+          const toolCallIndexMap = new Map<string, number>();
+          let nextToolCallIndex = 0;
+          const getToolCallIndex = (itemId: string): number => {
+            if (!toolCallIndexMap.has(itemId)) {
+              toolCallIndexMap.set(itemId, nextToolCallIndex++);
+            }
+            return toolCallIndexMap.get(itemId)!;
           };
 
           try {
@@ -349,7 +377,17 @@ export class OpenAIResponsesTransformer implements Transformer {
                                 role: "assistant",
                                 tool_calls: [
                                   {
-                                    index: 0,
+                                    // Key the index map by item.id (= the
+                                    // `item_id` carried on later
+                                    // function_call_arguments.delta events).
+                                    // call_id is a *different* identifier, so
+                                    // keying by it here would never match the
+                                    // delta lookup below and would scatter a
+                                    // tool call's name and arguments across two
+                                    // indices.
+                                    index: getToolCallIndex(
+                                      data.item.id || data.item.call_id || ""
+                                    ),
                                     id: data.item.call_id || data.item.id,
                                     function: {
                                       name: data.item.name || "",
@@ -466,7 +504,9 @@ export class OpenAIResponsesTransformer implements Transformer {
                               delta: {
                                 tool_calls: [
                                   {
-                                    index: 0,
+                                    index: getToolCallIndex(
+                                      data.item_id || ""
+                                    ),
                                     function: {
                                       arguments: data.delta || "",
                                     },
@@ -575,7 +615,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                     controller.enqueue(encoder.encode(line + "\n"));
                   }
                 } catch (error) {
-                  console.error("Error processing line:", line, error);
+                  transformer.logger?.error({ err: error, line }, "Error processing SSE line");
                   // 如果解析失败，直接传递原始行
                   controller.enqueue(encoder.encode(line + "\n"));
                 }
@@ -593,13 +633,13 @@ export class OpenAIResponsesTransformer implements Transformer {
               controller.enqueue(encoder.encode(doneChunk));
             }
           } catch (error) {
-            console.error("Stream error:", error);
+            transformer.logger?.error({ err: error }, "Stream error");
             controller.error(error);
           } finally {
             try {
               reader.releaseLock();
             } catch (e) {
-              console.error("Error releasing reader lock:", e);
+              transformer.logger?.error({ err: e }, "Error releasing reader lock");
             }
             controller.close();
           }
@@ -653,7 +693,7 @@ export class OpenAIResponsesTransformer implements Transformer {
     const messageOutput = responseData.output?.find(
       (item) => item.type === "message"
     );
-    const functionCallOutput = responseData.output?.find(
+    const functionCallOutputs = responseData.output?.filter(
       (item) => item.type === "function_call"
     );
     let annotations;
@@ -736,18 +776,16 @@ export class OpenAIResponsesTransformer implements Transformer {
       }
     }
 
-    if (functionCallOutput) {
-      // 处理function_call类型的输出
-      toolCalls = [
-        {
-          id: functionCallOutput.call_id || functionCallOutput.id,
-          function: {
-            name: functionCallOutput.name,
-            arguments: functionCallOutput.arguments,
-          },
-          type: "function",
+    if (functionCallOutputs && functionCallOutputs.length > 0) {
+      // 处理function_call类型的输出（支持多工具并行调用）
+      toolCalls = functionCallOutputs.map((fc: any) => ({
+        id: fc.call_id || fc.id,
+        function: {
+          name: fc.name,
+          arguments: fc.arguments,
         },
-      ];
+        type: "function",
+      }));
     }
 
     // 构建chat格式的响应

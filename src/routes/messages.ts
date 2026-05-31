@@ -6,16 +6,21 @@ import {
   checkServiceAuth,
   checkServiceAuthFromOcrTokenHeader,
   isEmbeddedUpstreamPath,
+  parseModelMap,
   parseUpstreamConfig,
+  parseUpstreamHeaders,
   parseUpstreamFromEmbeddedPath,
   parseUpstreamFormat,
   parseAccessTokens,
+  resolveUpstreamModel,
   type UpstreamConfig,
   type UpstreamFormat,
 } from "../utils/auth.js";
 import {
   scrubAnthropicOnlyFields,
   scrubChatCompletionsIncompatibleFields,
+  scrubResponsesReasoningArtifacts,
+  convertThinkingToReasoningContent,
 } from "../utils/strip.js";
 import {
   buildUpstreamSignal,
@@ -56,18 +61,38 @@ async function forwardMessages(
   }
   scrubAnthropicOnlyFields(unified as unknown as Record<string, unknown>);
 
+  // `reasoning.enabled` reflects the client's `thinking: { type: "enabled" }`.
+  // Capture it before the `reasoning` field is stripped on the chat path below.
+  const reasoningEnabled = !!(unified as any).reasoning?.enabled;
+
   // Step 2: unified -> upstream-specific shape (only needed for Responses API).
   // For chat-completions, unified IS already the OpenAI Chat Completions format,
-  // so we send it directly. The `reasoning` field is consumed by the Responses
-  // transformer to enable reasoning summaries upstream; on the chat-completions
-  // path it must be stripped (vanilla /chat/completions 400s on unknown keys).
+  // so we send it directly.
   let outboundBody: any = unified;
   if (format === "responses") {
+    // Drop the chat-completions-only `thinking` / `reasoning_content` artifacts
+    // so they don't leak into the Responses `input`; reasoning is conveyed via
+    // the top-level `reasoning` param (consumed by transformRequestIn) instead.
+    scrubResponsesReasoningArtifacts(
+      unified as unknown as Record<string, unknown>,
+    );
     outboundBody = await responsesT.transformRequestIn!(unified as any);
   } else {
+    // DeepSeek/Kimi-style upstreams require `reasoning_content` on assistant
+    // tool-call messages when thinking is enabled; this also strips the custom
+    // `thinking` field. The top-level `reasoning` field is then removed (vanilla
+    // /chat/completions 400s on unknown keys).
+    convertThinkingToReasoningContent(
+      unified as unknown as Record<string, unknown>,
+      reasoningEnabled,
+    );
     scrubChatCompletionsIncompatibleFields(
       unified as unknown as Record<string, unknown>,
     );
+    // 注入 stream_options 让上游在流式响应末尾返回 usage
+    if (wantsStream) {
+      (unified as any).stream_options = { include_usage: true };
+    }
   }
 
   req.log.info(
@@ -81,12 +106,16 @@ async function forwardMessages(
   );
 
   // Step 3: fetch upstream
+  // Keep request validation outside the fetch try/catch so bad alias headers
+  // return 400 instead of being rewritten as upstream_unreachable/502.
+  const upstreamHeaders = parseUpstreamHeaders(req);
   const signal = buildUpstreamSignal(req);
   let upstreamResponse: Response;
   try {
     upstreamResponse = await callUpstream({
       url: upstream.url,
       authorization: upstream.authorization,
+      headers: upstreamHeaders,
       body: outboundBody,
       signal,
     });
@@ -191,6 +220,11 @@ export async function registerMessagesRoute(fastify: FastifyInstance) {
       checkServiceAuth(req, accessTokens);
       const format = parseUpstreamFormat(req);
       const upstream = parseUpstreamConfig(req);
+      upstream.model = resolveUpstreamModel(
+        req.body?.model,
+        upstream.model,
+        parseModelMap(req),
+      );
       return forwardMessages(
         req,
         reply,
@@ -233,6 +267,11 @@ export async function registerMessagesRoute(fastify: FastifyInstance) {
       if (endpoint === "count_tokens") {
         return handleCountTokens(req, reply);
       }
+      upstream.model = resolveUpstreamModel(
+        req.body?.model,
+        upstream.model,
+        parseModelMap(req),
+      );
       return forwardMessages(
         req,
         reply,
