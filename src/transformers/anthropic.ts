@@ -276,13 +276,17 @@ export class AnthropicTransformer implements Transformer {
         let contentChunks = 0;
         let toolCallChunks = 0;
         let isClosed = false;
-        let isThinkingStarted = false;
         // Tracks reasoning_content-derived thinking that still needs a synthetic
         // signature_delta to seal the thinking block (see normalization below).
         let reasoningThinkingActive = false;
         let reasoningSignatureSent = false;
         let contentIndex = 0;
         let currentContentBlockIndex = -1; // Track the current content block index
+        // Type of the currently open content block. Needed because interleaved
+        // reasoning/content chunks (e.g. qwen vision) can otherwise route
+        // signature/thinking deltas onto a text block, which Anthropic clients
+        // reject ("Content block is not a thinking block").
+        let currentBlockType: "text" | "thinking" | "tool" | null = null;
 
         // 原子性的content block index分配函数
         const assignContentBlockIndex = (): number => {
@@ -319,24 +323,47 @@ export class AnthropicTransformer implements Transformer {
           }
         };
 
+        // Close the currently open content block, if any. An unsigned thinking
+        // block is sealed with a synthetic signature_delta first — Anthropic
+        // requires a signature before content_block_stop on thinking blocks.
+        const closeCurrentBlock = () => {
+          if (currentContentBlockIndex < 0) return;
+          if (currentBlockType === "thinking" && !reasoningSignatureSent) {
+            safeEnqueue(
+              encoder.encode(
+                `event: content_block_delta\ndata: ${JSON.stringify({
+                  type: "content_block_delta",
+                  index: currentContentBlockIndex,
+                  delta: {
+                    type: "signature_delta",
+                    signature: `sig_${Date.now()}`,
+                  },
+                })}\n\n`
+              )
+            );
+            reasoningSignatureSent = true;
+            reasoningThinkingActive = false;
+          }
+          safeEnqueue(
+            encoder.encode(
+              `event: content_block_stop\ndata: ${JSON.stringify({
+                type: "content_block_stop",
+                index: currentContentBlockIndex,
+              })}\n\n`
+            )
+          );
+          if (currentBlockType === "text") {
+            hasTextContentStarted = false;
+          }
+          currentContentBlockIndex = -1;
+          currentBlockType = null;
+        };
+
         const safeClose = () => {
           if (!isClosed) {
             try {
               // Close any remaining open content block
-              if (currentContentBlockIndex >= 0) {
-                const contentBlockStop = {
-                  type: "content_block_stop",
-                  index: currentContentBlockIndex,
-                };
-                safeEnqueue(
-                  encoder.encode(
-                    `event: content_block_stop\ndata: ${JSON.stringify(
-                      contentBlockStop
-                    )}\n\n`
-                  )
-                );
-                currentContentBlockIndex = -1;
-              }
+              closeCurrentBlock();
 
               if (stopReasonMessageDelta) {
                 safeEnqueue(
@@ -547,68 +574,66 @@ export class AnthropicTransformer implements Transformer {
                 }
 
                 if (choice?.delta?.thinking && !isClosed && !hasFinished) {
-                  // Close any previous content block if open
-                  // if (currentContentBlockIndex >= 0) {
-                  //   const contentBlockStop = {
-                  //     type: "content_block_stop",
-                  //     index: currentContentBlockIndex,
-                  //   };
-                  //   safeEnqueue(
-                  //     encoder.encode(
-                  //       `event: content_block_stop\ndata: ${JSON.stringify(
-                  //         contentBlockStop
-                  //       )}\n\n`
-                  //     )
-                  //   );
-                  //   currentContentBlockIndex = -1;
-                  // }
-
-                  if (!isThinkingStarted) {
-                    const thinkingBlockIndex = assignContentBlockIndex();
-                    const contentBlockStart = {
-                      type: "content_block_start",
-                      index: thinkingBlockIndex,
-                      content_block: { type: "thinking", thinking: "" },
-                    };
-                    safeEnqueue(
-                      encoder.encode(
-                        `event: content_block_start\ndata: ${JSON.stringify(
-                          contentBlockStart
-                        )}\n\n`
-                      )
-                    );
-                    currentContentBlockIndex = thinkingBlockIndex;
-                    isThinkingStarted = true;
-                  }
                   if (choice.delta.thinking.signature) {
-                    const thinkingSignature = {
-                      type: "content_block_delta",
-                      index: currentContentBlockIndex,
-                      delta: {
-                        type: "signature_delta",
-                        signature: choice.delta.thinking.signature,
-                      },
-                    };
-                    safeEnqueue(
-                      encoder.encode(
-                        `event: content_block_delta\ndata: ${JSON.stringify(
-                          thinkingSignature
-                        )}\n\n`
-                      )
-                    );
-                    const contentBlockStop = {
-                      type: "content_block_stop",
-                      index: currentContentBlockIndex,
-                    };
-                    safeEnqueue(
-                      encoder.encode(
-                        `event: content_block_stop\ndata: ${JSON.stringify(
-                          contentBlockStop
-                        )}\n\n`
-                      )
-                    );
-                    currentContentBlockIndex = -1;
+                    // Seal only while the thinking block is actually open. A
+                    // stray signature arriving after the block was closed by a
+                    // content/tool chunk must be dropped — emitting it onto the
+                    // current (text/tool) block breaks Anthropic clients.
+                    if (currentBlockType === "thinking") {
+                      const thinkingSignature = {
+                        type: "content_block_delta",
+                        index: currentContentBlockIndex,
+                        delta: {
+                          type: "signature_delta",
+                          signature: choice.delta.thinking.signature,
+                        },
+                      };
+                      safeEnqueue(
+                        encoder.encode(
+                          `event: content_block_delta\ndata: ${JSON.stringify(
+                            thinkingSignature
+                          )}\n\n`
+                        )
+                      );
+                      reasoningSignatureSent = true;
+                      reasoningThinkingActive = false;
+                      const contentBlockStop = {
+                        type: "content_block_stop",
+                        index: currentContentBlockIndex,
+                      };
+                      safeEnqueue(
+                        encoder.encode(
+                          `event: content_block_stop\ndata: ${JSON.stringify(
+                            contentBlockStop
+                          )}\n\n`
+                        )
+                      );
+                      currentContentBlockIndex = -1;
+                      currentBlockType = null;
+                    }
                   } else if (choice.delta.thinking.content) {
+                    if (currentBlockType !== "thinking") {
+                      // Reasoning resumed after content/tool output (or first
+                      // reasoning chunk): close whatever block is open and
+                      // start a fresh thinking block.
+                      closeCurrentBlock();
+                      const thinkingBlockIndex = assignContentBlockIndex();
+                      const contentBlockStart = {
+                        type: "content_block_start",
+                        index: thinkingBlockIndex,
+                        content_block: { type: "thinking", thinking: "" },
+                      };
+                      safeEnqueue(
+                        encoder.encode(
+                          `event: content_block_start\ndata: ${JSON.stringify(
+                            contentBlockStart
+                          )}\n\n`
+                        )
+                      );
+                      currentContentBlockIndex = thinkingBlockIndex;
+                      currentBlockType = "thinking";
+                      reasoningSignatureSent = false;
+                    }
                     const thinkingChunk = {
                       type: "content_block_delta",
                       index: currentContentBlockIndex,
@@ -630,24 +655,10 @@ export class AnthropicTransformer implements Transformer {
                 if (choice?.delta?.content && !isClosed && !hasFinished) {
                   contentChunks++;
 
-                  // Close any previous content block if open and it's not a text content block
-                  if (currentContentBlockIndex >= 0) {
-                    // Check if current content block is text type
-                    const isCurrentTextBlock = hasTextContentStarted;
-                    if (!isCurrentTextBlock) {
-                      const contentBlockStop = {
-                        type: "content_block_stop",
-                        index: currentContentBlockIndex,
-                      };
-                      safeEnqueue(
-                        encoder.encode(
-                          `event: content_block_stop\ndata: ${JSON.stringify(
-                            contentBlockStop
-                          )}\n\n`
-                        )
-                      );
-                      currentContentBlockIndex = -1;
-                    }
+                  // Close any previous non-text block (seals an unsigned
+                  // thinking block with its synthetic signature first).
+                  if (currentBlockType !== "text") {
+                    closeCurrentBlock();
                   }
 
                   if (!hasTextContentStarted && !hasFinished) {
@@ -669,6 +680,7 @@ export class AnthropicTransformer implements Transformer {
                       )
                     );
                     currentContentBlockIndex = textBlockIndex;
+                    currentBlockType = "text";
                   }
 
                   if (!isClosed && !hasFinished) {
@@ -695,22 +707,8 @@ export class AnthropicTransformer implements Transformer {
                   !isClosed &&
                   !hasFinished
                 ) {
-                  // Close text content block if open
-                  if (currentContentBlockIndex >= 0 && hasTextContentStarted) {
-                    const contentBlockStop = {
-                      type: "content_block_stop",
-                      index: currentContentBlockIndex,
-                    };
-                    safeEnqueue(
-                      encoder.encode(
-                        `event: content_block_stop\ndata: ${JSON.stringify(
-                          contentBlockStop
-                        )}\n\n`
-                      )
-                    );
-                    currentContentBlockIndex = -1;
-                    hasTextContentStarted = false;
-                  }
+                  // Close the open content block (seals unsigned thinking).
+                  closeCurrentBlock();
 
                   choice?.delta?.annotations.forEach((annotation: any) => {
                     const annotationBlockIndex = assignContentBlockIndex();
@@ -767,21 +765,9 @@ export class AnthropicTransformer implements Transformer {
                       !toolCallIndexToContentBlockIndex.has(toolCallIndex);
 
                     if (isUnknownIndex) {
-                      // Close any previous content block if open
-                      if (currentContentBlockIndex >= 0) {
-                        const contentBlockStop = {
-                          type: "content_block_stop",
-                          index: currentContentBlockIndex,
-                        };
-                        safeEnqueue(
-                          encoder.encode(
-                            `event: content_block_stop\ndata: ${JSON.stringify(
-                              contentBlockStop
-                            )}\n\n`
-                          )
-                        );
-                        currentContentBlockIndex = -1;
-                      }
+                      // Close any previous content block if open (seals an
+                      // unsigned thinking block first).
+                      closeCurrentBlock();
 
                       const newContentBlockIndex = assignContentBlockIndex();
                       toolCallIndexToContentBlockIndex.set(
@@ -811,6 +797,7 @@ export class AnthropicTransformer implements Transformer {
                         )
                       );
                       currentContentBlockIndex = newContentBlockIndex;
+                      currentBlockType = "tool";
 
                       const toolCallInfo = {
                         id: toolCallId,
@@ -900,21 +887,9 @@ export class AnthropicTransformer implements Transformer {
                     );
                   }
 
-                  // Close any remaining open content block
-                  if (currentContentBlockIndex >= 0) {
-                    const contentBlockStop = {
-                      type: "content_block_stop",
-                      index: currentContentBlockIndex,
-                    };
-                    safeEnqueue(
-                      encoder.encode(
-                        `event: content_block_stop\ndata: ${JSON.stringify(
-                          contentBlockStop
-                        )}\n\n`
-                      )
-                    );
-                    currentContentBlockIndex = -1;
-                  }
+                  // Close any remaining open content block (seals unsigned
+                  // thinking with a synthetic signature first).
+                  closeCurrentBlock();
 
                   if (!isClosed) {
                     const stopReasonMapping: Record<string, string> = {
