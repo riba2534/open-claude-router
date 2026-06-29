@@ -83,7 +83,9 @@ export class OpenAIResponsesTransformer implements Transformer {
   logger?: any;
 
   async transformRequestIn(
-    request: UnifiedChatRequest
+    request: UnifiedChatRequest,
+    _provider?: unknown,
+    context?: { reasoningSummary?: string | false }
   ): Promise<UnifiedChatRequest> {
     delete request.temperature;
     // max_tokens → max_output_tokens（Responses API 使用后者控制输出长度）
@@ -96,6 +98,9 @@ export class OpenAIResponsesTransformer implements Transformer {
     if (request.reasoning) {
       (request as any).reasoning = {
         effort: request.reasoning.effort,
+        ...(context?.reasoningSummary === false
+          ? {}
+          : { summary: context?.reasoningSummary ?? "detailed" }),
       };
     }
 

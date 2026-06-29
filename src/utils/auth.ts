@@ -27,6 +27,34 @@ export function parseUpstreamFormat(req: FastifyRequest): UpstreamFormat {
   );
 }
 
+export function parseReasoningSummary(
+  req: FastifyRequest,
+): string | false | undefined {
+  const v = req.headers["x-upstream-reasoning-summary"];
+  const raw = (Array.isArray(v) ? v[0] : v)?.trim();
+  if (raw === undefined || raw === "") return undefined;
+
+  const normalized = raw.toLowerCase();
+  if (
+    normalized === "none" ||
+    normalized === "off" ||
+    normalized === "false" ||
+    normalized === "0" ||
+    normalized === "disabled"
+  ) {
+    return false;
+  }
+  if (HEADER_INJECTION_RE.test(raw) || HEADER_VALUE_INVALID_RE.test(raw)) {
+    throw createApiError(
+      "X-Upstream-Reasoning-Summary contains invalid characters",
+      400,
+      "invalid_reasoning_summary",
+      "invalid_request_error",
+    );
+  }
+  return raw;
+}
+
 export function parseAccessTokens(env: string | undefined): Set<string> {
   if (!env) return new Set();
   return new Set(

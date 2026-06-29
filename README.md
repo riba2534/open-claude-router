@@ -188,6 +188,12 @@ claude"
 
 服务侧会把 OpenAI 的 `response.reasoning_summary_text.delta` 等事件转成 Anthropic 的 `thinking` 块返回给 Claude Code。**其他所有 alias（不带 `X-Upstream-Format` 或显式 `chat-completions`）行为完全不变**。
 
+默认情况下，服务会向 Responses API 上游发送 `reasoning.summary: "detailed"` 以请求 reasoning summary。若上游不支持该字段，可在 alias 里关闭：
+
+```bash
+ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Format: responses\nX-Upstream-Reasoning-Summary: none\nX-Upstream-Model-Map: claude-sonnet-4-6=your-model'
+```
+
 ### 3. 启动 Claude Code
 
 ```bash
@@ -231,6 +237,7 @@ myocr
 | `Authorization: Bearer <token>` | header | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | 服务自身访问鉴权 |
 | `X-OCR-Token` | path | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | path 模式下 `Authorization` 被上游凭证占用，服务鉴权改走此 header |
 | `X-Upstream-Format` | 两种模式都可用 | 可选 | `chat-completions`（默认）或 `responses`，声明上游 OpenAI 协议变体 |
+| `X-Upstream-Reasoning-Summary` | Responses | 可选 | 控制发送给 Responses API 的 `reasoning.summary`；默认 `detailed`，设为 `none` / `off` / `false` / `0` / `disabled` 时不发送 |
 
 ### Path 模式
 

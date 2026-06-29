@@ -11,6 +11,7 @@ import {
   parseUpstreamHeaders,
   parseUpstreamFromEmbeddedPath,
   parseUpstreamFormat,
+  parseReasoningSummary,
   parseAccessTokens,
   resolveUpstreamModel,
   type UpstreamConfig,
@@ -76,7 +77,12 @@ async function forwardMessages(
     scrubResponsesReasoningArtifacts(
       unified as unknown as Record<string, unknown>,
     );
-    outboundBody = await responsesT.transformRequestIn!(unified as any);
+    const reasoningSummary = parseReasoningSummary(req);
+    outboundBody = await responsesT.transformRequestIn!(
+      unified as any,
+      undefined as any,
+      reasoningSummary === undefined ? {} : { reasoningSummary },
+    );
   } else {
     // DeepSeek/Kimi-style upstreams require `reasoning_content` on assistant
     // tool-call messages when thinking is enabled; this also strips the custom
