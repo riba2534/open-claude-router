@@ -96,7 +96,6 @@ export class OpenAIResponsesTransformer implements Transformer {
     if (request.reasoning) {
       (request as any).reasoning = {
         effort: request.reasoning.effort,
-        summary: "detailed",
       };
     }
 
