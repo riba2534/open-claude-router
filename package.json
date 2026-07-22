@@ -1,6 +1,6 @@
 {
   "name": "open-claude-router",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Stateless Anthropic <-> OpenAI protocol bridge for Claude Code. All upstream info passed per-request via headers.",
   "type": "module",
   "private": true,
