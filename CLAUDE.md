@@ -78,7 +78,7 @@ client SSE / JSON
 
 ### 错误格式
 
-服务端所有错误都包装成 Anthropic 标准 `{ "type": "error", "error": { "type": "...", "message": "..." } }`，状态码映射在 `src/utils/upstream.ts` 的 `mapUpstreamStatusToAnthropicErrorType`，全局错误兜底在 `src/server.ts` 的 `setErrorHandler`。
+服务端所有错误都包装成 Anthropic 标准 `{ "type": "error", "error": { "type": "...", "message": "..." } }`，状态码映射在 `src/utils/upstream.ts` 的 `mapUpstreamStatusToAnthropicErrorType`，全局错误兜底在 `src/server.ts` 的 `setErrorHandler`。模型上游返回任意非 2xx 时，`forwardMessages()` 必须保留原状态码和错误体，并增加 `X-Should-Retry: true`，让 Claude Code 使用自身有界重试策略；router 自身不能再次请求上游，避免两层重试相乘。
 
 ## 重要约束（违反会出问题）
 
