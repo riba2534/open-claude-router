@@ -45,6 +45,7 @@ Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(Ope
 - **同时支持 OpenAI 两套协议**：默认走 Chat Completions（兼容 OpenAI 官方、OpenRouter、各类 OpenAI 兼容网关 / Kimi / DeepSeek 等），通过 `X-Upstream-Format: responses` opt-in 切到 Responses API（OpenAI o-series / gpt-5 原生协议，含 reasoning summary 转 Anthropic `thinking` 块）
 - **alias 里完成全部配置**：模型映射、上游 URL、上游凭证、服务鉴权、额外网关 header 都能通过 Claude Code alias 注入
 - **模型名映射**：客户端保留 `claude-*` 名称以启用 Claude Code 能力，上游收到真实模型名
+- **上游错误统一交给客户端重试**：上游返回任意非 2xx 时保留原状态码和错误内容，同时响应 `X-Should-Retry: true`，由 Claude Code 使用自身有界重试策略处理；服务端不重复请求上游
 - **两种接入方式**：上游信息可以放 HTTP header，也可以直接拼在 URL path 里
 - **轻量好部署**：esbuild 打包后单文件 ~70 KB，Docker 镜像几十 MB，开箱即用
 
@@ -268,6 +269,7 @@ Claude Code 会自动追加 `/v1/messages`，服务端识别并砍掉这个后�
 
 ## 常见问题
 
+- **上游错误会重试吗**：会上报为可重试。上游返回任意非 2xx 时，服务保留原状态码和 Anthropic 错误体，并增加 `X-Should-Retry: true`；具体次数和退避由 Claude Code 客户端版本决定。服务自身始终只向上游请求一次，避免服务端重试与客户端重试叠加。
 - **上游报 401 / 403**：先确认 `ANTHROPIC_AUTH_TOKEN` 没填反——path 模式（方式 A/C）里它是**上游凭证**、服务鉴权走 `X-OCR-Token`；header 模式（方式 B）里它是**服务鉴权 token**、上游凭证走 `X-Upstream-Authorization`（见[方式对比表](#2-配置-claude-code-alias)）。另外启用了 `OCR_ACCESS_TOKENS` 却没带对应 token 也会被服务拒绝。
 - **连不通 / `upstream_unreachable`（502）**：检查上游 URL 是否写全（path 模式要拼到 `/chat/completions` 或 `/responses` 这一级）；Docker 下不要在容器内设 `HOST=127.0.0.1`（见[自定义监听地址](#自定义监听地址)的警告）。
 - **上游报 `thinking is enabled but reasoning_content is missing in assistant tool call message`**：部分 DeepSeek / Kimi 式上游在开启 thinking 时，要求带工具调用的 assistant 消息必须携带 `reasoning_content`。服务已自动把 Anthropic `thinking` 转成 `reasoning_content`，并对缺失的历史工具调用消息兜底补全；若仍遇到，请确认运行的是最新版本。

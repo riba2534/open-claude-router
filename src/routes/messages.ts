@@ -134,6 +134,10 @@ async function forwardMessages(
   if (!upstreamResponse.ok) {
     const { status, body: errBody } =
       await buildAnthropicErrorFromUpstream(upstreamResponse);
+    // Preserve the upstream status/body, but explicitly let Claude Code apply
+    // its own bounded retry policy to every upstream HTTP error. The router
+    // remains single-attempt and stateless, so retries have exactly one owner.
+    reply.header("x-should-retry", "true");
     reply.code(status);
     return errBody;
   }
