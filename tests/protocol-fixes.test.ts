@@ -154,6 +154,11 @@ test("stream:true with a JSON upstream yields a full synthesized Anthropic SSE s
           event.content_block?.type === "tool_use")?.content_block.name,
         "read",
       );
+      assert.deepEqual(
+        events.find((event) => event.type === "content_block_start" &&
+          event.content_block?.type === "tool_use")?.content_block.caller,
+        { type: "direct" },
+      );
       const terminal = events.find((event) => event.type === "message_delta");
       assert.equal(terminal.delta.stop_reason, "tool_use");
       assert.deepEqual(terminal.usage, {
@@ -321,6 +326,7 @@ test("legacy streaming function_call becomes tool_use with stop_reason tool_use"
       event.content_block?.type === "tool_use",
   );
   assert.equal(toolStart?.content_block.name, "f");
+  assert.deepEqual(toolStart?.content_block.caller, { type: "direct" });
   assert.equal(
     events.find((event) => event.delta?.type === "input_json_delta")?.delta
       .partial_json,
@@ -361,6 +367,7 @@ test("legacy non-stream function_call becomes tool_use", async () => {
   assert.equal(body.content[0].type, "tool_use");
   assert.equal(body.content[0].name, "f");
   assert.deepEqual(body.content[0].input, { a: 1 });
+  assert.deepEqual(body.content[0].caller, { type: "direct" });
   assert.equal(body.stop_reason, "tool_use");
 });
 
@@ -386,7 +393,7 @@ test("a user turn of only unknown blocks degrades per-block and survives", async
   ]);
 });
 
-test("an unconvertible image source never leaves an empty content array", async () => {
+test("a malformed image source never leaves an empty content array", async () => {
   const anthropic = new AnthropicTransformer();
   const unified = await anthropic.transformRequestOut!({
     model: "claude-test",
@@ -395,7 +402,7 @@ test("an unconvertible image source never leaves an empty content array", async 
       {
         role: "user",
         content: [
-          { type: "image", source: { type: "file", file_id: "file_1" } },
+          { type: "image", source: { type: "file" } },
         ],
       },
     ],
@@ -408,7 +415,7 @@ test("an unconvertible image source never leaves an empty content array", async 
   // The image degrades to a JSON text block instead of vanishing.
   const user = unified.messages.find((message) => message.role === "user");
   assert.ok(user, "user turn was deleted");
-  assert.match((user!.content as any[])[0].text, /file_1/);
+  assert.match((user!.content as any[])[0].text, /"type":"file"/);
 });
 
 test("oversized documents stay typed and oversized unknown blocks stay bounded", async () => {

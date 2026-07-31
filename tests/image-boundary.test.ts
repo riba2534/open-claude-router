@@ -164,7 +164,11 @@ test("Chat tool image reaches a visual user sidecar instead of a JSON string", a
       assert.deepEqual(tool.content, [
         { type: "text", text: "screenshot" },
       ]);
-      assert.equal(sidecar.content[0].type, "image_url");
+      assert.deepEqual(sidecar.content[0], {
+        type: "text",
+        text: '[tool_result multimodal content {"tool_index":1,"tool_call_id_utf16be_base64url":"AGMAYQBsAGwAXwAx"}]',
+      });
+      assert.equal(sidecar.content[1].type, "image_url");
       assert.equal(typeof tool.content, "object");
       return okChatResponse();
     },

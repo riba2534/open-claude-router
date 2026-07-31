@@ -140,6 +140,22 @@ function unsupportedOutputPlaceholder(item: ResponsesAPIOutputItem): string {
   return boundedResponsesFallback(`output item ${type}`, item);
 }
 
+function isProgrammaticResponsesItem(item: ResponsesAPIOutputItem): boolean {
+  return item?.type === "program" ||
+    item?.type === "program_output" ||
+    (item?.type === "function_call" && item.caller != null);
+}
+
+function rejectProgrammaticResponsesItem(item: ResponsesAPIOutputItem): never {
+  throw createApiError(
+    `upstream Responses ${item.type || "programmatic"} item has no ` +
+      "replay-safe Anthropic Messages equivalent",
+    502,
+    "upstream_protocol_error",
+    "api_error",
+  );
+}
+
 const MAX_RESPONSES_FALLBACK_CHARS = 4096;
 
 function boundedResponsesFallback(kind: string, value: unknown): string {
@@ -222,6 +238,11 @@ interface ResponsesAPIOutputItem {
   result?: string;
   status?: string;
   role?: string;
+  caller?: {
+    type?: string;
+    caller_id?: string;
+    [key: string]: unknown;
+  } | null;
   action?: {
     type?: string;
     query?: string;
@@ -298,6 +319,7 @@ interface ResponsesStreamEvent {
     encrypted_content?: string;
     result?: string;
     status?: string;
+    caller?: ResponsesAPIOutputItem["caller"];
     action?: ResponsesAPIOutputItem["action"];
   };
   text?: string;
@@ -929,6 +951,16 @@ export class OpenAIResponsesTransformer implements Transformer {
             outputIndex: number | undefined,
             eventType: string,
           ): void => {
+            if (isProgrammaticResponsesItem(item)) {
+              emitFatalStreamError(
+                "Responses programmatic tool-calling item is unsupported",
+                new Error("programmatic caller cannot be replayed as direct"),
+                JSON.stringify(item),
+                "upstream Responses programmatic tool calling has no " +
+                  "replay-safe Anthropic Messages equivalent",
+              );
+              return;
+            }
             const itemId = item.id || item.call_id || "";
             const itemEvent: ResponsesStreamEvent = {
               type: eventType,
@@ -1354,6 +1386,18 @@ export class OpenAIResponsesTransformer implements Transformer {
                           encoder.encode(
                             `data: ${JSON.stringify(chatChunk)}\n\n`
                           )
+                        );
+                      } else if (
+                        data.type === "response.output_item.added" &&
+                        data.item &&
+                        isProgrammaticResponsesItem(
+                          data.item as ResponsesAPIOutputItem,
+                        )
+                      ) {
+                        emitResponseItemFallback(
+                          data.item as ResponsesAPIOutputItem,
+                          data.output_index,
+                          data.type,
                         );
                       } else if (
                         data.type === "response.output_item.added" &&
@@ -1899,6 +1943,16 @@ export class OpenAIResponsesTransformer implements Transformer {
       return imagePayload;
     }
 
+    if (
+      content.type === "image_file" &&
+      typeof content.image_file?.file_id === "string"
+    ) {
+      return {
+        type: "input_image",
+        file_id: content.image_file.file_id,
+      };
+    }
+
     if (content.type === "file" && content.file) {
       const filePayload: Record<string, unknown> = { type: "input_file" };
       for (const key of [
@@ -1977,6 +2031,14 @@ export class OpenAIResponsesTransformer implements Transformer {
     };
 
     for (const item of responseData.output || []) {
+      // Responses programmatic tool calling is a hosted-runtime protocol: its
+      // program item, fingerprint, caller relationship, and caller-bearing
+      // function output must all be replayed together. Anthropic direct client
+      // tools cannot represent that state. Never relabel a program-owned call
+      // as a direct tool_use.
+      if (isProgrammaticResponsesItem(item)) {
+        rejectProgrammaticResponsesItem(item);
+      }
       if (item.type === "reasoning") {
         if (!item.id) {
           throw createApiError(

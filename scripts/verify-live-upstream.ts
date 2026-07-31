@@ -306,6 +306,21 @@ function toolUseBlocks(result: LiveResult): Array<Record<string, unknown>> {
   );
 }
 
+function assertDirectToolCallers(
+  tools: Array<Record<string, unknown>>,
+): void {
+  for (const tool of tools) {
+    const caller = tool.caller;
+    if (
+      !caller ||
+      typeof caller !== "object" ||
+      (caller as Record<string, unknown>).type !== "direct"
+    ) {
+      throw new Error("tool_use block did not preserve caller:direct");
+    }
+  }
+}
+
 function hasReasoning(result: LiveResult): boolean {
   if (result.events) {
     return result.events.some(
@@ -513,6 +528,7 @@ async function runToolMatrix(): Promise<void> {
           if (tools.length < 1 || tools[0].name !== "live_alpha") {
             throw new Error("required tool_use block was not preserved");
           }
+          assertDirectToolCallers(tools);
           return `${tools.length} tool_use block(s) preserved`;
         },
       );
@@ -553,6 +569,7 @@ async function runToolMatrix(): Promise<void> {
         if (!names.has("live_alpha") || !names.has("live_beta")) {
           throw new Error("parallel tool identities were not preserved");
         }
+        assertDirectToolCallers(tools);
         return "two parallel tool calls preserved as valid sequential blocks";
       },
     );

@@ -88,6 +88,68 @@ async function responsesStreamToAnthropic(events: unknown[]): Promise<any[]> {
   return parseSse(await converted.text());
 }
 
+test("Responses programmatic tool calls never masquerade as direct Anthropic tools", async () => {
+  const program = {
+    type: "program",
+    id: "prog_1",
+    call_id: "call_prog_1",
+    code: "await tools.lookup({})",
+    fingerprint: "opaque-program-state",
+  };
+  const programCall = {
+    type: "function_call",
+    id: "fc_program_1",
+    call_id: "call_lookup_1",
+    name: "lookup",
+    arguments: "{}",
+    caller: { type: "program", caller_id: "call_prog_1" },
+  };
+  const programOutput = {
+    type: "program_output",
+    id: "prog_out_1",
+    call_id: "call_prog_1",
+    result: "{}",
+    status: "completed",
+  };
+
+  for (const item of [program, programCall, programOutput]) {
+    await assert.rejects(
+      () => responsesJsonToChat(responsePayload([item])),
+      (error: any) =>
+        error?.statusCode === 502 &&
+        error?.code === "upstream_protocol_error" &&
+        /replay-safe Anthropic/.test(error.message),
+    );
+  }
+
+  for (const item of [program, programCall]) {
+    const liveEvents = await responsesStreamToChat([{
+      type: "response.output_item.added",
+      output_index: 0,
+      item,
+    }]);
+    assert.equal(liveEvents.some((event) => event.error?.status === 502), true);
+    assert.equal(
+      liveEvents.some((event) => event.choices?.[0]?.delta?.tool_calls),
+      false,
+    );
+  }
+
+  const terminalEvents = await responsesStreamToAnthropic([{
+    type: "response.completed",
+    response: responsePayload([program, programCall]),
+  }]);
+  assert.equal(terminalEvents.some((event) => event.type === "error"), true);
+  assert.equal(
+    terminalEvents.some((event) => event.content_block?.type === "tool_use"),
+    false,
+  );
+  assert.equal(
+    terminalEvents.some((event) => event.type === "message_stop"),
+    false,
+  );
+});
+
 test("Responses refusal parts remain a refusal terminal in JSON and streams", async () => {
   const output = [
     {
@@ -189,6 +251,10 @@ test("reasoning separated from a tool by a visible message is not re-paired", as
   assert.deepEqual(
     anthropic.content.map((block: any) => block.type),
     ["thinking", "text", "tool_use"],
+  );
+  assert.deepEqual(
+    anthropic.content.find((block: any) => block.type === "tool_use")?.caller,
+    { type: "direct" },
   );
 });
 

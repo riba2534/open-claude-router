@@ -17,6 +17,10 @@ import { getThinkLevel } from "./thinking.js";
 import { createApiError } from "./errors.js";
 import { formatBase64 } from "./image.js";
 import { SseBlockDecoder } from "./sse.js";
+import {
+  encodeChatReasoningSignature,
+  isRouterOwnedReasoningSignature,
+} from "../utils/chat-reasoning.js";
 
 const ANTHROPIC_EFFORTS = new Set<AnthropicEffort>([
   "low",
@@ -35,10 +39,27 @@ function parseAnthropicEffort(value: unknown): AnthropicEffort | undefined {
 
 function convertAnthropicImage(part: any) {
   const source = part?.source;
+  if (
+    source?.type === "file" &&
+    typeof source.file_id === "string" &&
+    source.file_id.length > 0
+  ) {
+    return {
+      type: "image_file" as const,
+      image_file: { file_id: source.file_id },
+    };
+  }
+  const embeddedDataUrl =
+    source?.type === "base64" &&
+    typeof source.data === "string" &&
+    /^data:[^,]*;base64,/i.test(source.data);
   const url =
-    source?.type === "base64" && typeof source.data === "string"
+    source?.type === "base64" &&
+      typeof source.data === "string" &&
+      (embeddedDataUrl ||
+        (typeof source.media_type === "string" && source.media_type.length > 0))
       ? formatBase64(source.data, source.media_type)
-      : typeof source?.url === "string"
+      : source?.type === "url" && typeof source.url === "string"
         ? source.url
         : undefined;
   if (!url) return null;
@@ -250,6 +271,247 @@ function invalidRequest(message: string): never {
   throw createApiError(message, 400, "invalid_body", "invalid_request_error");
 }
 
+function normalizeSystemBlocks(blocks: any[]): Array<{
+  type: "text";
+  text: string;
+  cache_control?: any;
+}> {
+  return blocks.flatMap((item: any) => {
+    if (item?.type === "text" && typeof item.text === "string") {
+      return item.text
+        ? [{
+            type: "text" as const,
+            text: item.text,
+            ...(item.cache_control
+              ? { cache_control: item.cache_control }
+              : {}),
+          }]
+        : [];
+    }
+    // Mid-conversation system blocks are an evolving Anthropic union. Preserve
+    // unknown instructions as bounded text rather than silently deleting them.
+    return [{
+      type: "text" as const,
+      text: boundedJsonBlockText(item),
+    }];
+  });
+}
+
+function isToolChangeBlock(block: any): boolean {
+  return block?.type === "tool_addition" || block?.type === "tool_removal";
+}
+
+function expandMidConversationSystemBlocks(blocks: any[]): any[] {
+  return blocks.flatMap((block) =>
+    block?.type === "mid_conv_system" ? block.content : [block]
+  );
+}
+
+function isAnthropicServerToolDefinition(tool: any): boolean {
+  if (typeof tool?.type !== "string") return false;
+  return tool.type === "mcp_toolset" || [
+    "web_search",
+    "web_fetch",
+    "code_execution",
+    "advisor",
+    "tool_search_tool_regex",
+    "tool_search_tool_bm25",
+  ].some((prefix) => tool.type === prefix || tool.type.startsWith(`${prefix}_`));
+}
+
+function isAnthropicTypedClientToolDefinition(tool: any): boolean {
+  if (typeof tool?.type !== "string") return false;
+  return ["bash", "computer", "memory", "text_editor"].some(
+    (prefix) => tool.type === prefix || tool.type.startsWith(`${prefix}_`),
+  );
+}
+
+const ANTHROPIC_SERVER_TOOL_RESULT_BLOCK_TYPES = new Set([
+  "web_search_tool_result",
+  "web_fetch_tool_result",
+  "code_execution_tool_result",
+  "bash_code_execution_tool_result",
+  "text_editor_code_execution_tool_result",
+  "tool_search_tool_result",
+  "advisor_tool_result",
+  "mcp_tool_result",
+]);
+
+function isAnthropicServerHistoryBlock(block: any): boolean {
+  return block?.type === "server_tool_use" ||
+    block?.type === "mcp_tool_use" ||
+    ANTHROPIC_SERVER_TOOL_RESULT_BLOCK_TYPES.has(block?.type);
+}
+
+const ANTHROPIC_OPAQUE_CONTROL_BLOCK_TYPES = new Set([
+  "compaction",
+  "fallback",
+  "container_upload",
+]);
+
+const ANTHROPIC_TOOL_CALLERS = new Set([
+  "direct",
+  "code_execution_20250825",
+  "code_execution_20260120",
+  "code_execution_20260521",
+]);
+
+/**
+ * Anthropic's mid-conversation tool changes alter the tools offered to the
+ * current generation from their position onward. Chat Completions and
+ * Responses have only one top-level function list, so the faithful current-
+ * turn projection is the final active subset. The history blocks themselves
+ * are structural directives, not model-visible text.
+ */
+function resolveActiveAnthropicTools(
+  tools: any[] | undefined,
+  messages: any[],
+): any[] | undefined {
+  if (!tools?.length) {
+    const hasDynamicToolDirective = messages.some((message) => {
+      if (!Array.isArray(message?.content)) return false;
+      if (
+        message.role === "system" &&
+        expandMidConversationSystemBlocks(message.content).some(
+          isToolChangeBlock,
+        )
+      ) {
+        return true;
+      }
+      if (
+        message.role === "user" &&
+        message.content.some(
+          (block: any) =>
+            block?.type === "tool_result" &&
+            (Array.isArray(block.content)
+              ? block.content
+              : [block.content]
+            ).some((item: any) => item?.type === "tool_reference"),
+        )
+      ) {
+        return true;
+      }
+      return false;
+    });
+    if (hasDynamicToolDirective) {
+      invalidRequest(
+        "tool changes and tool references require declared tools",
+      );
+    }
+    return undefined;
+  }
+
+  const declared = new Map<string, any>();
+  const active = new Set<string>();
+  for (const tool of tools) {
+    if (typeof tool?.name !== "string" || tool.name.length === 0) continue;
+    declared.set(tool.name, tool);
+    if (tool.defer_loading !== true) active.add(tool.name);
+  }
+
+  const activateReference = (name: unknown, source: string) => {
+    if (typeof name !== "string" || name.length === 0) {
+      invalidRequest(`${source} must include a non-empty tool_name`);
+    }
+    if (!declared.has(name)) {
+      invalidRequest(
+        `${source} references undeclared tool ${JSON.stringify(name)}`,
+      );
+    }
+    active.add(name);
+  };
+
+  for (const message of messages) {
+    if (!Array.isArray(message?.content)) {
+      continue;
+    }
+
+    if (message.role === "system") {
+      for (const block of expandMidConversationSystemBlocks(message.content)) {
+        if (!isToolChangeBlock(block)) continue;
+        const reference = block.tool;
+        if (
+          reference?.type !== "tool_reference" ||
+          typeof reference.name !== "string" ||
+          reference.name.length === 0
+        ) {
+          invalidRequest(
+            `${block.type} currently requires a named tool_reference; ` +
+              "MCP tool-change references have no OpenAI function-tool equivalent",
+          );
+        }
+        if (!declared.has(reference.name)) {
+          invalidRequest(
+            `${block.type} references undeclared tool ${JSON.stringify(reference.name)}`,
+          );
+        }
+        if (block.type === "tool_addition") active.add(reference.name);
+        else active.delete(reference.name);
+      }
+    } else if (message.role === "user") {
+      for (const block of message.content) {
+        if (block?.type !== "tool_result") continue;
+        const resultBlocks = Array.isArray(block.content)
+          ? block.content
+          : block.content == null
+            ? []
+            : [block.content];
+        for (const resultBlock of resultBlocks) {
+          if (resultBlock?.type === "tool_reference") {
+            activateReference(
+              resultBlock.tool_name,
+              "tool_result tool_reference",
+            );
+          }
+        }
+      }
+    }
+  }
+
+  return tools.filter(
+    (tool) => typeof tool?.name === "string" && active.has(tool.name),
+  );
+}
+
+function assistantEndsWithServerToolResult(message: any): boolean {
+  if (message?.role !== "assistant" || !Array.isArray(message.content)) {
+    return false;
+  }
+  const last = message.content.at(-1);
+  return ANTHROPIC_SERVER_TOOL_RESULT_BLOCK_TYPES.has(last?.type) &&
+    typeof last?.tool_use_id === "string" &&
+    last.tool_use_id.length > 0;
+}
+
+function validateMidConversationSystemPlacement(messages: any[]): void {
+  for (let index = 0; index < messages.length;) {
+    if (messages[index]?.role !== "system") {
+      index += 1;
+      continue;
+    }
+    const groupStart = index;
+    while (index < messages.length && messages[index]?.role === "system") {
+      index += 1;
+    }
+    const previous = messages[groupStart - 1];
+    if (
+      groupStart === 0 ||
+      (previous?.role !== "user" &&
+        !assistantEndsWithServerToolResult(previous))
+    ) {
+      invalidRequest(
+        "mid-conversation system messages must follow a user turn or an assistant server-tool result",
+      );
+    }
+    const next = messages[index];
+    if (next !== undefined && next?.role !== "assistant") {
+      invalidRequest(
+        "mid-conversation system messages must be final or followed by an assistant turn",
+      );
+    }
+  }
+}
+
 // Malformed client JSON must be a 400 invalid_request_error, not a 500 with a
 // raw JavaScript TypeError leaking out of an unguarded dereference.
 function validateAnthropicRequestShape(request: Record<string, any>): void {
@@ -274,14 +536,20 @@ function validateAnthropicRequestShape(request: Record<string, any>): void {
     invalidRequest("messages must be an array");
   }
   let hasCitationsEnabledDocument = false;
-  for (const message of messages) {
+  for (const [messageIndex, message] of messages.entries()) {
     if (
       !message ||
       typeof message !== "object" ||
-      (message.role !== "user" && message.role !== "assistant")
+      message.role !== "user" &&
+      message.role !== "assistant" &&
+      message.role !== "system"
     ) {
+      const receivedRole =
+        message && typeof message === "object" ? message.role : undefined;
       invalidRequest(
-        'each message must be an object with role "user" or "assistant"',
+        `messages[${messageIndex}] must be an object with role ` +
+          `"user", "assistant", or "system"; received ` +
+          `${JSON.stringify(receivedRole)}`,
       );
     }
     if (
@@ -295,6 +563,82 @@ function validateAnthropicRequestShape(request: Record<string, any>): void {
         if (!part || typeof part !== "object") {
           invalidRequest("message content blocks must be objects");
         }
+        if (part.type === "mid_conv_system") {
+          if (message.role !== "system") {
+            invalidRequest(
+              "mid_conv_system blocks are only valid in system messages",
+            );
+          }
+          if (!Array.isArray(part.content)) {
+            invalidRequest("mid_conv_system.content must be an array");
+          }
+          for (const inner of part.content) {
+            if (
+              !inner ||
+              typeof inner !== "object" ||
+              !["text", "tool_addition", "tool_removal"].includes(inner.type)
+            ) {
+              invalidRequest(
+                "mid_conv_system.content supports only text and tool-change blocks",
+              );
+            }
+          }
+        }
+        if (isToolChangeBlock(part) && message.role !== "system") {
+          invalidRequest(
+            "tool_addition and tool_removal blocks are only valid in system messages",
+          );
+        }
+        if (part.type === "tool_use") {
+          if (
+            message.role !== "assistant" ||
+            typeof part.id !== "string" ||
+            part.id.length === 0 ||
+            typeof part.name !== "string" ||
+            part.name.length === 0 ||
+            !part.input ||
+            typeof part.input !== "object" ||
+            Array.isArray(part.input)
+          ) {
+            invalidRequest(
+              "assistant tool_use blocks require non-empty id/name and an object input",
+            );
+          }
+          if (part.caller !== undefined) {
+            if (
+              !part.caller ||
+              typeof part.caller !== "object" ||
+              Array.isArray(part.caller) ||
+              typeof part.caller.type !== "string"
+            ) {
+              invalidRequest(
+                "assistant tool_use caller must be a caller object when provided",
+              );
+            }
+            if (part.caller.type !== "direct") {
+              if (String(part.caller.type).startsWith("code_execution_")) {
+                invalidRequest(
+                  "code-execution tool-use history has no OpenAI function-call equivalent",
+                );
+              }
+              invalidRequest("assistant tool_use caller must be direct");
+            }
+          }
+        }
+        if (part.type === "tool_result") {
+          if (
+            message.role !== "user" ||
+            typeof part.tool_use_id !== "string" ||
+            part.tool_use_id.length === 0
+          ) {
+            invalidRequest(
+              "user tool_result blocks require a non-empty tool_use_id",
+            );
+          }
+          if (part.is_error !== undefined && typeof part.is_error !== "boolean") {
+            invalidRequest("tool_result.is_error must be a boolean when provided");
+          }
+        }
         if (
           message.role === "assistant" &&
           part.type === "thinking" &&
@@ -302,6 +646,16 @@ function validateAnthropicRequestShape(request: Record<string, any>): void {
         ) {
           invalidRequest(
             "assistant thinking blocks must include a non-empty signature",
+          );
+        }
+        if (isAnthropicServerHistoryBlock(part)) {
+          invalidRequest(
+            "Anthropic server-tool history has no OpenAI function-tool equivalent",
+          );
+        }
+        if (ANTHROPIC_OPAQUE_CONTROL_BLOCK_TYPES.has(part.type)) {
+          invalidRequest(
+            `Anthropic ${part.type} blocks have no replay-safe OpenAI equivalent`,
           );
         }
         if (
@@ -314,17 +668,99 @@ function validateAnthropicRequestShape(request: Record<string, any>): void {
       }
     }
   }
+  validateMidConversationSystemPlacement(messages);
 
   const tools = request.tools;
   if (tools !== undefined && !Array.isArray(tools)) {
     invalidRequest("tools must be an array");
   }
   for (const tool of tools ?? []) {
-    if (!tool || typeof tool !== "object" || typeof tool.name !== "string") {
-      invalidRequest("each tool must be an object with a name");
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) {
+      invalidRequest("each tool must be an object");
+    }
+    if (isAnthropicServerToolDefinition(tool)) {
+      invalidRequest(
+        "Anthropic server-side tools have no OpenAI function-tool equivalent",
+      );
+    }
+    if (isAnthropicTypedClientToolDefinition(tool)) {
+      invalidRequest(
+        "Anthropic typed client tools require a version-specific OpenAI function schema",
+      );
+    }
+    if (typeof tool.name !== "string" || tool.name.length === 0) {
+      invalidRequest("each client tool must have a non-empty name");
     }
     if (tool.strict !== undefined && typeof tool.strict !== "boolean") {
       invalidRequest("tool.strict must be a boolean when provided");
+    }
+    if (
+      tool.defer_loading !== undefined &&
+      typeof tool.defer_loading !== "boolean"
+    ) {
+      invalidRequest("tool.defer_loading must be a boolean when provided");
+    }
+    if (tool.allowed_callers !== undefined) {
+      if (
+        !Array.isArray(tool.allowed_callers) ||
+        tool.allowed_callers.length === 0 ||
+        tool.allowed_callers.some(
+          (caller: unknown) =>
+            typeof caller !== "string" ||
+            !ANTHROPIC_TOOL_CALLERS.has(caller),
+        )
+      ) {
+        invalidRequest("tool.allowed_callers must contain known caller values");
+      }
+      if (tool.allowed_callers.some((caller: string) => caller !== "direct")) {
+        invalidRequest(
+          "code-execution tool callers have no OpenAI function-tool equivalent",
+        );
+      }
+    }
+  }
+  if (
+    (tools?.length ?? 0) > 0 &&
+    tools.every((tool: any) => tool?.defer_loading === true)
+  ) {
+    invalidRequest("at least one tool must not use defer_loading");
+  }
+
+  const toolChoice = request.tool_choice;
+  if (toolChoice !== undefined) {
+    if (
+      !toolChoice ||
+      typeof toolChoice !== "object" ||
+      Array.isArray(toolChoice)
+    ) {
+      invalidRequest("tool_choice must be an object");
+    }
+    if (!["auto", "any", "tool", "none"].includes(toolChoice.type)) {
+      invalidRequest(
+        'tool_choice.type must be "auto", "any", "tool", or "none"',
+      );
+    }
+    if (
+      toolChoice.disable_parallel_tool_use !== undefined &&
+      typeof toolChoice.disable_parallel_tool_use !== "boolean"
+    ) {
+      invalidRequest(
+        "tool_choice.disable_parallel_tool_use must be a boolean when provided",
+      );
+    }
+    if (
+      toolChoice.type === "tool" &&
+      (typeof toolChoice.name !== "string" || toolChoice.name.length === 0)
+    ) {
+      invalidRequest("named tool_choice must include a non-empty name");
+    }
+    if (
+      toolChoice.type === "none" &&
+      toolChoice.disable_parallel_tool_use !== undefined
+    ) {
+      invalidRequest(
+        "tool_choice none cannot include disable_parallel_tool_use",
+      );
     }
   }
 
@@ -406,6 +842,15 @@ function validateAnthropicRequestShape(request: Record<string, any>): void {
         "thinking.budget_tokens is only valid when thinking.type is enabled",
       );
     }
+    if (
+      thinking.type === "enabled" &&
+      (request.tool_choice?.type === "any" ||
+        request.tool_choice?.type === "tool")
+    ) {
+      invalidRequest(
+        "forced tool_choice is not compatible with manually enabled thinking",
+      );
+    }
   }
 }
 
@@ -416,7 +861,12 @@ function convertToolResultContent(content: unknown): any {
   const blocks = Array.isArray(content) ? content : [content];
   if (blocks.length === 0) return "";
 
-  return blocks.map((block: any) => {
+  const visibleBlocks = blocks.filter(
+    (block: any) => block?.type !== "tool_reference",
+  );
+  if (visibleBlocks.length === 0) return "";
+
+  return visibleBlocks.map((block: any) => {
     if (typeof block === "string") {
       return { type: "text" as const, text: block };
     }
@@ -477,30 +927,7 @@ export class AnthropicTransformer implements Transformer {
           content: request.system,
         });
       } else if (Array.isArray(request.system) && request.system.length) {
-        const textParts: Array<{
-          type: "text";
-          text: string;
-          cache_control?: any;
-        }> = request.system.flatMap((item: any) => {
-          if (item.type === "text" && typeof item.text === "string") {
-            return item.text
-              ? [{
-                  type: "text" as const,
-                  text: item.text,
-                  ...(item.cache_control
-                    ? { cache_control: item.cache_control }
-                    : {}),
-                }]
-              : [];
-          }
-          // System blocks are an actively evolving Anthropic union. Preserve
-          // unknown future blocks as bounded text instead of silently deleting
-          // instructions or forwarding an invalid Chat content-part shape.
-          return [{
-            type: "text" as const,
-            text: boundedJsonBlockText(item),
-          }];
-        });
+        const textParts = normalizeSystemBlocks(request.system);
         // Never emit a message whose content is an empty array — Chat
         // Completions rejects that shape outright.
         if (textParts.length) {
@@ -515,6 +942,24 @@ export class AnthropicTransformer implements Transformer {
     const requestMessages = JSON.parse(JSON.stringify(request.messages || []));
 
     requestMessages?.forEach((msg: any) => {
+      if (msg.role === "system") {
+        if (typeof msg.content === "string") {
+          messages.push({ role: "system", content: msg.content });
+        } else {
+          const textParts = normalizeSystemBlocks(
+            expandMidConversationSystemBlocks(msg.content).filter(
+              (block: any) => !isToolChangeBlock(block),
+            ),
+          );
+          // Pure tool-change messages have already been projected into the
+          // final top-level tool set and must not become model-visible JSON.
+          if (textParts.length) {
+            messages.push({ role: "system", content: textParts });
+          }
+        }
+        return;
+      }
+
       if (msg.role === "user" || msg.role === "assistant") {
         if (typeof msg.content === "string") {
           messages.push({
@@ -725,6 +1170,26 @@ export class AnthropicTransformer implements Transformer {
       }
     });
 
+    const activeTools = resolveActiveAnthropicTools(
+      request.tools,
+      requestMessages,
+    );
+    const activeToolNames = new Set(
+      (activeTools ?? []).flatMap((tool) =>
+        typeof tool?.name === "string" ? [tool.name] : [],
+      ),
+    );
+    if (
+      request.tool_choice?.type === "tool" &&
+      !activeToolNames.has(request.tool_choice.name)
+    ) {
+      invalidRequest(
+        `tool_choice references inactive tool ${JSON.stringify(request.tool_choice.name)}`,
+      );
+    }
+    if (request.tool_choice?.type === "any" && activeToolNames.size === 0) {
+      invalidRequest("tool_choice any requires at least one active tool");
+    }
     const result: UnifiedChatRequest = {
       messages,
       model: request.model,
@@ -733,8 +1198,8 @@ export class AnthropicTransformer implements Transformer {
       top_p: request.top_p,
       stop: request.stop_sequences,
       stream: request.stream,
-      tools: request.tools?.length
-        ? this.convertAnthropicToolsToUnified(request.tools)
+      tools: activeTools?.length
+        ? this.convertAnthropicToolsToUnified(activeTools)
         : undefined,
       tool_choice: request.tool_choice,
     };
@@ -894,6 +1359,7 @@ export class AnthropicTransformer implements Transformer {
         // signature_delta to seal the thinking block (see normalization below).
         let reasoningThinkingActive = false;
         let reasoningSignatureSent = false;
+        let reasoningReplayText = "";
         let contentIndex = 0;
         let currentContentBlockIndex = -1; // Track the current content block index
         // Type of the currently open content block. Needed because interleaved
@@ -978,14 +1444,6 @@ export class AnthropicTransformer implements Transformer {
         const closeCurrentBlock = () => {
           if (currentContentBlockIndex < 0) return;
           if (currentBlockType === "thinking" && !reasoningSignatureSent) {
-            if (omitThinking) {
-              throw createApiError(
-                "upstream omitted replayable reasoning state",
-                502,
-                "upstream_protocol_error",
-                "api_error",
-              );
-            }
             safeEnqueue(
               encoder.encode(
                 `event: content_block_delta\ndata: ${JSON.stringify({
@@ -993,7 +1451,9 @@ export class AnthropicTransformer implements Transformer {
                   index: currentContentBlockIndex,
                   delta: {
                     type: "signature_delta",
-                    signature: `sig_${Date.now()}`,
+                    signature: encodeChatReasoningSignature(
+                      reasoningReplayText,
+                    ),
                   },
                 })}\n\n`
               )
@@ -1014,6 +1474,7 @@ export class AnthropicTransformer implements Transformer {
           }
           currentContentBlockIndex = -1;
           currentBlockType = null;
+          reasoningReplayText = "";
         };
 
         // Anthropic content blocks cannot be interleaved. OpenAI can stream
@@ -1090,6 +1551,7 @@ export class AnthropicTransformer implements Transformer {
                     id: toolCall.id,
                     name: toolCall.name,
                     input: {},
+                    caller: { type: "direct" },
                   },
                 })}\n\n`,
               ),
@@ -1456,27 +1918,74 @@ export class AnthropicTransformer implements Transformer {
                   !(choice?.delta as any)?.thinking &&
                   (choiceText || choice?.delta?.tool_calls)
                 ) {
-                  if (omitThinking) {
-                    throw createApiError(
-                      "upstream omitted replayable reasoning state",
-                      502,
-                      "upstream_protocol_error",
-                      "api_error",
-                    );
-                  }
                   // First content/tool_call after a reasoning_content run: the
                   // thinking block must be sealed with a signature_delta before
-                  // content_block_stop. The upstream gave none, so synthesize one
-                  // (matches the reference reasoning transformer's Date.now()
-                  // signature). Routed through the signature branch below.
+                  // content_block_stop. The upstream gave none, so synthesize a
+                  // reversible Router envelope. Routed through the signature
+                  // branch below.
                   (choice.delta as any).thinking = {
-                    signature: `sig_${Date.now()}`,
+                    signature: encodeChatReasoningSignature(
+                      reasoningReplayText,
+                    ),
                   };
                   reasoningSignatureSent = true;
                   reasoningThinkingActive = false;
                 }
 
                 if (choice?.delta?.thinking && !isClosed && !hasFinished) {
+                  // Some compatible Chat endpoints coalesce content and
+                  // signature into the same thinking delta. Process content
+                  // first so the signature seals those exact bytes instead of
+                  // silently discarding them behind an otherwise valid stream.
+                  if (choice.delta.thinking.content) {
+                    if (currentBlockType !== "thinking") {
+                      // Reasoning resumed after content/tool output (or first
+                      // reasoning chunk): close whatever block is open and
+                      // start a fresh thinking block.
+                      flushToolCalls();
+                      closeCurrentBlock();
+                      const thinkingBlockIndex = assignContentBlockIndex();
+                      const contentBlockStart = {
+                        type: "content_block_start",
+                        index: thinkingBlockIndex,
+                        content_block: { type: "thinking", thinking: "" },
+                      };
+                      safeEnqueue(
+                        encoder.encode(
+                          `event: content_block_start\ndata: ${JSON.stringify(
+                            contentBlockStart
+                          )}\n\n`
+                        )
+                      );
+                      currentContentBlockIndex = thinkingBlockIndex;
+                      currentBlockType = "thinking";
+                      reasoningSignatureSent = false;
+                      reasoningReplayText = "";
+                    }
+                    reasoningReplayText += choice.delta.thinking.content;
+                    // Anthropic `display:"omitted"` keeps the ordinary
+                    // thinking block and its signature, but emits no visible
+                    // thinking delta. Only an explicit client choice triggers
+                    // this; the router never guesses a model-specific default.
+                    if (!omitThinking) {
+                      const thinkingChunk = {
+                        type: "content_block_delta",
+                        index: currentContentBlockIndex,
+                        delta: {
+                          type: "thinking_delta",
+                          thinking: choice.delta.thinking.content,
+                        },
+                      };
+                      safeEnqueue(
+                        encoder.encode(
+                          `event: content_block_delta\ndata: ${JSON.stringify(
+                            thinkingChunk
+                          )}\n\n`
+                        )
+                      );
+                    }
+                  }
+
                   if (choice.delta.thinking.signature) {
                     if (currentBlockType !== "thinking") {
                       // A signature-only item is still a real reasoning block.
@@ -1500,6 +2009,7 @@ export class AnthropicTransformer implements Transformer {
                       currentContentBlockIndex = thinkingBlockIndex;
                       currentBlockType = "thinking";
                       reasoningSignatureSent = false;
+                      reasoningReplayText = "";
                     }
                     if (currentBlockType === "thinking") {
                       const thinkingSignature = {
@@ -1507,7 +2017,19 @@ export class AnthropicTransformer implements Transformer {
                         index: currentContentBlockIndex,
                         delta: {
                           type: "signature_delta",
-                          signature: choice.delta.thinking.signature,
+                          // A native Chat extension signature is not something
+                          // the generic Chat request path can replay. When the
+                          // client asked to omit visible thinking, wrap the
+                          // hidden bytes in our own reversible envelope instead
+                          // of returning a token that would replay as an empty
+                          // reasoning_content field on the next tool turn.
+                          signature: omitThinking &&
+                              reasoningReplayText &&
+                              !isRouterOwnedReasoningSignature(
+                                choice.delta.thinking.signature,
+                              )
+                            ? encodeChatReasoningSignature(reasoningReplayText)
+                            : choice.delta.thinking.signature,
                         },
                       };
                       safeEnqueue(
@@ -1532,51 +2054,7 @@ export class AnthropicTransformer implements Transformer {
                       );
                       currentContentBlockIndex = -1;
                       currentBlockType = null;
-                    }
-                  } else if (choice.delta.thinking.content) {
-                    if (currentBlockType !== "thinking") {
-                      // Reasoning resumed after content/tool output (or first
-                      // reasoning chunk): close whatever block is open and
-                      // start a fresh thinking block.
-                      flushToolCalls();
-                      closeCurrentBlock();
-                      const thinkingBlockIndex = assignContentBlockIndex();
-                      const contentBlockStart = {
-                        type: "content_block_start",
-                        index: thinkingBlockIndex,
-                        content_block: { type: "thinking", thinking: "" },
-                      };
-                      safeEnqueue(
-                        encoder.encode(
-                          `event: content_block_start\ndata: ${JSON.stringify(
-                            contentBlockStart
-                          )}\n\n`
-                        )
-                      );
-                      currentContentBlockIndex = thinkingBlockIndex;
-                      currentBlockType = "thinking";
-                      reasoningSignatureSent = false;
-                    }
-                    // Anthropic `display:"omitted"` keeps the ordinary
-                    // thinking block and its signature, but emits no visible
-                    // thinking delta. Only an explicit client choice triggers
-                    // this; the router never guesses a model-specific default.
-                    if (!omitThinking) {
-                      const thinkingChunk = {
-                        type: "content_block_delta",
-                        index: currentContentBlockIndex,
-                        delta: {
-                          type: "thinking_delta",
-                          thinking: choice.delta.thinking.content || "",
-                        },
-                      };
-                      safeEnqueue(
-                        encoder.encode(
-                          `event: content_block_delta\ndata: ${JSON.stringify(
-                            thinkingChunk
-                          )}\n\n`
-                        )
-                      );
+                      reasoningReplayText = "";
                     }
                   }
                 }
@@ -1964,6 +2442,7 @@ export class AnthropicTransformer implements Transformer {
               id: block.id,
               name: block.name,
               input: parseUpstreamToolInput(block.input),
+              caller: { type: "direct" },
             });
           } else if (
             block?.type === "server_tool_use" ||
@@ -2001,18 +2480,18 @@ export class AnthropicTransformer implements Transformer {
         ) {
           const preToolThinking: any[] = [];
           for (const block of upstreamThinkingBlocks) {
-            if (omitThinking && !block?.signature) {
-              throw createApiError(
-                "upstream omitted replayable reasoning state",
-                502,
-                "upstream_protocol_error",
-                "api_error",
-              );
-            }
+            const reasoningContent = typeof block?.content === "string"
+              ? block.content
+              : "";
             const anthropicBlock = {
               type: "thinking",
-              thinking: omitThinking ? "" : (block?.content ?? ""),
-              signature: block?.signature || `sig_${Date.now()}`,
+              thinking: omitThinking ? "" : reasoningContent,
+              signature: omitThinking &&
+                  reasoningContent &&
+                  !isRouterOwnedReasoningSignature(block?.signature)
+                ? encodeChatReasoningSignature(reasoningContent)
+                : block?.signature ||
+                  encodeChatReasoningSignature(reasoningContent),
             };
             if (block?.tool_call_id) {
               const group = thinkingByToolCall.get(block.tool_call_id) ?? [];
@@ -2031,18 +2510,15 @@ export class AnthropicTransformer implements Transformer {
             typeof messageThinking === "string" &&
             (messageThinking.length > 0 || upstreamThinking?.signature)
           ) {
-            if (omitThinking && !upstreamThinking?.signature) {
-              throw createApiError(
-                "upstream omitted replayable reasoning state",
-                502,
-                "upstream_protocol_error",
-                "api_error",
-              );
-            }
             content.unshift({
               type: "thinking",
               thinking: omitThinking ? "" : messageThinking,
-              signature: upstreamThinking?.signature || `sig_${Date.now()}`,
+              signature: omitThinking &&
+                  messageThinking &&
+                  !isRouterOwnedReasoningSignature(upstreamThinking?.signature)
+                ? encodeChatReasoningSignature(messageThinking)
+                : upstreamThinking?.signature ||
+                  encodeChatReasoningSignature(messageThinking),
             });
           }
         }
@@ -2086,6 +2562,7 @@ export class AnthropicTransformer implements Transformer {
                 id: toolCall.id,
                 name: toolCall.function.name,
                 input: parseUpstreamToolInput(toolCall.function.arguments),
+                caller: { type: "direct" },
               });
             }
           }
@@ -2104,6 +2581,7 @@ export class AnthropicTransformer implements Transformer {
               id: `call_${uuidv4()}`,
               name: message.function_call.name,
               input: parseUpstreamToolInput(message.function_call.arguments),
+              caller: { type: "direct" },
             });
           }
         }

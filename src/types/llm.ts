@@ -34,6 +34,17 @@ export interface ImageContent {
 }
 
 /**
+ * Provider file-backed image. Responses has a native `input_image.file_id`;
+ * Chat receives the same ID through its standard `file` content part.
+ */
+export interface ImageFileContent {
+  type: "image_file";
+  image_file: {
+    file_id: string;
+  };
+}
+
+/**
  * Lossless file/document envelope shared by the protocol transformers.
  *
  * `fallback_text` is deliberately outside the OpenAI `file` object. The
@@ -52,7 +63,11 @@ export interface FileContent {
   fallback_text: string;
 }
 
-export type MessageContent = TextContent | ImageContent | FileContent;
+export type MessageContent =
+  | TextContent
+  | ImageContent
+  | ImageFileContent
+  | FileContent;
 
 export interface UnifiedMessage {
   role: "user" | "assistant" | "system" | "tool";

@@ -178,6 +178,7 @@ export function anthropicMessageToSseText(message: any): string {
             id: block.id,
             name: block.name,
             input: {},
+            caller: block.caller ?? { type: "direct" },
           },
         }),
       );

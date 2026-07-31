@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AnthropicTransformer } from "../src/transformers/anthropic.js";
+import { OpenAIResponsesTransformer } from "../src/transformers/responses.js";
 import { normalizeMultimodalToolResultsForChatCompletions } from "../src/utils/strip.js";
 
 const logger = {
@@ -40,7 +41,7 @@ async function toAnthropicStream(response: Response): Promise<any[]> {
 
 test("invalid message roles/content and thinking budgets fail locally with 400", async () => {
   const invalidRequests = [
-    { messages: [{ role: "system", content: "not allowed here" }] },
+    { messages: [{ role: "developer", content: "not allowed here" }] },
     { messages: [{ role: "user", content: null }] },
     { messages: [{ role: "user", content: 7 }] },
     {
@@ -81,6 +82,628 @@ test("invalid message roles/content and thinking budgets fail locally with 400",
     thinking: { type: "enabled", budget_tokens: 16384 },
   });
   assert.deepEqual(valid.reasoning, { effort: "high", enabled: true });
+});
+
+test("Claude Code system-role compatibility messages preserve order and blocks", async () => {
+  const result = await transformer().transformRequestOut!({
+    model: "openai/test-model",
+    messages: [
+      { role: "user", content: "create a title" },
+      {
+        role: "system",
+        content: [
+          { type: "text", text: "Return JSON only" },
+          { type: "future_system_instruction", value: "preserve me" },
+        ],
+      },
+    ],
+  });
+
+  assert.deepEqual(result.messages.map((message) => message.role), [
+    "user",
+    "system",
+  ]);
+  assert.deepEqual(result.messages[1].content, [
+    { type: "text", text: "Return JSON only" },
+    {
+      type: "text",
+      text: JSON.stringify({
+        type: "future_system_instruction",
+        value: "preserve me",
+      }),
+    },
+  ]);
+});
+
+test("mid-conversation tool changes project the final active set for Chat and Responses", async () => {
+  const unified = await transformer().transformRequestOut!({
+    model: "openai/test-model",
+    tools: [
+      { name: "always_on", input_schema: { type: "object" } },
+      {
+        name: "deferred_then_added",
+        defer_loading: true,
+        input_schema: { type: "object" },
+      },
+      { name: "removed", input_schema: { type: "object" } },
+    ],
+    messages: [
+      { role: "user", content: "continue" },
+      {
+        role: "system",
+        content: [
+          { type: "text", text: "Use the newly available tool if needed" },
+          {
+            type: "mid_conv_system",
+            content: [
+              { type: "text", text: "This text came through the wrapper" },
+              {
+                type: "tool_addition",
+                tool: {
+                  type: "tool_reference",
+                  name: "deferred_then_added",
+                },
+              },
+            ],
+          },
+          {
+            type: "tool_removal",
+            tool: { type: "tool_reference", name: "removed" },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    unified.tools?.map((tool) => tool.function.name),
+    ["always_on", "deferred_then_added"],
+  );
+  assert.deepEqual(unified.messages, [
+    { role: "user", content: "continue" },
+    {
+      role: "system",
+      content: [
+        { type: "text", text: "Use the newly available tool if needed" },
+        { type: "text", text: "This text came through the wrapper" },
+      ],
+    },
+  ]);
+
+  const responses = new OpenAIResponsesTransformer();
+  responses.logger = logger;
+  const responseRequest = await responses.transformRequestIn!(
+    structuredClone(unified),
+  );
+  assert.deepEqual(
+    responseRequest.tools?.map((tool: any) => tool.name),
+    ["always_on", "deferred_then_added"],
+  );
+  assert.deepEqual((responseRequest as any).input, [
+    { role: "user", content: "continue" },
+    {
+      role: "system",
+      content: [
+        {
+          type: "input_text",
+          text: "Use the newly available tool if needed",
+        },
+        {
+          type: "input_text",
+          text: "This text came through the wrapper",
+        },
+      ],
+    },
+  ]);
+});
+
+test("invalid or unsupported mid-conversation tool references fail explicitly", async () => {
+  const invalidReferences = [
+    { type: "tool_reference", name: "missing" },
+    { type: "mcp_tool_reference", server_name: "server", name: "remote" },
+  ];
+  for (const tool of invalidReferences) {
+    await assert.rejects(
+      () => transformer().transformRequestOut!({
+        model: "openai/test-model",
+        tools: [{ name: "declared", input_schema: { type: "object" } }],
+        messages: [
+          { role: "user", content: "continue" },
+          {
+            role: "system",
+            content: [{ type: "tool_addition", tool }],
+          },
+        ],
+      }),
+      (error: any) => error?.statusCode === 400,
+    );
+  }
+
+  for (const content of [
+    { type: "mid_conv_system", content: "not-an-array" },
+    {
+      type: "mid_conv_system",
+      content: [{ type: "mid_conv_system", content: [] }],
+    },
+  ]) {
+    await assert.rejects(
+      () => transformer().transformRequestOut!({
+        model: "openai/test-model",
+        messages: [
+          { role: "user", content: "continue" },
+          { role: "system", content: [content] },
+        ],
+      }),
+      (error: any) => error?.statusCode === 400,
+    );
+  }
+
+  for (const role of ["user", "assistant"]) {
+    for (const type of ["tool_addition", "tool_removal"]) {
+      await assert.rejects(
+        () => transformer().transformRequestOut!({
+          model: "openai/test-model",
+          tools: [{ name: "declared", input_schema: { type: "object" } }],
+          messages: [{
+            role,
+            content: [{
+              type,
+              tool: { type: "tool_reference", name: "declared" },
+            }],
+          }],
+        }),
+        (error: any) => error?.statusCode === 400,
+      );
+    }
+  }
+});
+
+test("tool_result references activate deferred tools and disappear from visible output", async () => {
+  const unified = await transformer().transformRequestOut!({
+    model: "openai/test-model",
+    tools: [
+      { name: "search", input_schema: { type: "object" } },
+      {
+        name: "weather",
+        defer_loading: true,
+        input_schema: { type: "object" },
+      },
+    ],
+    tool_choice: { type: "tool", name: "weather" },
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "call_search", name: "search", input: {} },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_search",
+            content: [
+              { type: "tool_reference", tool_name: "weather" },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    unified.tools?.map((tool) => tool.function.name),
+    ["search", "weather"],
+  );
+  assert.deepEqual(unified.messages[1], {
+    role: "tool",
+    tool_call_id: "call_search",
+    content: "",
+  });
+  assert.deepEqual(unified.tool_choice, {
+    type: "function",
+    function: { name: "weather" },
+  });
+
+  await assert.rejects(
+    () => transformer().transformRequestOut!({
+      model: "openai/test-model",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_search",
+              content: [
+                { type: "tool_reference", tool_name: "missing" },
+              ],
+            },
+          ],
+        },
+      ],
+    }),
+    (error: any) => error?.statusCode === 400,
+  );
+});
+
+test("tool choice cannot require an inactive or empty tool set", async () => {
+  const choices = [
+    { type: "any" },
+    { type: "tool", name: "removed" },
+  ];
+  for (const tool_choice of choices) {
+    await assert.rejects(
+      () => transformer().transformRequestOut!({
+        model: "openai/test-model",
+        tools: [{ name: "removed", input_schema: { type: "object" } }],
+        tool_choice,
+        messages: [
+          { role: "user", content: "continue" },
+          {
+            role: "system",
+            content: [
+              {
+                type: "tool_removal",
+                tool: { type: "tool_reference", name: "removed" },
+              },
+            ],
+          },
+        ],
+      }),
+      (error: any) => error?.statusCode === 400,
+    );
+  }
+});
+
+test("server-owned tools are rejected instead of becoming client functions", async () => {
+  const serverToolTypes = [
+    "tool_search_tool_regex",
+    "tool_search_tool_bm25_20251119",
+    "web_search_20260318",
+    "web_fetch_20260318",
+    "code_execution_20260521",
+    "advisor_20260301",
+    "mcp_toolset",
+  ];
+  for (const type of serverToolTypes) {
+    await assert.rejects(
+      () => transformer().transformRequestOut!({
+        model: "openai/test-model",
+        tools: [{ type, name: `server_${type}` }],
+        messages: [{ role: "user", content: "run a server tool" }],
+      }),
+      (error: any) =>
+        error?.statusCode === 400 &&
+        /server-side tools/.test(error.message),
+    );
+  }
+
+  for (const type of [
+    "server_tool_use",
+    "tool_search_tool_result",
+    "advisor_tool_result",
+    "mcp_tool_use",
+    "mcp_tool_result",
+  ]) {
+    await assert.rejects(
+      () => transformer().transformRequestOut!({
+        model: "openai/test-model",
+        messages: [{
+          role: "assistant",
+          content: [{
+            type,
+            id: "srvtoolu_history",
+            tool_use_id: "srvtoolu_history",
+            content: {},
+          }],
+        }],
+      }),
+      (error: any) =>
+        error?.statusCode === 400 &&
+        /server-tool history/.test(error.message),
+    );
+  }
+});
+
+test("typed Anthropic client tools are rejected instead of getting empty schemas", async () => {
+  for (const type of [
+    "bash_20250124",
+    "computer_20251124",
+    "memory_20250818",
+    "text_editor_20250728",
+  ]) {
+    await assert.rejects(
+      () => transformer().transformRequestOut!({
+        model: "openai/test-model",
+        tools: [{ type, name: `client_${type}` }],
+        messages: [{ role: "user", content: "use the client tool" }],
+      }),
+      (error: any) =>
+        error?.statusCode === 400 &&
+        /version-specific OpenAI function schema/.test(error.message),
+    );
+  }
+});
+
+test("opaque Anthropic control blocks never become model-visible JSON", async () => {
+  const blocks = [
+    {
+      type: "compaction",
+      content: "summary",
+      encrypted_content: "opaque-do-not-expose",
+    },
+    {
+      type: "fallback",
+      from: { model: "model-a" },
+      to: { model: "model-b" },
+      trigger: { type: "refusal" },
+    },
+    { type: "container_upload", file_id: "file_provider_specific" },
+  ];
+  for (const block of blocks) {
+    await assert.rejects(
+      () => transformer().transformRequestOut!({
+        model: "openai/test-model",
+        messages: [{ role: "assistant", content: [block] }],
+      }),
+      (error: any) =>
+        error?.statusCode === 400 && /replay-safe OpenAI/.test(error.message),
+    );
+  }
+});
+
+test("client tool names cannot be silently empty", async () => {
+  await assert.rejects(
+    () => transformer().transformRequestOut!({
+      model: "openai/test-model",
+      tools: [{ name: "", input_schema: { type: "object" } }],
+      messages: [{ role: "user", content: "continue" }],
+    }),
+    (error: any) => error?.statusCode === 400 && /non-empty/.test(error.message),
+  );
+
+  const directOnly = await transformer().transformRequestOut!({
+    model: "openai/test-model",
+    tools: [{
+      name: "direct_only",
+      allowed_callers: ["direct"],
+      input_schema: { type: "object" },
+    }],
+    messages: [{ role: "user", content: "continue" }],
+  });
+  assert.equal(directOnly.tools?.[0].function.name, "direct_only");
+
+  for (const allowed_callers of [
+    ["code_execution_20260521"],
+    ["direct", "code_execution_20260120"],
+    ["future_caller"],
+    [],
+    "direct",
+  ]) {
+    await assert.rejects(
+      () => transformer().transformRequestOut!({
+        model: "openai/test-model",
+        tools: [{
+          name: "restricted",
+          allowed_callers,
+          input_schema: { type: "object" },
+        }],
+        messages: [{ role: "user", content: "continue" }],
+      }),
+      (error: any) => error?.statusCode === 400,
+    );
+  }
+});
+
+test("known tool history blocks validate role and required fields", async () => {
+  const directHistory = await transformer().transformRequestOut!({
+    model: "openai/test-model",
+    messages: [{
+      role: "assistant",
+      content: [{
+        type: "tool_use",
+        id: "call_direct",
+        name: "run",
+        input: {},
+        caller: { type: "direct" },
+      }],
+    }],
+  });
+  assert.equal(directHistory.messages[0].tool_calls?.[0].function.name, "run");
+
+  const invalidMessages = [
+    [{ role: "assistant", content: [{
+      type: "tool_use", id: "", name: "run", input: {},
+    }] }],
+    [{ role: "assistant", content: [{
+      type: "tool_use", id: "call", name: "", input: {},
+    }] }],
+    [{ role: "assistant", content: [{
+      type: "tool_use", id: "call", name: "run", input: "bad",
+    }] }],
+    [{ role: "user", content: [{
+      type: "tool_use", id: "call", name: "run", input: {},
+    }] }],
+    [{ role: "assistant", content: [{
+      type: "tool_use",
+      id: "call",
+      name: "run",
+      input: {},
+      caller: { type: "code_execution_20260120", tool_id: "srvtoolu_1" },
+    }] }],
+    [{ role: "assistant", content: [{
+      type: "tool_use",
+      id: "call",
+      name: "run",
+      input: {},
+      caller: { type: "future_caller" },
+    }] }],
+    [{ role: "assistant", content: [{
+      type: "tool_use",
+      id: "call",
+      name: "run",
+      input: {},
+      caller: "direct",
+    }] }],
+    [{ role: "user", content: [{
+      type: "tool_result", tool_use_id: "", content: "bad",
+    }] }],
+    [{ role: "assistant", content: [{
+      type: "tool_result", tool_use_id: "call", content: "bad",
+    }] }],
+    [{ role: "user", content: [{
+      type: "tool_result",
+      tool_use_id: "call",
+      content: "bad",
+      is_error: "true",
+    }] }],
+  ];
+  for (const messages of invalidMessages) {
+    await assert.rejects(
+      () => transformer().transformRequestOut!({
+        model: "openai/test-model",
+        messages,
+      }),
+      (error: any) => error?.statusCode === 400,
+    );
+  }
+});
+
+test("deferred tools and manual thinking constraints follow Anthropic request rules", async () => {
+  await assert.rejects(
+    () => transformer().transformRequestOut!({
+      model: "openai/test-model",
+      tools: [{
+        name: "only_deferred",
+        defer_loading: true,
+        input_schema: { type: "object" },
+      }],
+      messages: [{ role: "user", content: "continue" }],
+    }),
+    (error: any) =>
+      error?.statusCode === 400 && /at least one tool/.test(error.message),
+  );
+
+  await assert.rejects(
+    () => transformer().transformRequestOut!({
+      model: "openai/test-model",
+      tools: [{
+        name: "bad_deferred_flag",
+        defer_loading: "true",
+        input_schema: { type: "object" },
+      }],
+      messages: [{ role: "user", content: "continue" }],
+    }),
+    (error: any) =>
+      error?.statusCode === 400 && /must be a boolean/.test(error.message),
+  );
+
+  for (const tool_choice of [
+    { type: "any" },
+    { type: "tool", name: "weather" },
+  ]) {
+    await assert.rejects(
+      () => transformer().transformRequestOut!({
+        model: "openai/test-model",
+        thinking: { type: "enabled", budget_tokens: 1024 },
+        tools: [{ name: "weather", input_schema: { type: "object" } }],
+        tool_choice,
+        messages: [{ role: "user", content: "continue" }],
+      }),
+      (error: any) =>
+        error?.statusCode === 400 && /forced tool_choice/.test(error.message),
+    );
+  }
+
+  const adaptive = await transformer().transformRequestOut!({
+    model: "openai/test-model",
+    thinking: { type: "adaptive" },
+    tools: [
+      {
+        name: "deferred",
+        defer_loading: true,
+        input_schema: { type: "object" },
+      },
+      { name: "weather", input_schema: { type: "object" } },
+    ],
+    tool_choice: { type: "any" },
+    messages: [{ role: "user", content: "continue" }],
+  });
+  assert.equal(adaptive.tool_choice, "required");
+  assert.deepEqual(adaptive.tools?.map((tool) => tool.function.name), [
+    "weather",
+  ]);
+});
+
+test("tool_choice validates Anthropic shape before conversion", async () => {
+  const invalidChoices = [
+    "required",
+    { type: "required" },
+    { type: "tool", name: "" },
+    { type: "auto", disable_parallel_tool_use: "true" },
+    { type: "none", disable_parallel_tool_use: false },
+  ];
+  for (const tool_choice of invalidChoices) {
+    await assert.rejects(
+      () => transformer().transformRequestOut!({
+        model: "openai/test-model",
+        tools: [{ name: "weather", input_schema: { type: "object" } }],
+        tool_choice,
+        messages: [{ role: "user", content: "continue" }],
+      }),
+      (error: any) => error?.statusCode === 400,
+    );
+  }
+});
+
+test("mid-conversation system placement follows Anthropic ordering rules", async () => {
+  const invalidMessageLists = [
+    [{ role: "system", content: "not first" }],
+    [
+      { role: "assistant", content: "done" },
+      { role: "system", content: "not after ordinary assistant" },
+    ],
+    [
+      { role: "user", content: "one" },
+      { role: "system", content: "update" },
+      { role: "user", content: "must be assistant or end" },
+    ],
+    [
+      {
+        role: "assistant",
+        content: [{
+          type: "totally_fake_tool_result",
+          tool_use_id: "srvtoolu_fake",
+        }],
+      },
+      { role: "system", content: "a suffix is not a server result" },
+    ],
+  ];
+  for (const messages of invalidMessageLists) {
+    await assert.rejects(
+      () => transformer().transformRequestOut!({
+        model: "openai/test-model",
+        messages,
+      }),
+      (error: any) => error?.statusCode === 400,
+    );
+  }
+
+  const validMessageLists = [[
+    { role: "user", content: "one" },
+    { role: "system", content: "first update" },
+    { role: "system", content: "second update" },
+    { role: "assistant", content: "acknowledged" },
+  ]];
+  for (const messages of validMessageLists) {
+    const result = await transformer().transformRequestOut!({
+      model: "openai/test-model",
+      messages,
+    });
+    assert.ok(result.messages.some((message) => message.role === "system"));
+  }
 });
 
 test("future system blocks use a bounded, non-empty text fallback", async () => {
@@ -240,6 +863,10 @@ test("documents retain a typed unified file envelope and Chat degrades only URL 
     {
       role: "user",
       content: [
+        {
+          type: "text",
+          text: '[tool_result multimodal content {"tool_index":1,"tool_call_id_utf16be_base64url":"AGMAYQBsAGwAXwAx"}]',
+        },
         {
           type: "file",
           file: {

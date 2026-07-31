@@ -1,3 +1,5 @@
+import { decodeChatReasoningSignature } from "./chat-reasoning.js";
+
 export function scrubAnthropicOnlyFields(body: Record<string, unknown>): void {
   const messages = body.messages;
   if (!Array.isArray(messages)) return;
@@ -56,8 +58,18 @@ export function normalizeMultimodalToolResultsForChatCompletions(
 
   const normalized: any[] = [];
   let pendingSidecars: any[] = [];
+  let toolResultOrdinal = 0;
 
   const normalizeFilePart = (part: any): any => {
+    if (
+      part?.type === "image_file" &&
+      typeof part.image_file?.file_id === "string"
+    ) {
+      return {
+        type: "file",
+        file: { file_id: part.image_file.file_id },
+      };
+    }
     if (part?.type !== "file") return part;
     const file = part.file;
     const fallback =
@@ -111,16 +123,45 @@ export function normalizeMultimodalToolResultsForChatCompletions(
       normalized.push(message);
       continue;
     }
+    toolResultOrdinal += 1;
 
     if (Array.isArray(message.content)) {
       const textParts = message.content.filter(
         (part: any) => part?.type === "text",
       );
-      pendingSidecars.push(
-        ...message.content.filter(
-          (part: any) => part?.type === "image_url" || part?.type === "file",
-        ),
+      const multimodalParts = message.content.filter(
+        (part: any) => part?.type === "image_url" || part?.type === "file",
       );
+      if (multimodalParts.length > 0) {
+        const toolCallId =
+          typeof message.tool_call_id === "string"
+            ? message.tool_call_id
+            : undefined;
+        const provenance = {
+          tool_index: toolResultOrdinal,
+          ...(toolCallId !== undefined
+            ? {
+                // Encode every JavaScript UTF-16 code unit so even a JSON
+                // string containing an unpaired surrogate remains exactly
+                // reversible. Plain UTF-8 would replace it with U+FFFD.
+                tool_call_id_utf16be_base64url:
+                  encodeUtf16CodeUnitsBase64Url(toolCallId),
+              }
+            : {}),
+        };
+        // Chat Completions only permits text in role:"tool" content. The
+        // multimodal user sidecar therefore carries a deterministic provenance
+        // marker before the original image/file bytes. This preserves which
+        // parallel tool result owned each part and avoids an ambiguous
+        // image-only turn without guessing anything about its business meaning.
+        pendingSidecars.push(
+          {
+            type: "text",
+            text: `[tool_result multimodal content ${JSON.stringify(provenance)}]`,
+          },
+          ...multimodalParts,
+        );
+      }
       message.content = textParts.length > 0 ? textParts : "";
     } else if (message.content == null) {
       message.content = "";
@@ -129,6 +170,14 @@ export function normalizeMultimodalToolResultsForChatCompletions(
   }
   flushSidecars();
   body.messages = normalized;
+}
+
+function encodeUtf16CodeUnitsBase64Url(value: string): string {
+  const bytes = Buffer.allocUnsafe(value.length * 2);
+  for (let index = 0; index < value.length; index += 1) {
+    bytes.writeUInt16BE(value.charCodeAt(index), index * 2);
+  }
+  return bytes.toString("base64url");
 }
 
 /**
@@ -161,19 +210,25 @@ export function convertThinkingToReasoningContent(
     // Prefer the full multi-block form (joined — reasoning_content is a single
     // string) and fall back to the single-block field.
     const thinkingBlocks = m.thinking_blocks as
-      | Array<{ content?: string }>
+      | Array<{ content?: string; signature?: string }>
       | undefined;
     const joinedThinking = Array.isArray(thinkingBlocks)
       ? thinkingBlocks
-          .map((block) => block?.content)
+          .map((block) =>
+            block?.content || decodeChatReasoningSignature(block?.signature)
+          )
           .filter(Boolean)
           .join("\n")
       : "";
-    const thinking = m.thinking as { content?: string } | undefined;
+    const thinking = m.thinking as
+      | { content?: string; signature?: string }
+      | undefined;
+    const singleThinking = thinking?.content ||
+      decodeChatReasoningSignature(thinking?.signature);
     if (joinedThinking) {
       m.reasoning_content = joinedThinking;
-    } else if (thinking?.content) {
-      m.reasoning_content = thinking.content;
+    } else if (singleThinking) {
+      m.reasoning_content = singleThinking;
     }
     delete m.thinking;
     delete m.thinking_blocks;

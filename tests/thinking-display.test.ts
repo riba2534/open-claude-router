@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AnthropicTransformer } from "../src/transformers/anthropic.js";
 import { OpenAIResponsesTransformer } from "../src/transformers/responses.js";
+import { decodeChatReasoningSignature } from "../src/utils/chat-reasoning.js";
+import { convertThinkingToReasoningContent } from "../src/utils/strip.js";
 
 const logger = {
   debug() {},
@@ -178,22 +180,105 @@ test("Responses omitted display requests encrypted state without a detailed summ
   assert.deepEqual(summarized.reasoning, { summary: "detailed" });
 });
 
-test("Chat JSON rejects omitted reasoning without replayable state", async () => {
-  await assert.rejects(
-    anthropicTransformer().transformResponseIn!(
-      chatJson("private chat reasoning"),
-      omittedContext,
-    ),
-    (error: any) =>
-      error?.statusCode === 502 && error?.code === "upstream_protocol_error",
+test("Chat JSON hides omitted reasoning and replays it through an opaque Router signature", async () => {
+  const anthropic = anthropicTransformer();
+  const omittedResponse = await anthropic.transformResponseIn!(
+    chatJson("private chat reasoning"),
+    omittedContext,
+  );
+  const omitted: any = await omittedResponse.json();
+  const omittedThinking = omitted.content.find(
+    (block: any) => block.type === "thinking",
   );
 
-  const visibleResponse = await anthropicTransformer().transformResponseIn!(
+  assert.equal(omittedThinking.thinking, "");
+  assert.equal(
+    decodeChatReasoningSignature(omittedThinking.signature),
+    "private chat reasoning",
+  );
+  assert.equal(
+    omitted.content.find((block: any) => block.type === "text").text,
+    "answer",
+  );
+
+  const replay: any = await anthropic.transformRequestOut!({
+    model: "claude-test",
+    max_tokens: 2048,
+    thinking: { type: "adaptive", display: "omitted" },
+    messages: [
+      { role: "user", content: "first turn" },
+      {
+        role: "assistant",
+        content: [
+          omittedThinking,
+          {
+            type: "tool_use",
+            id: "call-replay",
+            name: "lookup",
+            input: { value: 1 },
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call-replay",
+            content: "done",
+          },
+        ],
+      },
+    ],
+  } as any);
+  convertThinkingToReasoningContent(replay, true);
+  assert.equal(
+    replay.messages.find((message: any) => message.role === "assistant")
+      .reasoning_content,
+    "private chat reasoning",
+  );
+
+  const visibleResponse = await anthropic.transformResponseIn!(
     chatJson("visible chat reasoning"),
     ordinaryContext,
   );
   const visible: any = await visibleResponse.json();
   assert.equal(visible.content[0].thinking, "visible chat reasoning");
+  assert.equal(
+    decodeChatReasoningSignature(visible.content[0].signature),
+    "visible chat reasoning",
+  );
+
+  const nativeSignatureResponse = await anthropic.transformResponseIn!(
+    new Response(
+      JSON.stringify({
+        id: "chatcmpl-native-thinking",
+        object: "chat.completion",
+        model: "reasoner",
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "answer",
+            thinking: {
+              content: "hidden native-extension reasoning",
+              signature: "native-chat-signature",
+            },
+          },
+          finish_reason: "stop",
+        }],
+        usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+      }),
+      { headers: { "content-type": "application/json" } },
+    ),
+    omittedContext,
+  );
+  const nativeSignatureBody: any = await nativeSignatureResponse.json();
+  assert.equal(nativeSignatureBody.content[0].thinking, "");
+  assert.equal(
+    decodeChatReasoningSignature(nativeSignatureBody.content[0].signature),
+    "hidden native-extension reasoning",
+  );
 });
 
 test("Responses JSON hides text but preserves its replayable signature", async () => {
@@ -215,7 +300,7 @@ test("Responses JSON hides text but preserves its replayable signature", async (
   assert.equal(body.content.find((block: any) => block.type === "text").text, "answer");
 });
 
-test("Chat SSE rejects omitted reasoning without replayable state", async () => {
+test("Chat SSE hides omitted reasoning and emits a replayable Router signature", async () => {
   const upstream = sse([
     {
       id: "chatcmpl-thinking-display",
@@ -252,10 +337,79 @@ test("Chat SSE rejects omitted reasoning without replayable state", async () => 
   const events = parseAnthropicSse(await converted.text());
 
   assert.equal(events.some((event) => event.delta?.type === "thinking_delta"), false);
-  assert.equal(events.some((event) => event.delta?.type === "signature_delta"), false);
-  assert.equal(events.some((event) => event.delta?.type === "text_delta"), false);
-  assert.equal(events.some((event) => event.type === "error"), true);
-  assert.equal(events.some((event) => event.type === "message_stop"), false);
+  const signature = events.find(
+    (event) => event.delta?.type === "signature_delta",
+  )?.delta.signature;
+  assert.equal(
+    decodeChatReasoningSignature(signature),
+    "private stream reasoning",
+  );
+  assert.equal(
+    events.find((event) => event.delta?.type === "text_delta")?.delta.text,
+    "answer",
+  );
+  assert.equal(events.some((event) => event.type === "error"), false);
+  assert.equal(events.some((event) => event.type === "message_stop"), true);
+
+  const nativeSignatureEvents = [
+    {
+      id: "chatcmpl-native-thinking-stream",
+      model: "reasoner",
+      choices: [{
+        index: 0,
+        delta: {
+          role: "assistant",
+          thinking: {
+            content: "hidden native stream reasoning",
+            signature: "native-stream-signature",
+          },
+        },
+        finish_reason: null,
+      }],
+    },
+    {
+      id: "chatcmpl-native-thinking-stream",
+      model: "reasoner",
+      choices: [{ index: 0, delta: { content: "answer" }, finish_reason: null }],
+    },
+    {
+      id: "chatcmpl-native-thinking-stream",
+      model: "reasoner",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    },
+  ];
+  const convertedNative = await anthropicTransformer().transformResponseIn!(
+    sse(nativeSignatureEvents),
+    omittedContext,
+  );
+  const nativeEvents = parseAnthropicSse(await convertedNative.text());
+  const nativeSignature = nativeEvents.find(
+    (event) => event.delta?.type === "signature_delta",
+  )?.delta.signature;
+  assert.equal(
+    decodeChatReasoningSignature(nativeSignature),
+    "hidden native stream reasoning",
+  );
+  assert.equal(
+    nativeEvents.find((event) => event.delta?.type === "text_delta")?.delta.text,
+    "answer",
+  );
+
+  const visibleNative = await anthropicTransformer().transformResponseIn!(
+    sse(nativeSignatureEvents),
+    ordinaryContext,
+  );
+  const visibleNativeEvents = parseAnthropicSse(await visibleNative.text());
+  assert.equal(
+    visibleNativeEvents.find((event) => event.delta?.type === "thinking_delta")
+      ?.delta.thinking,
+    "hidden native stream reasoning",
+  );
+  assert.equal(
+    visibleNativeEvents.find((event) => event.delta?.type === "signature_delta")
+      ?.delta.signature,
+    "native-stream-signature",
+  );
 });
 
 test("Responses SSE omitted display suppresses text and retains encrypted replay state", async () => {

@@ -18,6 +18,8 @@
 
 - [Anthropic vision](https://platform.claude.com/docs/en/build-with-claude/vision)
 - [Anthropic tool results](https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls)
+- [Anthropic mid-conversation system messages and tool changes](https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages)
+- [Anthropic deferred tools and tool search](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
 - [Anthropic streaming](https://platform.claude.com/docs/en/build-with-claude/streaming)
 - [Anthropic extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking)
 - [Anthropic stop reasons](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons)
@@ -52,7 +54,7 @@
 
 ### Chat 与 Responses 的不可同构点
 
-OpenAI Chat 的 `role:"tool"` content 正式只允许字符串或 text part，不能原生容纳 `image_url`。本次实现把整组并行 tool message 保持连续且 text-only，并把图片放到其后的标准 user 多模态 sidecar。图片字节、图片间顺序和视觉输入得以保留，但原始跨模态顺序及图片与某个具体 tool output 的强归属会降级。
+OpenAI Chat 的 `role:"tool"` content 正式只允许字符串或 text part，不能原生容纳 `image_url`。本次实现把整组并行 tool message 保持连续且 text-only，并把图片放到其后的标准 user 多模态 sidecar。每组附件前加入通用 provenance marker：工具在请求历史中的序号，加完整 `tool_call_id` 的可逆 UTF-16BE/base64url 编码。这样不会把任意 ID 当作自然语言，也不会因长公共前缀截断碰撞；图片字节、图片间顺序和并行结果归属可恢复。该 marker 仍是模型可见的有损兼容编码，不是 Chat 正式关联字段，text/image 的原始交错顺序无法同构。
 
 Responses 的 `function_call_output.output` 正式允许字符串或 `input_text` / `input_image` / `input_file` 数组，因此可原生保留归属。需要精确多模态工具结果语义时，应优先使用 Responses。
 
@@ -86,32 +88,34 @@ claude-code-router 的 Fusion Vision 是显式注册的独立 MCP server，由�
 
 | 项目 | Anthropic → Chat | Anthropic → Responses | 参考项目对照 | 裁决 / 当前状态 |
 |---|---|---|---|---|
-| roles | 顶层 system → system；message 仅接受正式 user/assistant | system 统一成为 input 中的 system message | 会识别部分特定 reminder 结构 | 不引入业务 reminder 规则；**合理差异** |
+| roles | 顶层 system → system；user/assistant 与普通中途 system 按原位置保留，并校验 system placement | system content part → `input_text`，角色和位置不变 | 会识别部分特定 reminder 结构 | 不引入业务 reminder 规则；原先丢弃 Claude Code 实际 system message 为**已修复 bug**。依赖 Anthropic server-tool result 的 system 历史因执行责任不可同构而明确 400 |
 | developer | Anthropic Messages 无同名 message role，不合成 | 同左 | 部分 provider 路径会合成 | 没有可靠来源；**合理差异** |
 | system string / block array | text 保序，wrapper `cache_control` 剥除 | string / array 现在走同一 system message 语义 | 实现因 translator 而异 | 原先 Responses 两种输入走 instructions / 多 message，已统一；**已修复 bug** |
 | 普通 text content | string 或 text part 保留 | `input_text` / `output_text` | 基本等价 | 正确 |
-| 顶层 base64 image | 标准 data URL `image_url`，无额外字段 | 标准 `input_image` data URL | CLI：Chat/Codex 支持；claude-code-router gateway：丢弃 | 非标准 `media_type` 与截断均为**已修复 bug**；参考 gateway 为明确缺陷 |
-| 顶层 URL image | 标准 `image_url` | 标准 `input_image` | CLI：Chat 支持、Codex 会丢；claude-code-router gateway：丢弃 | Router 当前更完整；两参考路径各有**参考限制** |
+| 顶层 base64 image | 已知 base64 source → 标准 data URL `image_url`，无额外字段；缺 media type 的裸 payload 不猜格式，自描述 data URL 保留 | 标准 `input_image` data URL | CLI：Chat/Codex 支持；claude-code-router gateway：丢弃 | 非标准 `media_type` 与截断、缺类型时默认猜 image/png 均为**已修复 bug**；参考 gateway 为明确缺陷 |
+| 顶层 URL / file_id image | 已知 URL source → 标准 `image_url`；Anthropic image file source → 标准 Chat `file.file_id` | 标准 `input_image.image_url` / `input_image.file_id` | CLI：Chat 支持 URL、Codex 会丢 URL；两个参考路径未覆盖最新 file image | Router 当前覆盖正式三种 source；未知 source 即使带 url 也按有界文本降级，避免猜测未来语义；旧测试把 file image JSON 化为文字是**已修复 bug** |
 | document / file | base64 / text source → 正式 `file_data`；Anthropic file source → `file_id`；Chat 无正式 `file_url`，URL source 使用含 URL 的有界文本 fallback | 统一转 `input_file`，支持 `file_data` / `file_id` / `file_url` / `filename` | CLI 多条路径会丢；claude-code-router gateway 的 tool document 仅在无 text 时 JSON 降级 | typed 映射为**已修复 bug**；`source:content`、citations/context 无稳定同构字段，继续安全降级或不转发，属于**待验证** |
 | unknown 顶层 block | 逐 block 有界 JSON 文本降级（对齐 tool_result 的做法），turn 不再被静默删除 | 同左 | 多数路径忽略 | 原先整轮消失、单轮请求可退化为 `messages: []`；**已修复 bug** |
-| `tool_use` | assistant `tool_calls[]`，ID/name/JSON args 保留 | 每个 call 成为 `function_call` | 基本等价 | 正确 |
+| 已知 opaque control block | `compaction` / `fallback` / `container_upload` 明确 400 | 同左 | 参考版本通常尚未覆盖 | 前两者要求结构/加密状态按原位回放，后者携带 provider file ID；转成可见 JSON 会泄漏 opaque metadata 并改变语义，当前无 replay-safe OpenAI 同构；**已修复 bug / 协议限制** |
+| `tool_use` | assistant `tool_calls[]`，ID/name/JSON args 保留；上游 function call 返回时补正式 `caller:{type:"direct"}` | 每个普通 call 成为 `function_call`，返回标记 direct caller；带 program caller 的 function call 与 `program` / `program_output` 必须连同 hosted-runtime 状态回放，当前明确 502 而不伪装 direct | 基本等价 | 已知 block 先校验角色、非空 id/name、object input 与 caller；历史 caller 缺省或 direct 可回放，code-execution caller 明确 400；custom tool 的 `allowed_callers` 仅 `direct` 可等价；OpenAI programmatic caller 无 Anthropic 同构；**已修复 bug / 协议限制** |
 | `tools[].strict` | 显式 true/false 保真，未声明保持 Chat 默认 | Responses 正式要求 boolean，未声明映射为 `strict:false` | 参考路径版本不同 | 缺省 strict 导致严格 Responses 端点 400；**已修复 bug** |
 | `output_config.format` | → `response_format.json_schema` | → `text.format` | 参考版本覆盖不一 | document citations 同时启用时按 Anthropic 正式冲突本地 400；**已修复 bug** |
 | assistant text + `tool_use` 历史 | text 和 calls 均保留 | Router 内部 `output_blocks` 保留 thinking/text/tool 原顺序，回放为有序 reasoning/message/function_call items | CLI 会先 flush message；claude-code-router gateway 保留 text/calls | 原先遇 call 就丢全部 text、以及 `[thinking,tool,text]` 被重排均为**已修复 bug** |
 | `tool_result` string | tool string | function output string | 两参考实现基本等价 | 正确 |
-| `tool_result` text/image array | text-only tool + user image sidecar；图片字节与图片间顺序保留，跨模态原顺序和具体 tool 强绑定降级 | 原生 output part 数组，跨模态顺序与归属保留 | CLI：Chat 非标准地把 image 放 tool、Codex 仅保 base64；claude-code-router gateway：image-only JSON 化，mixed 时丢 image | 原 JSON stringify 为**已修复 bug**；Chat sidecar 是**合理差异** |
+| `tool_result` text/image array | text-only tool + user image sidecar；每组附件前以工具序号 + 完整 ID 的可逆 opaque marker 保留并行归属，跨模态原始交错顺序仍降级 | 原生 output part 数组，跨模态顺序与归属保留 | CLI：Chat 非标准地把 image 放 tool、Codex 仅保 base64；claude-code-router gateway：image-only JSON 化，mixed 时丢 image | 原 JSON stringify 为**已修复 bug**；Chat marker/sidecar 是无正式同构字段时的**合理有损差异** |
+| 中途工具可用性 | `defer_loading` 初始隐藏；direct 与 `mid_conv_system` wrapper 内的 `tool_addition` / `tool_removal`、自定义客户端 `tool_result.tool_reference` 按顺序计算当前 active tool 子集 | 同一 active 子集转 Responses 顶层 functions | 两个参考实现未形成通用基线 | wrapper 内文字保持 system、结构 directive 不再变成模型可见 JSON；inactive named/any tool choice 本地 400；全 deferred 工具集按 Anthropic 规则本地 400；Anthropic server-owned tools/history 与 MCP tool-change reference 无通用 OpenAI function-tool 同构，明确报错；内置 typed client tools 在实现版本化 schema 前明确报错而非伪造空 schema；**已修复 bug / 协议限制** |
 | 同轮 `tool_result` + user text 顺序 | 连续 tool message 后再发 user follow-up | `function_call_output` 后再发 user `input_text` | claude-code-router gateway：Chat 正确、Responses 反序 | Router 当前顺序正确；新增参考回归测试 |
 | 空 / 缺省 `tool_result.content` | `""` | output `""` | claude-code-router gateway 同为 `""`；CLI 路径不完全一致 | 原先缺字段或 `"[]"`；**已修复 bug** |
 | unknown / document tool-result block | unknown 逐 block 有界文本 fallback；可表示为 `file_data` / `file_id` 的 document 移入随后 user file sidecar，URL-only 文件转含 URL 的文本 | unknown → `input_text` fallback；document → `input_file`，与 text/image 一起保留数组顺序和 tool 归属 | CLI mixed 场景可能丢；claude-code-router gateway 只在无 text 时 JSON 化，mixed 场景静默丢弃 | typed document 为**已修复 bug**；Chat sidecar / URL fallback 是正式 schema 不可同构导致的**合理差异** |
 | `tool_result.is_error` | 当前不转发 | 当前不转发 | translator 路径处理不一 | OpenAI 两协议无直接同构 flag；是否编码进文本/状态需设计，**待验证** |
-| `tool_choice:any` | `required` | `required` | translator 各异 | 原样 `any` 会被 OpenAI 拒绝；既有修复保留 |
+| `tool_choice:any` | `required` | `required` | translator 各异 | 先校验 Anthropic 对象形状、枚举、named name 与 parallel flag；manual enabled thinking 禁止 forced choice，adaptive 允许；原样 `any` 会被 OpenAI 拒绝；**已修复 bug** |
 | named tool choice | OpenAI function choice | Responses 扁平 function choice | 基本等价 | 正确 |
 | parallel tools request | `disable_parallel_tool_use` 取反映射 | 同左；未指定时不覆盖上游默认 | 支持程度依路径 | 原 Responses 硬编码 false；**已修复 bug** |
 | parallel tools stream | 按 OpenAI tool index 缓冲并输出顺序完整 Anthropic block | Responses 先映射 tool index，再走同一状态机 | CLI 有独立事件状态机 | 原先 delta 可写入已关闭 block；**已修复 bug** |
-| thinking / effort / display request | `output_config.effort` 五值精确映射；thinking 内容使用兼容扩展 `reasoning_content`。Chat 无 encrypted replay state，显式 omitted 遇仅明文 reasoning 时 JSON/SSE 均返回 502 | 五个显式 effort 精确映射；显式 omitted 不请求 detailed summary，但继续 include encrypted state | 两个参考项目均含 provider/路径特有映射，不能作为通用 clamp 依据 | 不再合成不可回放的 Chat signature；Responses 缺 id/encrypted state 同样 502。enabled/adaptive/budget 的本地 400 校验保持；**已修复 bug / Chat 协议限制** |
-| reasoning history | Chat 保留 reasoning_content 文本，signature 无标准承载 | 请求 encrypted content；Router 把正式必需的 item ID 与 encrypted content 封入自描述 opaque signature，下一轮只解包自身 marker | CLI 会验证 provider signature，但其兼容路径省略 ID | 原生 Claude/未知/合成 signature 不会误传；**已修复并保守降级**。若兼容网关把相邻请求路由到不同 state resource，正式回放仍可能被其 409 拒绝，Router 不猜测或删除历史 |
-| reasoning response | visible `reasoning_content` → thinking；普通显示模式可使用局部兼容 signature，omitted 禁止伪造 | 非流式优先 `reasoning_text`、无正文时回退 summary；流式覆盖 delta/done/item fallback 并去重；`{id, encrypted_content}` → Router signature envelope | 两个参考项目的字段与事件覆盖均随 provider/path 变化 | 缺必填 Responses reasoning id、omitted 缺 encrypted state、SSE/JSON 不一致均为**已修复 bug** |
-| `cache_control` | 只剥 protocol wrapper | 同左 | 多数路径剥除 | 原递归删除会破坏 JSON Schema 同名属性；**已修复 bug** |
+| thinking / effort / display request | `output_config.effort` 五值精确映射；thinking 内容使用兼容扩展 `reasoning_content`。Chat 无标准 encrypted replay state，Router 以自描述 opaque signature 无状态封装原 reasoning；显式 omitted 在 JSON/SSE 都隐藏明文 delta 并保留下一轮回放 | 五个显式 effort 精确映射；显式 omitted 不请求 detailed summary，但继续 include encrypted state | 两个参考项目均含 provider/路径特有映射，不能作为通用 clamp 依据 | Chat envelope 只做可逆协议承载，不声称是上游原生密文；Responses 缺 id/encrypted state 仍为 502。enabled/adaptive/budget 的本地 400 校验保持；**已修复 bug / Chat 协议限制** |
+| reasoning history | Chat 把 Router 自有 signature 解回原 `reasoning_content`；未知/原生 Anthropic signature 不猜测、不透传为 Chat 扩展 | 请求 encrypted content；Router 把正式必需的 item ID 与 encrypted content 封入自描述 opaque signature，下一轮只解包自身 marker | CLI 会验证 provider signature，但其兼容路径省略 ID | Chat 与 Responses 使用不同版本前缀，避免跨协议误解包；**已修复并保守降级**。若兼容网关把相邻 Responses 请求路由到不同 state resource，正式回放仍可能被其 409 拒绝，Router 不猜测或删除历史 |
+| reasoning response | visible `reasoning_content` → thinking；无原生 signature 时生成可逆 Router envelope，omitted 仅抑制可见 thinking delta，不丢回放状态 | 非流式优先 `reasoning_text`、无正文时回退 summary；流式覆盖 delta/done/item fallback 并去重；`{id, encrypted_content}` → Router signature envelope | 两个参考项目的字段与事件覆盖均随 provider/path 变化 | Chat envelope 不是加密承诺，只是无状态可逆承载；缺必填 Responses reasoning id、omitted 缺 encrypted state、SSE/JSON 不一致均为**已修复 bug** |
+| `cache_control` | 只剥 protocol wrapper | 同左 | 多数路径剥除 | 原递归删除会破坏 JSON Schema 同名属性；**已修复 bug**。Anthropic 的 tool reference 与 tool-search 专页对 `defer_loading + cache_control` 可否组合存在相互矛盾的说明，Router 暂不据此新增拦截；该 wrapper 最终仍剥除，列为**尚需验证** |
 | metadata / user_id | 当前不转发 | 当前不转发 | 有的映射到 OpenAI user | Anthropic metadata、OpenAI metadata/user/safety_identifier 不同构；**待验证** |
 | `max_tokens` | 原样 | `max_output_tokens` | 基本等价 | 正确 |
 | `temperature` / `top_p` | 原样 | 原样 | 因模型而异 | Responses 原先无条件删 temperature，top_p 丢失；**已修复 bug** |
@@ -136,7 +140,8 @@ claude-code-router 的 Fusion Vision 是显式注册的独立 MCP server，由�
 ## 已实施改动
 
 - 修正 base64 / URL 图片转换，并移除 Chat 非标准 `media_type`。
-- 对 tool result 的 text/image/document/unknown/empty 内容做结构化转换；Responses 原生保留 `input_text` / `input_image` / `input_file` 多 block 顺序与归属；Chat tool message 保持 text-only，并把图片/可表示文件放入标准 user sidecar。
+- 对 tool result 的 text/image/document/unknown/empty 内容做结构化转换；Responses 原生保留 `input_text` / `input_image` / `input_file` 多 block 顺序与归属；Chat tool message 保持 text-only，并把图片/可表示文件放入带可逆 provenance marker 的标准 user sidecar。
+- 保留普通中途 system 角色与位置；direct block 与 `mid_conv_system` wrapper 恰好展开一层，wrapper 内文字保持 system、工具变更只进入结构投影；按历史顺序解释 `defer_loading`、自定义客户端 `tool_result` 中的 `tool_reference` 和 `tool_addition` / `tool_removal`，向 OpenAI 两协议投影当前生成的最终 active tool 子集。Anthropic server-owned tools（含 web search/fetch、code execution、advisor、tool search、MCP）及其历史结果因没有通用 OpenAI function-tool 同构而明确报错，不把服务端执行伪装成客户端函数；内置 typed client tools 在实现对应版本 schema 前也明确报错而非伪造空参数函数；`compaction` / `fallback` / `container_upload` 不会降级成模型可见 JSON。所有判断都来自协议类型，不加入模型名、网关或业务工具特判。
 - Anthropic document 的 base64/text/file/URL source 建立统一内部 file envelope；Chat 正式使用 `file_data`/`file_id`，URL-only 安全降级，Responses 正式使用 `input_file.file_data`/`file_id`/`file_url`。
 - 新增 `top_p`、Chat `stop`、并行工具参数映射；保留 Responses temperature；disabled thinking 不再误启用。
 - 精确映射 `output_config.effort` 的五个正式值；enabled budget 必须为有限整数且至少 1024，adaptive 可省略且不得携带 budget；只有合法 enabled budget 才进入 Responses heuristic，不做模型名 clamp。
@@ -175,9 +180,22 @@ claude-code-router 的 Fusion Vision 是显式注册的独立 MCP server，由�
 
 ## 第三轮独立复核与收口（0.5.0）
 
-三个只读 Agent 分别复核多模态/工具/结构化输出、reasoning/history、SSE/error lifecycle，主 Agent 用源码与最小可执行 fixture 裁决。确认并修复：Responses 缺省 `strict:false`；document citations 与 structured output 冲突；Chat/Responses incomplete 工具在流/非流均降级为有界诊断文本；legacy stream function call 稳定 ID；`web_search_call` 与 citation 的 id/action/query/URL/range 有界保真且不猜测归属；web-search 等 fallback 等待 terminal 完整快照，citation 按 item/content/annotation 位置去重且 text→citation 顺序统一；生成图片流/非流均只发占位符；file/未知 citation 和未知 output payload 的有界保真；assistant history block 顺序；unsigned/missing-id reasoning；Chat omitted 不可回放时的 502；Responses terminal response/status 与逐 `output_index` 工具身份校验；cancelled/queued/in-progress/unknown status；完整 item 后 delta 去重；工具参数只在 id/name 齐全后下发；cache-write usage；HTTP 200 SSE logical failure 的状态和 retry contract。
+三个只读 Agent 分别复核多模态/工具/结构化输出、reasoning/history、SSE/error lifecycle，主 Agent 用源码与最小可执行 fixture 裁决。确认并修复：Responses 缺省 `strict:false`；document citations 与 structured output 冲突；Chat/Responses incomplete 工具在流/非流均降级为有界诊断文本；legacy stream function call 稳定 ID；`web_search_call` 与 citation 的 id/action/query/URL/range 有界保真且不猜测归属；web-search 等 fallback 等待 terminal 完整快照，citation 按 item/content/annotation 位置去重且 text→citation 顺序统一；生成图片流/非流均只发占位符；file/未知 citation 和未知 output payload 的有界保真；assistant history block 顺序；Chat reasoning 在 visible/omitted、JSON/SSE 与工具历史间使用 Router 自有可逆 signature 保持无状态回放；Responses unsigned/missing-id reasoning；Responses terminal response/status 与逐 `output_index` 工具身份校验；cancelled/queued/in-progress/unknown status；完整 item 后 delta 去重；工具参数只在 id/name 齐全后下发；cache-write usage；HTTP 200 SSE logical failure 的状态和 retry contract。
 
 新增 `tests/protocol-edge-regressions.test.ts` 直接覆盖上述终态和责任边界。上游 HTTP 非 2xx 的既定策略未改：所有 3xx/4xx/5xx 仍只请求一次、保留状态/错误体并返回 `X-Should-Retry:true`。
+
+## 第四轮真实 Claude Code 与 main A/B（0.5.0）
+
+为避免只验证构造 fixture，本轮同时运行两个独立 Router 进程：`origin/main` 精确提交 `2683537d5097`（0.4.0）监听独立端口，候选为 `ba6185cdab2c` 加本节修复；main 通过 `git archive` 导出到临时目录，没有切换当前分支或使用 worktree。两套上游、Chat / Responses 两种格式使用相同授权、模型和请求矩阵：
+
+- main 在最终同构矩阵分别为 10/23、11/23 通过；失败覆盖正式 `tool_use.caller`、Responses 流式 text/usage/单与并行工具、document、reasoning/history。候选分别为 22/23（1 个上游状态限制 classified skip）与 23/23，0 failed。
+- 候选同矩阵为 22/23（另 1 项 classified skip）、23/23；skip 是兼容上游跨请求 reasoning item 返回 409，绕过 Router 直连同样复现。
+- 四个真实 Claude Code 2.1.220 TUI 均使用完整 `env ... claude` 命令启动，不依赖 alias 展开。候选四路均完成普通流式文本、并行 Read、Bash 工具结果、工具错误恢复；三条接受正式多模态结构的链路直接读取 PNG 并一致识别真实图形，且完成历史回放。
+- 收口阶段又从这四个 tmux 进程逐一克隆原始环境（仍不执行 alias），并行运行强制 `Read(package.json)` 的 `claude -p` 工具往返；四路全部退出 0、无 permission denial，并返回 `VERSION=0.5.0`。其中一条 Chat 路径曾在 tool-result 后因 `display:"omitted"` 缺可回放 reasoning 而由 Router 本地返回 502；改为自描述 Chat signature envelope 后复测通过，JSON/SSE、native/coalesced signature 与历史回放均有回归测试。
+- 剩余一条 Chat 兼容端点对正式 `role:user` 的 `text + image_url` 数组返回 409 `content expected a string`。脱敏结构探针确认候选没有发送 `content:null`；同端点的 Responses 路径可识图，OpenAI Chat 正式 schema也允许 user content part 数组，故归类为端点兼容限制，不加入网关或模型特判。
+- main 的 Chat / Responses 图片历史会把 typed 图片压成字符串：Claude Code 显示 Read 后转而调用 Bash 或输出与 PNG 像素不符的描述，证明“HTTP 200”不等于视觉语义到达；main 的一条 Responses SSE 链路甚至完成空响应。候选修复了这一责任边界。
+
+上述 A/B 不记录真实 endpoint、模型或凭证。Router 只按显式 `X-Upstream-Format` 选择协议，不根据任何上游身份、模型名或业务工具名改变请求。
 
 ## 测试证据
 
@@ -191,9 +209,11 @@ claude-code-router 的 Fusion Vision 是显式注册的独立 MCP server，由�
 - 文本模型拒绝标准图片的 400 责任边界；
 - assistant text + tools、generic tool names、schema 同名字段、thinking/parallel/参数；
 - `output_config.effort` 五值在 thinking absent/disabled/enabled/adaptive 下的精确 Chat / Responses 映射，以及 enabled budget 缺失、0、小数、过小和 adaptive 携带 budget 的本地 400；
+- client tool 的非空名称、`defer_loading` 类型、全 deferred 工具集、`tool_choice` 形状/枚举及 manual thinking 强制工具冲突；`mid_conv_system` wrapper 展开；`tool_use` / `tool_result` 的角色和必填字段；所有已知 Anthropic server-owned tool 定义与历史块、typed client tool、opaque control block 均明确报错，不会变成空 schema 函数或模型可见 JSON；
 - Chat 并行工具流、流式错误；
 - Chat / Responses 同 event 多 `data:`、LF/CRLF/CR、逐字节 UTF-8、EOF trailing event、`[DONE]` 终止读取，以及 malformed event 即使后续存在合法 terminal 也不得合成成功；
 - Responses created/completed/incomplete/failed、usage/cache、reasoning signature/reasoning_text、done-only fallback、refusal `stop_details`、partial/incomplete function call 安全终态，流式/非流式；
+- Responses programmatic tool calling 的 `program` / `program_output` / caller-bearing `function_call` 在 JSON、live SSE item 与 terminal-only SSE 均明确失败，不会被重标成 direct `tool_use`；
 - 非 2xx 状态表 `300, 400, 401, 403, 404, 408, 409, 413, 422, 429, 500, 502, 504, 529`：均保留状态、只 fetch 一次、返回 `X-Should-Retry:true`；
 - header 与 embedded-path 两种接入；200 和本地 400 不带 retry header。
 
@@ -219,10 +239,10 @@ go test ./internal/translator/codex/claude \
   -count=1
 ```
 
-当前候选的仓库自动化回归为 141/141 通过。另以 `scripts/verify-live-upstream.ts` 对两套独立兼容上游运行脱敏真实用例，既有完整矩阵合计 45 passed / 1 classified skip / 0 failed；本次收口以最新生产构建在当前可访问的独立上游复跑全部 23 个 Chat/Responses case，23/23 通过。另一内网上游从当前执行环境无法建立连接，只记为环境不可达，不归因于协议转换：
+当前候选的仓库自动化回归为 157/157 通过。另以 `scripts/verify-live-upstream.ts` 对两套独立兼容上游运行脱敏真实用例，最新完整矩阵合计 45 passed / 1 classified skip / 0 failed：
 
 - Chat Completions 与 Responses 的普通文本，各覆盖 stream false/true（4）；
-- 两协议 required tool call，各覆盖 stream false/true（4），以及两协议并行工具流（2）；
+- 两协议 required tool call，各覆盖 stream false/true（4），以及两协议并行工具流（2）；所有成功工具块同时断言正式 `caller:{type:"direct"}`；
 - 两协议顶层 base64 / URL 图片（4），两协议嵌套 tool-result text + image（2）；
 - 两协议 document file/input_file（2）与 Responses reasoning usage 的 stream false/true（2）；
 - Responses reasoning 历史跨轮回放（每套上游各 1）：一套成功完成签名回放；另一套返回 409 `item not found / different resource`，Router 保留状态与 retry header；直接绕过 Router 的两轮正式 Responses 回放也得到同类 409，因此只对该上游归类为跨资源状态限制并 skip；
@@ -232,8 +252,8 @@ go test ./internal/translator/codex/claude \
 
 - Chat Completions：embedded-path `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`，普通 `claude -p` 成功；
 - Responses：embedded-path `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_CUSTOM_HEADERS='X-Upstream-Format: responses'`，普通 `claude -p` 成功；
-- 两种格式分别允许 `Read` 读取 PNG，并完整完成 3-turn `tool_use → tool_result(text/image) → assistant` 往返；
-- Router 运行日志分别确认 `format=chat-completions` / `format=responses`，所有模型请求均为 HTTP 200。
+- 两套上游 × 两种格式共四个 TUI 完成文本、并行 Read、Bash 与工具错误恢复；三条兼容链路完成 `Read(PNG) → tool_result(text/image) → assistant → history replay`，一条 Chat 端点按上文责任边界返回 409；
+- Router 日志分别确认 `format=chat-completions` / `format=responses`，没有按端点、模型或工具名的运行时分支。
 
 报告不记录真实 endpoint、模型名或凭证。使用自有上游复跑：
 
