@@ -190,7 +190,7 @@ test("Responses refusal parts remain a refusal terminal in JSON and streams", as
       .filter((event) => event.delta?.type === "text_delta")
       .map((event) => event.delta.text)
       .join(""),
-    "I cannot ",
+    "I cannot help with that.",
   );
   const terminal = stream.find((event) => event.type === "message_delta");
   assert.equal(terminal?.delta.stop_reason, "refusal");
@@ -217,6 +217,119 @@ test("Responses refusal parts remain a refusal terminal in JSON and streams", as
     doneOnly.find((event) => event.type === "message_delta")?.delta.stop_reason,
     "refusal",
   );
+});
+
+const snapshotChannelCases = [
+  {
+    name: "output text",
+    prefix: "Hel",
+    complete: "Hello",
+    divergent: "World",
+    delta: (value: string) => ({ type: "response.output_text.delta", delta: value }),
+    done: (value: string) => ({ type: "response.output_text.done", text: value }),
+    item: (value: string) => ({
+      id: "msg_snapshot",
+      type: "message",
+      content: [{ type: "output_text", text: value }],
+    }),
+    value: (delta: any) => delta.content,
+  },
+  {
+    name: "refusal",
+    prefix: "N",
+    complete: "NO",
+    divergent: "BLOCKED",
+    delta: (value: string) => ({ type: "response.refusal.delta", delta: value }),
+    done: (value: string) => ({ type: "response.refusal.done", refusal: value }),
+    item: (value: string) => ({
+      id: "msg_snapshot",
+      type: "message",
+      content: [{ type: "refusal", refusal: value }],
+    }),
+    value: (delta: any) => delta.refusal,
+  },
+  {
+    name: "reasoning text",
+    prefix: "rea",
+    complete: "reason",
+    divergent: "think",
+    delta: (value: string) => ({ type: "response.reasoning_text.delta", delta: value }),
+    done: (value: string) => ({ type: "response.reasoning_text.done", text: value }),
+    item: (value: string) => ({
+      id: "rs_snapshot",
+      type: "reasoning",
+      content: [{ type: "reasoning_text", text: value }],
+      encrypted_content: "encrypted-state",
+    }),
+    value: (delta: any) => delta.thinking?.content,
+  },
+] as const;
+
+function snapshotEvents(snapshotCase: (typeof snapshotChannelCases)[number], delta: string, done: string) {
+  const item = snapshotCase.item(snapshotCase.complete);
+  const identity = { item_id: item.id, output_index: 0, content_index: 0 };
+  return [
+    { ...snapshotCase.delta(delta), output_index: 0, content_index: 0 },
+    { ...snapshotCase.done(done), ...identity },
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: responsePayload([item]) },
+  ];
+}
+
+test("Responses done snapshots append only missing suffixes and terminal snapshots do not duplicate", async () => {
+  for (const snapshotCase of snapshotChannelCases) {
+    const chunks = await responsesStreamToChat(
+      snapshotEvents(snapshotCase, snapshotCase.prefix, snapshotCase.complete),
+    );
+    const values = chunks
+      .flatMap((chunk) => chunk.choices?.map((choice: any) => choice.delta) || [])
+      .map(snapshotCase.value)
+      .filter(Boolean);
+    assert.deepEqual(values, [
+      snapshotCase.prefix,
+      snapshotCase.complete.slice(snapshotCase.prefix.length),
+    ], snapshotCase.name);
+    assert.equal(
+      chunks.filter((chunk) => chunk.choices?.[0]?.finish_reason).length,
+      1,
+      snapshotCase.name,
+    );
+  }
+});
+
+test("Responses snapshots equal to accumulated deltas are no-ops", async () => {
+  for (const snapshotCase of snapshotChannelCases) {
+    const chunks = await responsesStreamToChat(
+      snapshotEvents(snapshotCase, snapshotCase.complete, snapshotCase.complete),
+    );
+    const values = chunks
+      .flatMap((chunk) => chunk.choices?.map((choice: any) => choice.delta) || [])
+      .map(snapshotCase.value)
+      .filter(Boolean);
+    assert.deepEqual(values, [snapshotCase.complete], snapshotCase.name);
+  }
+});
+
+test("Responses divergent text snapshots fail without a success terminal", async () => {
+  for (const snapshotCase of snapshotChannelCases) {
+    const events = await responsesStreamToAnthropic(
+      snapshotEvents(snapshotCase, snapshotCase.prefix, snapshotCase.divergent),
+    );
+    assert.equal(
+      events.filter((event) => event.type === "error").length,
+      1,
+      snapshotCase.name,
+    );
+    assert.match(
+      events.find((event) => event.type === "error")?.error?.message,
+      /inconsistent/,
+    );
+    assert.equal(
+      events.some((event) => event.type === "message_stop"),
+      false,
+      snapshotCase.name,
+    );
+  }
 });
 
 test("reasoning separated from a tool by a visible message is not re-paired", async () => {

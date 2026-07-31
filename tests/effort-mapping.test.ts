@@ -107,9 +107,14 @@ test("maps every formal effort across all thinking modes", async () => {
 });
 
 test("rejects non-Anthropic effort values", async () => {
+  for (const effort of [undefined, null]) {
+    const unified = await anthropic.transformRequestOut!(
+      anthropicRequest(effort),
+    );
+    assert.equal(unified.reasoning_effort, undefined, String(effort));
+  }
+
   const invalidValues = [
-    undefined,
-    null,
     "",
     "none",
     "minimal",
@@ -121,41 +126,26 @@ test("rejects non-Anthropic effort values", async () => {
   ];
 
   for (const effort of invalidValues) {
-    const unified = await anthropic.transformRequestOut!(
-      anthropicRequest(effort),
-    );
-    assert.equal(unified.reasoning_effort, undefined, String(effort));
-
-    const result = await toResponses(unified);
-    assert.equal(result.reasoning, undefined, String(effort));
-    assert.equal(
-      Object.prototype.hasOwnProperty.call(result, "reasoning_effort"),
-      false,
+    await assert.rejects(
+      anthropic.transformRequestOut!(anthropicRequest(effort)),
+      (error: any) =>
+        error.statusCode === 400 && error.type === "invalid_request_error",
       String(effort),
     );
-    assert.equal(result.include, undefined, String(effort));
   }
 });
 
-test("invalid explicit effort does not replace thinking budget derivation", async () => {
-  const unified = await anthropic.transformRequestOut!(
-    anthropicRequest("minimal", {
-      type: "enabled",
-      budget_tokens: 4096,
-    }),
+test("invalid explicit effort is rejected before thinking budget derivation", async () => {
+  await assert.rejects(
+    anthropic.transformRequestOut!(
+      anthropicRequest("minimal", {
+        type: "enabled",
+        budget_tokens: 4096,
+      }),
+    ),
+    (error: any) =>
+      error.statusCode === 400 && error.type === "invalid_request_error",
   );
-  assert.equal(unified.reasoning_effort, undefined);
-  assert.deepEqual(unified.reasoning, {
-    effort: "medium",
-    enabled: true,
-  });
-
-  const result = await toResponses(unified);
-  assert.deepEqual(result.reasoning, {
-    effort: "medium",
-    summary: "detailed",
-  });
-  assert.deepEqual(result.include, ["reasoning.encrypted_content"]);
 });
 
 test("Responses prefers and removes explicit Chat reasoning_effort", async () => {

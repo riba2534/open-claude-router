@@ -165,6 +165,9 @@ test("stream:true with a JSON upstream yields a full synthesized Anthropic SSE s
         input_tokens: 8,
         output_tokens: 4,
         cache_read_input_tokens: 2,
+        cache_creation_input_tokens: 0,
+        output_tokens_details: null,
+        server_tool_use: null,
       });
     },
   );
@@ -383,39 +386,30 @@ test("a user turn of only unknown blocks degrades per-block and survives", async
     messages: [
       {
         role: "user",
-        content: [{ type: "search_result", value: 1 }],
+        content: [{ type: "future_search_result", value: 1 }],
       },
     ],
   });
   assert.equal(unified.messages.length, 1);
   assert.deepEqual(unified.messages[0].content, [
-    { type: "text", text: '{"type":"search_result","value":1}' },
+    { type: "text", text: '{"type":"future_search_result","value":1}' },
   ]);
 });
 
-test("a malformed image source never leaves an empty content array", async () => {
+test("a malformed image source is rejected instead of leaving empty content", async () => {
   const anthropic = new AnthropicTransformer();
-  const unified = await anthropic.transformRequestOut!({
-    model: "claude-test",
-    system: [{ type: "image", source: { type: "base64" } }],
-    messages: [
-      {
+  await assert.rejects(
+    anthropic.transformRequestOut!({
+      model: "claude-test",
+      system: [{ type: "image", source: { type: "base64" } }],
+      messages: [{
         role: "user",
-        content: [
-          { type: "image", source: { type: "file" } },
-        ],
-      },
-    ],
-  });
-  for (const message of unified.messages) {
-    if (Array.isArray(message.content)) {
-      assert.ok(message.content.length > 0, "empty content array emitted");
-    }
-  }
-  // The image degrades to a JSON text block instead of vanishing.
-  const user = unified.messages.find((message) => message.role === "user");
-  assert.ok(user, "user turn was deleted");
-  assert.match((user!.content as any[])[0].text, /"type":"file"/);
+        content: [{ type: "image", source: { type: "file" } }],
+      }],
+    }),
+    (error: any) =>
+      error.statusCode === 400 && /provider-owned/.test(error.message),
+  );
 });
 
 test("oversized documents stay typed and oversized unknown blocks stay bounded", async () => {
@@ -632,6 +626,9 @@ test("usage delivered before the finish chunk is not zeroed", async () => {
       input_tokens: 60,
       output_tokens: 20,
       cache_read_input_tokens: 40,
+      cache_creation_input_tokens: 0,
+      output_tokens_details: null,
+      server_tool_use: null,
     },
   );
 });
@@ -1042,24 +1039,25 @@ test("a tool without input_schema gets a default parameters object", async () =>
 // P3: Anthropic-only sibling fields do not leak into Chat content parts
 // ---------------------------------------------------------------------------
 
-test("top-level text blocks are rebuilt without Anthropic-only siblings", async () => {
+test("top-level text citations are rejected instead of silently discarded", async () => {
   const anthropic = new AnthropicTransformer();
-  const unified = await anthropic.transformRequestOut!({
-    model: "claude-test",
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: "cited",
-            citations: [{ type: "char_location" }],
-          },
-        ],
-      },
-    ],
-  });
-  assert.deepEqual(unified.messages[0].content, [
-    { type: "text", text: "cited" },
-  ]);
+  await assert.rejects(
+    anthropic.transformRequestOut!({
+      model: "claude-test",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "cited",
+              citations: [{ type: "char_location" }],
+            },
+          ],
+        },
+      ],
+    }),
+    (error: any) =>
+      error.statusCode === 400 && /citations/.test(error.message),
+  );
 });

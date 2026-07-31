@@ -39,16 +39,6 @@ function parseAnthropicEffort(value: unknown): AnthropicEffort | undefined {
 
 function convertAnthropicImage(part: any) {
   const source = part?.source;
-  if (
-    source?.type === "file" &&
-    typeof source.file_id === "string" &&
-    source.file_id.length > 0
-  ) {
-    return {
-      type: "image_file" as const,
-      image_file: { file_id: source.file_id },
-    };
-  }
   const embeddedDataUrl =
     source?.type === "base64" &&
     typeof source.data === "string" &&
@@ -81,9 +71,6 @@ function documentFallbackText(part: any): string {
       : `[unsupported document block omitted: ${text.length} chars]`;
   if (source?.type === "url" && typeof source.url === "string") {
     return bounded(`[document${title}: ${source.url}]`);
-  }
-  if (source?.type === "file" && typeof source.file_id === "string") {
-    return bounded(`[document${title}: ${source.file_id}]`);
   }
   if (source?.type === "base64" && typeof source.data === "string") {
     return bounded(
@@ -124,11 +111,6 @@ function convertAnthropicDocument(part: any): FileContent | null {
       source.data,
       "utf8",
     ).toString("base64")}`;
-  } else if (
-    source?.type === "file" &&
-    typeof source.file_id === "string"
-  ) {
-    file.file_id = source.file_id;
   } else if (source?.type === "url" && typeof source.url === "string") {
     file.file_url = source.url;
   } else {
@@ -140,6 +122,75 @@ function convertAnthropicDocument(part: any): FileContent | null {
     file,
     fallback_text: documentFallbackText(part),
   };
+}
+
+const TOOL_RESULT_ERROR_MARKER =
+  '[open-claude-router tool_result metadata: {"is_error":true}]';
+
+function metadataTextPart(kind: "document" | "search_result", metadata: object) {
+  return {
+    type: "text" as const,
+    text: `[open-claude-router ${kind} metadata: ${JSON.stringify(metadata)}]`,
+  };
+}
+
+function documentMetadataPart(part: any, required = false) {
+  const hasContext = part?.context !== undefined && part?.context !== null;
+  if (!required && !hasContext) return null;
+  return metadataTextPart("document", {
+    title: typeof part?.title === "string" ? part.title : null,
+    context: typeof part?.context === "string" ? part.context : null,
+  });
+}
+
+function convertAnthropicDocumentBlocks(part: any): any[] {
+  const source = part?.source;
+  if (source?.type === "content") {
+    const blocks: any[] = [documentMetadataPart(part, true)!];
+    if (typeof source.content === "string") {
+      blocks.push({ type: "text", text: source.content });
+      return blocks;
+    }
+    for (const content of source.content as any[]) {
+      if (content.type === "text") {
+        blocks.push({ type: "text", text: content.text });
+      } else if (content.type === "image") {
+        const image = convertAnthropicImage(content);
+        blocks.push(
+          image ?? {
+            type: "text",
+            text: boundedJsonBlockText(content),
+          },
+        );
+      } else {
+        blocks.push({
+          type: "text",
+          text: boundedJsonBlockText(content),
+        });
+      }
+    }
+    return blocks;
+  }
+
+  const file = convertAnthropicDocument(part);
+  if (!file) {
+    return [{ type: "text", text: boundedJsonBlockText(part) }];
+  }
+  const metadata = documentMetadataPart(part);
+  return metadata ? [metadata, file] : [file];
+}
+
+function convertAnthropicSearchResult(part: any): any[] {
+  return [
+    metadataTextPart("search_result", {
+      title: part.title,
+      source: part.source,
+    }),
+    ...part.content.map((content: any) => ({
+      type: "text" as const,
+      text: content.text,
+    })),
+  ];
 }
 
 function jsonFallback(value: unknown): string {
@@ -184,25 +235,80 @@ function chatContentPartToText(part: any): string {
   return boundedJsonBlockText(part);
 }
 
-// OpenAI usage -> Anthropic usage. cached_tokens is reported as a subset of
-// prompt_tokens by OpenAI, but some compatible gateways report it as a
-// separate counter — clamp so input_tokens can never go negative.
-function convertUsage(usage: any): {
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_input_tokens: number;
-  cache_creation_input_tokens?: number;
-} {
+// OpenAI usage -> current Anthropic Usage. cached_tokens is reported as a
+// subset of prompt_tokens by OpenAI, but some compatible gateways report it as
+// a separate counter — clamp so input_tokens can never go negative.
+function convertServiceTier(serviceTier: unknown): "standard" | "priority" | null {
+  return serviceTier === "default" || serviceTier === "standard"
+    ? "standard"
+    : serviceTier === "priority" || serviceTier === "fast"
+      ? "priority"
+      : null;
+}
+
+function convertUsage(usage: any, serviceTier?: unknown): Record<string, any> {
   const cached = usage?.prompt_tokens_details?.cached_tokens || 0;
   const cacheWrite = usage?.prompt_tokens_details?.cache_write_tokens || 0;
+  const reasoningTokens =
+    usage?.completion_tokens_details?.reasoning_tokens;
   return {
+    cache_creation: null,
+    cache_creation_input_tokens: cacheWrite,
+    cache_read_input_tokens: cached,
+    inference_geo: null,
     input_tokens: Math.max(
       0,
       (usage?.prompt_tokens || 0) - cached - cacheWrite,
     ),
     output_tokens: usage?.completion_tokens || 0,
-    cache_read_input_tokens: cached,
-    ...(cacheWrite > 0 ? { cache_creation_input_tokens: cacheWrite } : {}),
+    output_tokens_details: typeof reasoningTokens === "number"
+      ? { thinking_tokens: reasoningTokens }
+      : null,
+    server_tool_use: null,
+    service_tier: convertServiceTier(serviceTier),
+  };
+}
+
+// RawMessageDeltaEvent uses the smaller MessageDeltaUsage schema. Do not copy
+// full-message-only keys such as cache_creation, inference_geo, or
+// service_tier into delta events.
+function convertDeltaUsage(usage: any): Record<string, any> {
+  const full = convertUsage(usage);
+  return {
+    cache_creation_input_tokens: full.cache_creation_input_tokens,
+    cache_read_input_tokens: full.cache_read_input_tokens,
+    input_tokens: full.input_tokens,
+    output_tokens: full.output_tokens,
+    output_tokens_details: full.output_tokens_details,
+    server_tool_use: full.server_tool_use,
+  };
+}
+
+function emptyAnthropicUsage(
+  outputTokens = 0,
+  serviceTier?: unknown,
+): Record<string, any> {
+  return {
+    cache_creation: null,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    inference_geo: null,
+    input_tokens: 0,
+    output_tokens: outputTokens,
+    output_tokens_details: null,
+    server_tool_use: null,
+    service_tier: convertServiceTier(serviceTier),
+  };
+}
+
+function emptyAnthropicDeltaUsage(outputTokens = 0): Record<string, any> {
+  return {
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    input_tokens: 0,
+    output_tokens: outputTokens,
+    output_tokens_details: null,
+    server_tool_use: null,
   };
 }
 
@@ -512,6 +618,237 @@ function validateMidConversationSystemPlacement(messages: any[]): void {
   }
 }
 
+function validateAnthropicImageBlock(block: any, label: string): void {
+  const source = block?.source;
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    invalidRequest(`${label}.source must be an object`);
+  }
+  if (source.type === "file") {
+    invalidRequest(
+      `${label}.source.type "file" is provider-owned and cannot be translated to an OpenAI file id`,
+    );
+  }
+  if (source.type === "base64") {
+    const selfDescribingDataUrl = typeof source.data === "string" &&
+      /^data:[^,]*;base64,/i.test(source.data);
+    if (
+      typeof source.data !== "string" ||
+      (!selfDescribingDataUrl &&
+        (typeof source.media_type !== "string" ||
+          source.media_type.length === 0))
+    ) {
+      invalidRequest(
+        `${label} base64 sources require string data and a non-empty media_type`,
+      );
+    }
+    return;
+  }
+  if (source.type === "url") {
+    if (typeof source.url !== "string" || source.url.length === 0) {
+      invalidRequest(`${label} URL sources require a non-empty url`);
+    }
+    return;
+  }
+  if (typeof source.type !== "string" || source.type.length === 0) {
+    invalidRequest(`${label}.source.type must be a non-empty string`);
+  }
+  // Future discriminators are opaque user content. Conversion preserves the
+  // bounded envelope as visible text without guessing image semantics.
+}
+
+function validateOptionalDocumentMetadata(block: any, label: string): void {
+  for (const key of ["title", "context"] as const) {
+    if (
+      block[key] !== undefined &&
+      block[key] !== null &&
+      typeof block[key] !== "string"
+    ) {
+      invalidRequest(`${label}.${key} must be a string or null when provided`);
+    }
+  }
+  if (
+    block.citations !== undefined &&
+    block.citations !== null &&
+    (!block.citations ||
+      typeof block.citations !== "object" ||
+      Array.isArray(block.citations) ||
+      typeof block.citations.enabled !== "boolean")
+  ) {
+    invalidRequest(`${label}.citations must include a boolean enabled value`);
+  }
+}
+
+function validateTextBlockCitations(block: any, label: string): void {
+  if (block.citations === undefined || block.citations === null) return;
+  if (!Array.isArray(block.citations)) {
+    invalidRequest(`${label}.citations must be an array or null when provided`);
+  }
+  if (block.citations.length > 0) {
+    invalidRequest(`${label}.citations have no OpenAI protocol equivalent`);
+  }
+}
+
+function validateAnthropicDocumentBlock(block: any, label: string): boolean {
+  validateOptionalDocumentMetadata(block, label);
+  const source = block?.source;
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    invalidRequest(`${label}.source must be an object`);
+  }
+  if (source.type === "file") {
+    invalidRequest(
+      `${label}.source.type "file" is provider-owned and cannot be translated to an OpenAI file id`,
+    );
+  }
+  if (source.type === "base64") {
+    const selfDescribingDataUrl = typeof source.data === "string" &&
+      /^data:[^,]*;base64,/i.test(source.data);
+    if (
+      typeof source.data !== "string" ||
+      (!selfDescribingDataUrl &&
+        (typeof source.media_type !== "string" ||
+          source.media_type.length === 0))
+    ) {
+      invalidRequest(
+        `${label} base64 sources require string data and a non-empty media_type`,
+      );
+    }
+  } else if (source.type === "text") {
+    if (typeof source.data !== "string") {
+      invalidRequest(`${label} text sources require string data`);
+    }
+  } else if (source.type === "url") {
+    if (typeof source.url !== "string" || source.url.length === 0) {
+      invalidRequest(`${label} URL sources require a non-empty url`);
+    }
+  } else if (source.type === "content") {
+    if (typeof source.content !== "string" && !Array.isArray(source.content)) {
+      invalidRequest(`${label} content sources require a string or block array`);
+    }
+    if (Array.isArray(source.content)) {
+      for (const [index, inner] of source.content.entries()) {
+        if (!inner || typeof inner !== "object" || Array.isArray(inner)) {
+          invalidRequest(`${label}.source.content[${index}] must be a block`);
+        }
+        if (inner.type === "text") {
+          if (typeof inner.text !== "string") {
+            invalidRequest(
+              `${label}.source.content[${index}].text must be a string`,
+            );
+          }
+          validateTextBlockCitations(
+            inner,
+            `${label}.source.content[${index}]`,
+          );
+        } else if (inner.type === "image") {
+          validateAnthropicImageBlock(
+            inner,
+            `${label}.source.content[${index}]`,
+          );
+        } else if (
+          typeof inner.type !== "string" ||
+          inner.type.length === 0
+        ) {
+          invalidRequest(
+            `${label}.source.content[${index}].type must be a non-empty string`,
+          );
+        }
+      }
+    }
+  } else if (typeof source.type !== "string" || source.type.length === 0) {
+    invalidRequest(`${label}.source.type must be a non-empty string`);
+  }
+  return block.citations?.enabled === true;
+}
+
+function validateAnthropicSearchResultBlock(block: any, label: string): boolean {
+  if (
+    typeof block.title !== "string" ||
+    block.title.length === 0 ||
+    typeof block.source !== "string" ||
+    block.source.length === 0
+  ) {
+    invalidRequest(`${label} requires non-empty title and source strings`);
+  }
+  if (!Array.isArray(block.content) || block.content.length === 0) {
+    invalidRequest(`${label}.content must be a non-empty array of text blocks`);
+  }
+  for (const [index, content] of block.content.entries()) {
+    if (
+      !content ||
+      typeof content !== "object" ||
+      Array.isArray(content) ||
+      content.type !== "text" ||
+      typeof content.text !== "string" ||
+      content.text.length === 0
+    ) {
+      invalidRequest(
+        `${label}.content[${index}] must be a text block with non-empty text`,
+      );
+    }
+    validateTextBlockCitations(content, `${label}.content[${index}]`);
+  }
+  if (
+    block.citations !== undefined &&
+    block.citations !== null &&
+    (!block.citations ||
+      typeof block.citations !== "object" ||
+      Array.isArray(block.citations) ||
+      typeof block.citations.enabled !== "boolean")
+  ) {
+    invalidRequest(`${label}.citations must include a boolean enabled value`);
+  }
+  return block.citations?.enabled === true;
+}
+
+function validateToolResultContent(
+  content: unknown,
+  label: string,
+): boolean {
+  if (content === undefined || content === null || typeof content === "string") {
+    return false;
+  }
+  if (!Array.isArray(content)) {
+    invalidRequest(`${label} must be a string or an array of content blocks`);
+  }
+  let hasCitations = false;
+  let hasSearchResult = false;
+  let hasOtherVisibleContent = false;
+  for (const [index, block] of content.entries()) {
+    const blockLabel = `${label}[${index}]`;
+    if (!block || typeof block !== "object" || Array.isArray(block)) {
+      invalidRequest(`${blockLabel} must be a content block`);
+    }
+    if (block.type === "text") {
+      hasOtherVisibleContent = true;
+      if (typeof block.text !== "string") {
+        invalidRequest(`${blockLabel}.text must be a string`);
+      }
+      validateTextBlockCitations(block, blockLabel);
+    } else if (block.type === "image") {
+      hasOtherVisibleContent = true;
+      validateAnthropicImageBlock(block, blockLabel);
+    } else if (block.type === "document") {
+      hasOtherVisibleContent = true;
+      hasCitations = validateAnthropicDocumentBlock(block, blockLabel) ||
+        hasCitations;
+    } else if (block.type === "search_result") {
+      hasSearchResult = true;
+      hasCitations = validateAnthropicSearchResultBlock(block, blockLabel) ||
+        hasCitations;
+    } else if (block.type === "tool_reference") {
+      if (typeof block.tool_name !== "string" || block.tool_name.length === 0) {
+        invalidRequest(`${blockLabel} requires a non-empty tool_name`);
+      }
+    }
+  }
+  if (hasSearchResult && hasOtherVisibleContent) {
+    invalidRequest(
+      `${label} cannot mix search_result blocks with other visible content blocks`,
+    );
+  }
+  return hasCitations;
+}
+
 // Malformed client JSON must be a 400 invalid_request_error, not a 500 with a
 // raw JavaScript TypeError leaking out of an unguarded dereference.
 function validateAnthropicRequestShape(request: Record<string, any>): void {
@@ -528,14 +865,26 @@ function validateAnthropicRequestShape(request: Record<string, any>): void {
       if (!block || typeof block !== "object") {
         invalidRequest("system content blocks must be objects");
       }
+      if (block.type === "text") {
+        if (typeof block.text !== "string") {
+          invalidRequest("system text blocks require a string text field");
+        }
+        validateTextBlockCitations(block, "system text block");
+      }
     }
+  }
+
+  if (request.container !== undefined && request.container !== null) {
+    invalidRequest(
+      "Anthropic container state has no replay-safe OpenAI equivalent",
+    );
   }
 
   const messages = request.messages;
   if (!Array.isArray(messages)) {
     invalidRequest("messages must be an array");
   }
-  let hasCitationsEnabledDocument = false;
+  let hasCitationsEnabledContent = false;
   for (const [messageIndex, message] of messages.entries()) {
     if (
       !message ||
@@ -562,6 +911,47 @@ function validateAnthropicRequestShape(request: Record<string, any>): void {
       for (const part of message.content) {
         if (!part || typeof part !== "object") {
           invalidRequest("message content blocks must be objects");
+        }
+        if (part.type === "redacted_thinking") {
+          invalidRequest(
+            "redacted_thinking history has no replay-safe OpenAI equivalent",
+          );
+        }
+        if (part.type === "text") {
+          if (typeof part.text !== "string") {
+            invalidRequest("text content blocks require a string text field");
+          }
+          validateTextBlockCitations(
+            part,
+            `messages[${messageIndex}].content text`,
+          );
+        }
+        if (part.type === "image") {
+          if (message.role !== "user") {
+            invalidRequest("image blocks are only valid in user messages");
+          }
+          validateAnthropicImageBlock(
+            part,
+            `messages[${messageIndex}].content image`,
+          );
+        }
+        if (part.type === "document") {
+          if (message.role !== "user") {
+            invalidRequest("document blocks are only valid in user messages");
+          }
+          hasCitationsEnabledContent = validateAnthropicDocumentBlock(
+            part,
+            `messages[${messageIndex}].content document`,
+          ) || hasCitationsEnabledContent;
+        }
+        if (part.type === "search_result") {
+          if (message.role !== "user") {
+            invalidRequest("search_result blocks are only valid in user messages");
+          }
+          hasCitationsEnabledContent = validateAnthropicSearchResultBlock(
+            part,
+            `messages[${messageIndex}].content search_result`,
+          ) || hasCitationsEnabledContent;
         }
         if (part.type === "mid_conv_system") {
           if (message.role !== "system") {
@@ -638,6 +1028,10 @@ function validateAnthropicRequestShape(request: Record<string, any>): void {
           if (part.is_error !== undefined && typeof part.is_error !== "boolean") {
             invalidRequest("tool_result.is_error must be a boolean when provided");
           }
+          hasCitationsEnabledContent = validateToolResultContent(
+            part.content,
+            `messages[${messageIndex}].tool_result.content`,
+          ) || hasCitationsEnabledContent;
         }
         if (
           message.role === "assistant" &&
@@ -657,13 +1051,6 @@ function validateAnthropicRequestShape(request: Record<string, any>): void {
           invalidRequest(
             `Anthropic ${part.type} blocks have no replay-safe OpenAI equivalent`,
           );
-        }
-        if (
-          message.role === "user" &&
-          part.type === "document" &&
-          part.citations?.enabled === true
-        ) {
-          hasCitationsEnabledDocument = true;
         }
       }
     }
@@ -774,7 +1161,7 @@ function validateAnthropicRequestShape(request: Record<string, any>): void {
     invalidRequest("output_config must be an object");
   }
   const outputFormat = outputConfig?.format;
-  if (outputFormat !== undefined) {
+  if (outputFormat !== undefined && outputFormat !== null) {
     if (
       !outputFormat ||
       typeof outputFormat !== "object" ||
@@ -788,11 +1175,26 @@ function validateAnthropicRequestShape(request: Record<string, any>): void {
         'output_config.format must be a "json_schema" object with an object schema',
       );
     }
-    if (hasCitationsEnabledDocument) {
+    if (hasCitationsEnabledContent) {
       invalidRequest(
-        "output_config.format cannot be combined with document citations",
+        "output_config.format cannot be combined with document or search_result citations",
       );
     }
+  }
+  if (hasCitationsEnabledContent) {
+    invalidRequest(
+      "document and search_result citations have no OpenAI protocol equivalent",
+    );
+  }
+  const effort = outputConfig?.effort;
+  if (
+    effort !== undefined &&
+    effort !== null &&
+    parseAnthropicEffort(effort) === undefined
+  ) {
+    invalidRequest(
+      'output_config.effort must be "low", "medium", "high", "xhigh", "max", or null',
+    );
   }
 
   const thinking = request.thinking;
@@ -854,19 +1256,26 @@ function validateAnthropicRequestShape(request: Record<string, any>): void {
   }
 }
 
-function convertToolResultContent(content: unknown): any {
-  if (content == null) return "";
-  if (typeof content === "string") return content;
+function convertToolResultContent(content: unknown, isError: boolean): any {
+  const errorMarker = isError
+    ? [{ type: "text" as const, text: TOOL_RESULT_ERROR_MARKER }]
+    : [];
+  if (content == null) return isError ? errorMarker : "";
+  if (typeof content === "string") {
+    return isError
+      ? [...errorMarker, { type: "text" as const, text: content }]
+      : content;
+  }
 
   const blocks = Array.isArray(content) ? content : [content];
-  if (blocks.length === 0) return "";
+  if (blocks.length === 0) return isError ? errorMarker : "";
 
   const visibleBlocks = blocks.filter(
     (block: any) => block?.type !== "tool_reference",
   );
-  if (visibleBlocks.length === 0) return "";
+  if (visibleBlocks.length === 0) return isError ? errorMarker : "";
 
-  return visibleBlocks.map((block: any) => {
+  const converted = visibleBlocks.flatMap((block: any) => {
     if (typeof block === "string") {
       return { type: "text" as const, text: block };
     }
@@ -878,11 +1287,14 @@ function convertToolResultContent(content: unknown): any {
       if (image) return image;
     }
     if (block?.type === "document") {
-      const file = convertAnthropicDocument(block);
-      if (file) return file;
+      return convertAnthropicDocumentBlocks(block);
+    }
+    if (block?.type === "search_result") {
+      return convertAnthropicSearchResult(block);
     }
     return { type: "text" as const, text: boundedJsonBlockText(block) };
   });
+  return [...errorMarker, ...converted];
 }
 
 export class AnthropicTransformer implements Transformer {
@@ -978,7 +1390,10 @@ export class AnthropicTransformer implements Transformer {
               toolParts.forEach((tool: any) => {
                 const toolMessage: UnifiedMessage = {
                   role: "tool",
-                  content: convertToolResultContent(tool.content),
+                  content: convertToolResultContent(
+                    tool.content,
+                    tool.is_error === true,
+                  ),
                   tool_call_id: tool.tool_use_id,
                 };
                 if (tool.cache_control) {
@@ -1021,11 +1436,12 @@ export class AnthropicTransformer implements Transformer {
                 }
               }
               if (part?.type === "document") {
-                const file = convertAnthropicDocument(part);
-                if (file) {
-                  contentParts.push(file);
-                  continue;
-                }
+                contentParts.push(...convertAnthropicDocumentBlocks(part));
+                continue;
+              }
+              if (part?.type === "search_result") {
+                contentParts.push(...convertAnthropicSearchResult(part));
+                continue;
               }
               contentParts.push({
                 type: "text",
@@ -1074,10 +1490,7 @@ export class AnthropicTransformer implements Transformer {
                   thinking: part.thinking ?? "",
                   signature: part.signature,
                 });
-              } else if (
-                part?.type !== "thinking" &&
-                part?.type !== "redacted_thinking"
-              ) {
+              } else if (part?.type !== "thinking") {
                 orderedBlocks.push({
                   type: "text",
                   text: boundedJsonBlockText(part),
@@ -1090,16 +1503,14 @@ export class AnthropicTransformer implements Transformer {
             );
             // Preserve future/unsupported assistant blocks as bounded text
             // instead of silently erasing history. Signed thinking and tool
-            // calls have dedicated mappings; redacted thinking is deliberately
-            // omitted because exposing its opaque payload as visible text
-            // would violate its confidentiality semantics.
+            // calls have dedicated mappings. redacted_thinking was rejected by
+            // shape validation because it cannot be replayed safely.
             const fallbackParts = msg.content
               .filter(
                 (part: any) =>
                   part?.type !== "text" &&
                   part?.type !== "tool_use" &&
-                  part?.type !== "thinking" &&
-                  part?.type !== "redacted_thinking",
+                  part?.type !== "thinking",
               )
               .map((part: any) => boundedJsonBlockText(part));
             if (textParts.length || fallbackParts.length) {
@@ -1284,6 +1695,8 @@ export class AnthropicTransformer implements Transformer {
         return new Response(
           JSON.stringify({
             type: "error",
+            request_id:
+              typeof data.request_id === "string" ? data.request_id : null,
             error: {
               type: data.error.type || data.error.code || "api_error",
               message:
@@ -1601,6 +2014,7 @@ export class AnthropicTransformer implements Transformer {
                   encoder.encode(
                     `event: error\ndata: ${JSON.stringify({
                       type: "error",
+                      request_id: null,
                       error: {
                         type: "api_error",
                         message:
@@ -1621,6 +2035,7 @@ export class AnthropicTransformer implements Transformer {
                   encoder.encode(
                     `event: error\ndata: ${JSON.stringify({
                       type: "error",
+                      request_id: null,
                       error: {
                         type: "api_error",
                         message:
@@ -1651,15 +2066,12 @@ export class AnthropicTransformer implements Transformer {
                     `event: message_delta\ndata: ${JSON.stringify({
                       type: "message_delta",
                       delta: {
+                        container: null,
                         stop_reason: "end_turn",
                         stop_sequence: null,
                         stop_details: null,
                       },
-                      usage: {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cache_read_input_tokens: 0,
-                      },
+                      usage: emptyAnthropicDeltaUsage(),
                     })}\n\n`
                   )
                 );
@@ -1749,6 +2161,7 @@ export class AnthropicTransformer implements Transformer {
                   encoder.encode(
                     `event: error\ndata: ${JSON.stringify({
                       type: "error",
+                      request_id: null,
                       error: {
                         type: "api_error",
                         message: "malformed upstream SSE event",
@@ -1773,6 +2186,7 @@ export class AnthropicTransformer implements Transformer {
                 if (chunk.error) {
                   const errorMessage = {
                     type: "error",
+                    request_id: null,
                     error: {
                       type:
                         chunk.error.type || chunk.error.code || "api_error",
@@ -1811,15 +2225,13 @@ export class AnthropicTransformer implements Transformer {
                       id: messageId,
                       type: "message",
                       role: "assistant",
+                      container: null,
                       content: [],
                       model: model,
                       stop_reason: null,
                       stop_sequence: null,
                       stop_details: null,
-                      usage: {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                      },
+                      usage: emptyAnthropicUsage(0, chunk.service_tier),
                     },
                   };
 
@@ -1838,14 +2250,15 @@ export class AnthropicTransformer implements Transformer {
                     stopReasonMessageDelta = {
                       type: "message_delta",
                       delta: {
+                        container: null,
                         stop_reason: "end_turn",
                         stop_sequence: null,
                         stop_details: null,
                       },
-                      usage: convertUsage(chunk.usage),
+                      usage: convertDeltaUsage(chunk.usage),
                     };
                   } else {
-                    stopReasonMessageDelta.usage = convertUsage(chunk.usage);
+                    stopReasonMessageDelta.usage = convertDeltaUsage(chunk.usage);
                   }
                 }
                 if (!choice) {
@@ -2281,6 +2694,7 @@ export class AnthropicTransformer implements Transformer {
                     stopReasonMessageDelta = {
                       type: "message_delta",
                       delta: {
+                        container: null,
                         stop_reason: anthropicStopReason,
                         stop_sequence: null,
                         stop_details: isRefusal
@@ -2288,12 +2702,9 @@ export class AnthropicTransformer implements Transformer {
                           : null,
                       },
                       usage: chunk.usage
-                        ? convertUsage(chunk.usage)
-                        : (stopReasonMessageDelta?.usage ?? {
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            cache_read_input_tokens: 0,
-                          }),
+                        ? convertDeltaUsage(chunk.usage)
+                        : (stopReasonMessageDelta?.usage ??
+                          emptyAnthropicDeltaUsage()),
                     };
                   }
 
@@ -2308,6 +2719,7 @@ export class AnthropicTransformer implements Transformer {
                   encoder.encode(
                     `event: error\ndata: ${JSON.stringify({
                       type: "error",
+                      request_id: null,
                       error: {
                         type: "api_error",
                         message: "upstream response conversion failed",
@@ -2462,15 +2874,12 @@ export class AnthropicTransformer implements Transformer {
             typeof item?.url_citation?.url === "string" &&
             item.url_citation.url.length > 0,
         );
-        if (urlCitationAnnotations.length) {
-          content.push({
-            type: "text",
-            text: boundedJsonBlockText({
-              type: "openai_url_citations",
-              annotations: urlCitationAnnotations,
-            }),
-          });
-        }
+        const citationFallbackText = urlCitationAnnotations.length
+          ? boundedJsonBlockText({
+            type: "openai_url_citations",
+            annotations: urlCitationAnnotations,
+          })
+          : null;
 
         const upstreamThinkingBlocks = message.thinking_blocks;
         const thinkingByToolCall = new Map<string, any[]>();
@@ -2523,12 +2932,36 @@ export class AnthropicTransformer implements Transformer {
           }
         }
 
+        const messageContentTexts: string[] = [];
         if (typeof message.content === "string" && message.content) {
+          messageContentTexts.push(message.content);
           content.push({ type: "text", text: message.content });
         } else if (Array.isArray(message.content)) {
           for (const part of message.content) {
-            content.push({ type: "text", text: chatContentPartToText(part) });
+            const text = chatContentPartToText(part);
+            messageContentTexts.push(text);
+            content.push({ type: "text", text });
           }
+        }
+        // Chat annotations describe the preceding message content. Keep the
+        // same visible order as streaming endpoints: answer first, then the
+        // bounded source metadata fallback.
+        if (citationFallbackText) {
+          content.push({ type: "text", text: citationFallbackText });
+        }
+        const audio = message.audio;
+        const audioTranscript = typeof audio?.transcript === "string"
+          ? audio.transcript
+          : "";
+        if (
+          audioTranscript &&
+          !messageContentTexts.includes(audioTranscript) &&
+          messageContentTexts.join("") !== audioTranscript
+        ) {
+          content.push({ type: "text", text: audioTranscript });
+        }
+        if (typeof audio?.data === "string" && audio.data.length > 0) {
+          content.push({ type: "text", text: "[generated audio omitted]" });
         }
         if (refusalText) {
           content.push({ type: "text", text: refusalText });
@@ -2594,12 +3027,16 @@ export class AnthropicTransformer implements Transformer {
         id: openaiResponse.id,
         type: "message",
         role: "assistant",
+        container: null,
         model: openaiResponse.model,
         content,
         stop_reason: mapChatFinishReason(choice.finish_reason, isRefusal),
         stop_sequence: null,
         stop_details: isRefusal ? refusalStopDetails(refusalText) : null,
-        usage: convertUsage(openaiResponse.usage),
+        usage: convertUsage(
+          openaiResponse.usage,
+          (openaiResponse as any).service_tier,
+        ),
       };
       this.logger?.debug(
         {

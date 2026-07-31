@@ -739,7 +739,7 @@ test("empty string and empty array content preserve their message turn", async (
   }
 });
 
-test("unknown assistant blocks degrade safely while redacted thinking stays opaque", async () => {
+test("unknown assistant blocks degrade safely and redacted thinking is rejected", async () => {
   const result = await transformer().transformRequestOut!({
     model: "claude-test",
     messages: [
@@ -748,7 +748,6 @@ test("unknown assistant blocks degrade safely while redacted thinking stays opaq
         content: [
           { type: "text", text: "visible" },
           { type: "future_assistant_block", value: "preserve-me" },
-          { type: "redacted_thinking", data: "opaque-secret-state" },
         ],
       },
     ],
@@ -758,7 +757,17 @@ test("unknown assistant blocks degrade safely while redacted thinking stays opaq
   assert.match(content, /^visible\n/);
   assert.match(content, /future_assistant_block/);
   assert.match(content, /preserve-me/);
-  assert.doesNotMatch(content, /opaque-secret-state/);
+  await assert.rejects(
+    transformer().transformRequestOut!({
+      model: "claude-test",
+      messages: [{
+        role: "assistant",
+        content: [{ type: "redacted_thinking", data: "opaque-secret-state" }],
+      }],
+    }),
+    (error: any) =>
+      error.statusCode === 400 && /redacted_thinking/.test(error.message),
+  );
 });
 
 test("documents retain a typed unified file envelope and Chat degrades only URL files", async () => {
@@ -781,10 +790,6 @@ test("documents retain a typed unified file envelope and Chat degrades only URL 
             type: "document",
             title: "remote.pdf",
             source: { type: "url", url: "https://example.com/report.pdf" },
-          },
-          {
-            type: "document",
-            source: { type: "file", file_id: "file_document_1" },
           },
         ],
       },
@@ -828,11 +833,6 @@ test("documents retain a typed unified file envelope and Chat degrades only URL 
     },
     fallback_text: '[document "remote.pdf": https://example.com/report.pdf]',
   });
-  assert.deepEqual((unified.messages[0].content as any[])[2], {
-    type: "file",
-    file: { file_id: "file_document_1" },
-    fallback_text: "[document: file_document_1]",
-  });
   assert.equal((unified.messages[2].content as any[])[1].type, "file");
 
   const chat = structuredClone(unified) as any;
@@ -848,10 +848,6 @@ test("documents retain a typed unified file envelope and Chat degrades only URL 
     {
       type: "text",
       text: '[document "remote.pdf": https://example.com/report.pdf]',
-    },
-    {
-      type: "file",
-      file: { file_id: "file_document_1" },
     },
   ]);
   assert.deepEqual(chat.messages.slice(2), [
@@ -877,6 +873,21 @@ test("documents retain a typed unified file envelope and Chat degrades only URL 
       ],
     },
   ]);
+
+  await assert.rejects(
+    transformer().transformRequestOut!({
+      model: "claude-test",
+      messages: [{
+        role: "user",
+        content: [{
+          type: "document",
+          source: { type: "file", file_id: "file_document_1" },
+        }],
+      }],
+    }),
+    (error: any) =>
+      error.statusCode === 400 && /provider-owned/.test(error.message),
+  );
 });
 
 test("assistant replay does not pair thinking across an intervening text block", async () => {

@@ -33,10 +33,6 @@ test("top-level base64 and URL images use standard OpenAI image parts", async ()
             type: "image",
             source: { type: "url", url: "https://example.com/image.png" },
           },
-          {
-            type: "image",
-            source: { type: "file", file_id: "file_image_1" },
-          },
         ],
       },
     ],
@@ -51,10 +47,6 @@ test("top-level base64 and URL images use standard OpenAI image parts", async ()
     {
       type: "image_url",
       image_url: { url: "https://example.com/image.png" },
-    },
-    {
-      type: "image_file",
-      image_file: { file_id: "file_image_1" },
     },
   ]);
   assert.equal(
@@ -71,18 +63,32 @@ test("top-level base64 and URL images use standard OpenAI image parts", async ()
   );
   assert.deepEqual(responsesRequest.input[0].content.at(-1), {
     type: "input_image",
-    file_id: "file_image_1",
+    image_url: "https://example.com/image.png",
   });
 
   const chatRequest: any = structuredClone(result);
   normalizeMultimodalToolResultsForChatCompletions(chatRequest);
   assert.deepEqual(chatRequest.messages[0].content.at(-1), {
-    type: "file",
-    file: { file_id: "file_image_1" },
+    type: "image_url",
+    image_url: { url: "https://example.com/image.png" },
   });
 });
 
-test("unknown or underspecified image sources degrade instead of guessing image semantics", async () => {
+test("malformed/provider-owned image sources fail while future sources degrade", async () => {
+  for (const source of [
+    { type: "base64", data: "AA==" },
+    { type: "file", file_id: "file_image_1" },
+  ]) {
+    await assert.rejects(anthropic.transformRequestOut!({
+      model: "claude-test",
+      max_tokens: 32,
+      messages: [{
+        role: "user",
+        content: [{ type: "image", source }],
+      }],
+    }), (error: any) => error.statusCode === 400);
+  }
+
   const result = await anthropic.transformRequestOut!({
     model: "claude-test",
     max_tokens: 32,
@@ -98,10 +104,6 @@ test("unknown or underspecified image sources degrade instead of guessing image 
         },
         {
           type: "image",
-          source: { type: "base64", data: "AA==" },
-        },
-        {
-          type: "image",
           source: {
             type: "base64",
             data: "data:image/webp;base64,AA==",
@@ -114,9 +116,7 @@ test("unknown or underspecified image sources degrade instead of guessing image 
 
   assert.equal(content[0].type, "text");
   assert.match(content[0].text, /future_source/);
-  assert.equal(content[1].type, "text");
-  assert.match(content[1].text, /"type":"base64"/);
-  assert.deepEqual(content[2], {
+  assert.deepEqual(content[1], {
     type: "image_url",
     image_url: { url: "data:image/webp;base64,AA==" },
   });
@@ -150,10 +150,6 @@ test("tool_result preserves mixed text, images, unknown blocks, and empty conten
                   data: "AA==",
                 },
               },
-              {
-                type: "image",
-                source: { type: "file", file_id: "file_tool_image_1" },
-              },
               { type: "future_block", value: 7 },
             ],
           },
@@ -171,10 +167,6 @@ test("tool_result preserves mixed text, images, unknown blocks, and empty conten
       {
         type: "image_url",
         image_url: { url: "data:image/png;base64,AA==" },
-      },
-      {
-        type: "image_file",
-        image_file: { file_id: "file_tool_image_1" },
       },
       { type: "text", text: '{"type":"future_block","value":7}' },
     ],
@@ -337,10 +329,6 @@ test("Responses preserves structured function output and assistant text plus cal
                   url: "https://example.com/a.png",
                 },
               },
-              {
-                type: "image",
-                source: { type: "file", file_id: "file_image_result" },
-              },
             ],
           },
         ],
@@ -369,7 +357,6 @@ test("Responses preserves structured function output and assistant text plus cal
       output: [
         { type: "input_text", text: "result" },
         { type: "input_image", image_url: "https://example.com/a.png" },
-        { type: "input_image", file_id: "file_image_result" },
       ],
     },
   ]);

@@ -14,6 +14,31 @@ function sseEvent(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
+function fullUsage(usage: any, outputTokens = usage?.output_tokens ?? 0) {
+  return {
+    cache_creation: usage?.cache_creation ?? null,
+    cache_creation_input_tokens: usage?.cache_creation_input_tokens ?? 0,
+    cache_read_input_tokens: usage?.cache_read_input_tokens ?? 0,
+    inference_geo: usage?.inference_geo ?? null,
+    input_tokens: usage?.input_tokens ?? 0,
+    output_tokens: outputTokens,
+    output_tokens_details: usage?.output_tokens_details ?? null,
+    server_tool_use: usage?.server_tool_use ?? null,
+    service_tier: usage?.service_tier ?? null,
+  };
+}
+
+function deltaUsage(usage: any, outputTokens = usage?.output_tokens ?? 0) {
+  return {
+    cache_creation_input_tokens: usage?.cache_creation_input_tokens ?? 0,
+    cache_read_input_tokens: usage?.cache_read_input_tokens ?? 0,
+    input_tokens: usage?.input_tokens ?? 0,
+    output_tokens: outputTokens,
+    output_tokens_details: usage?.output_tokens_details ?? null,
+    server_tool_use: usage?.server_tool_use ?? null,
+  };
+}
+
 /**
  * Keep transport failures inside the Anthropic SSE protocol. Once a streaming
  * reply has started Fastify cannot replace it with a JSON error response; an
@@ -62,6 +87,7 @@ export function guardAnthropicSseStream(
             encoder.encode(
               sseEvent("error", {
                 type: "error",
+                request_id: null,
                 error: {
                   type: "api_error",
                   message: "upstream stream transport failed",
@@ -103,23 +129,12 @@ export function anthropicMessageToSseText(message: any): string {
       type: "message_start",
       message: {
         ...message,
+        container: message?.container ?? null,
         content: [],
         stop_reason: null,
         stop_details: null,
         stop_sequence: null,
-        usage: {
-          input_tokens: usage.input_tokens ?? 0,
-          output_tokens: 0,
-          ...(usage.cache_read_input_tokens !== undefined
-            ? { cache_read_input_tokens: usage.cache_read_input_tokens }
-            : {}),
-          ...(usage.cache_creation_input_tokens !== undefined
-            ? {
-                cache_creation_input_tokens:
-                  usage.cache_creation_input_tokens,
-              }
-            : {}),
-        },
+        usage: fullUsage(usage, 0),
       },
     }),
   );
@@ -211,23 +226,12 @@ export function anthropicMessageToSseText(message: any): string {
     sseEvent("message_delta", {
       type: "message_delta",
       delta: {
+        container: null,
         stop_reason: message?.stop_reason ?? "end_turn",
         stop_details: message?.stop_details ?? null,
         stop_sequence: message?.stop_sequence ?? null,
       },
-      usage: {
-        input_tokens: usage.input_tokens ?? 0,
-        output_tokens: usage.output_tokens ?? 0,
-        ...(usage.cache_read_input_tokens !== undefined
-          ? { cache_read_input_tokens: usage.cache_read_input_tokens }
-          : {}),
-        ...(usage.cache_creation_input_tokens !== undefined
-          ? {
-              cache_creation_input_tokens:
-                usage.cache_creation_input_tokens,
-            }
-          : {}),
-      },
+      usage: deltaUsage(usage),
     }),
   );
   frames.push(sseEvent("message_stop", { type: "message_stop" }));
@@ -291,7 +295,11 @@ export async function aggregateAnthropicSseToMessage(
       );
     }
     if (event.type === "message_start") {
-      message = { ...event.message };
+      message = {
+        ...event.message,
+        container: event.message?.container ?? null,
+        usage: fullUsage(event.message?.usage),
+      };
       continue;
     }
     if (event.type === "content_block_start") {
@@ -329,6 +337,7 @@ export async function aggregateAnthropicSseToMessage(
     if (event.type === "message_delta") {
       if (message) {
         message.stop_reason = event.delta?.stop_reason ?? message.stop_reason;
+        message.container = event.delta?.container ?? message.container ?? null;
         message.stop_details =
           event.delta?.stop_details ?? message.stop_details ?? null;
         message.stop_sequence =

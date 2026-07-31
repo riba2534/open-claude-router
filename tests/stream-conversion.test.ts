@@ -234,6 +234,9 @@ test("coalesced Chat finish and usage-only chunks retain final usage", async () 
       input_tokens: 8,
       output_tokens: 4,
       cache_read_input_tokens: 3,
+      cache_creation_input_tokens: 0,
+      output_tokens_details: null,
+      server_tool_use: null,
     },
   );
 });
@@ -307,6 +310,9 @@ test("Responses stream preserves model, usage, and encrypted reasoning signature
     input_tokens: 10,
     output_tokens: 5,
     cache_read_input_tokens: 3,
+    cache_creation_input_tokens: 0,
+    output_tokens_details: null,
+    server_tool_use: null,
   });
 });
 
@@ -560,9 +566,15 @@ test("non-stream Responses preserves reasoning item and cached usage", async () 
     encrypted_content: "encrypted-reasoning-state",
   });
   assert.deepEqual(body.usage, {
+    cache_creation: null,
+    cache_creation_input_tokens: 0,
     input_tokens: 10,
     output_tokens: 5,
     cache_read_input_tokens: 3,
+    inference_geo: null,
+    output_tokens_details: null,
+    server_tool_use: null,
+    service_tier: null,
   });
 });
 
@@ -658,6 +670,7 @@ test("non-stream failed Responses object becomes an Anthropic error", async () =
   assert.equal(final.status, 500);
   assert.deepEqual(await final.json(), {
     type: "error",
+    request_id: null,
     error: { type: "api_error", message: "generation failed" },
   });
 });

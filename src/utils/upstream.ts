@@ -94,9 +94,13 @@ export async function callUpstream(
 export function mapUpstreamStatusToAnthropicErrorType(status: number): string {
   if (status === 400) return "invalid_request_error";
   if (status === 401) return "authentication_error";
+  if (status === 402) return "billing_error";
   if (status === 403) return "permission_error";
   if (status === 404) return "not_found_error";
+  if (status === 409) return "conflict_error";
+  if (status === 413) return "request_too_large";
   if (status === 429) return "rate_limit_error";
+  if (status === 504) return "timeout_error";
   if (status === 529) return "overloaded_error";
   if (status >= 500) return "api_error";
   return "api_error";
@@ -104,6 +108,7 @@ export function mapUpstreamStatusToAnthropicErrorType(status: number): string {
 
 export interface AnthropicError {
   type: "error";
+  request_id: string | null;
   error: {
     type: string;
     message: string;
@@ -114,6 +119,7 @@ export async function buildAnthropicErrorFromUpstream(
   res: Response,
 ): Promise<{ status: number; body: AnthropicError }> {
   let text = "";
+  let requestId: string | null = null;
   let message =
     res.statusText || `upstream returned HTTP ${res.status}`;
   try {
@@ -127,8 +133,13 @@ export async function buildAnthropicErrorFromUpstream(
   }
   try {
     const parsed = JSON.parse(text);
-    if (parsed?.error?.message) message = parsed.error.message;
-    else if (parsed?.message) message = parsed.message;
+    if (typeof parsed?.error?.message === "string" && parsed.error.message) {
+      message = parsed.error.message;
+    } else if (typeof parsed?.message === "string" && parsed.message) {
+      message = parsed.message;
+    }
+    requestId =
+      typeof parsed?.request_id === "string" ? parsed.request_id : null;
   } catch {
     /* keep raw text */
   }
@@ -136,6 +147,7 @@ export async function buildAnthropicErrorFromUpstream(
     status: res.status,
     body: {
       type: "error",
+      request_id: requestId,
       error: {
         type: mapUpstreamStatusToAnthropicErrorType(res.status),
         message,

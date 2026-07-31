@@ -30,10 +30,24 @@ test("every upstream non-2xx is single-attempt and marked retryable", async () =
   }) as typeof fetch;
 
   try {
-    const statuses = [
-      300, 400, 401, 403, 404, 408, 409, 413, 422, 429, 500, 502, 504, 529,
-    ];
-    for (const upstreamStatus of statuses) {
+    const statuses = new Map<number, string>([
+      [300, "api_error"],
+      [400, "invalid_request_error"],
+      [401, "authentication_error"],
+      [402, "billing_error"],
+      [403, "permission_error"],
+      [404, "not_found_error"],
+      [408, "api_error"],
+      [409, "conflict_error"],
+      [413, "request_too_large"],
+      [422, "api_error"],
+      [429, "rate_limit_error"],
+      [500, "api_error"],
+      [502, "api_error"],
+      [504, "timeout_error"],
+      [529, "overloaded_error"],
+    ]);
+    for (const [upstreamStatus, expectedType] of statuses) {
       status = upstreamStatus;
       const before = fetchCount;
       const response = await app.inject({
@@ -49,7 +63,10 @@ test("every upstream non-2xx is single-attempt and marked retryable", async () =
       assert.equal(response.statusCode, upstreamStatus);
       assert.equal(response.headers["x-should-retry"], "true");
       assert.equal(fetchCount, before + 1);
-      assert.equal(response.json().type, "error");
+      const error = response.json();
+      assert.equal(error.type, "error");
+      assert.equal(error.request_id, null);
+      assert.equal(error.error.type, expectedType);
     }
 
     status = 503;

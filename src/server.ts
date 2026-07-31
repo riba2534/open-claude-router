@@ -2,6 +2,7 @@ import Fastify from "fastify";
 import { registerMessagesRoute } from "./routes/messages.js";
 import { registerCountTokensRoute } from "./routes/count_tokens.js";
 import type { ApiError } from "./transformers/errors.js";
+import { mapUpstreamStatusToAnthropicErrorType } from "./utils/upstream.js";
 
 const PORT = Number(process.env.PORT ?? 3457);
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -27,7 +28,7 @@ const fastify = Fastify({
 fastify.setErrorHandler((error, req, reply) => {
   const apiErr = error as ApiError;
   const status = apiErr.statusCode ?? 500;
-  const type = apiErr.type ?? "api_error";
+  const type = apiErr.type ?? mapUpstreamStatusToAnthropicErrorType(status);
   const code = apiErr.code ?? "internal_error";
 
   const message = (error as Error)?.message ?? "internal error";
@@ -40,6 +41,7 @@ fastify.setErrorHandler((error, req, reply) => {
 
   reply.code(status).send({
     type: "error",
+    request_id: null,
     error: {
       type,
       message,

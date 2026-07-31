@@ -140,15 +140,34 @@ function unsupportedOutputPlaceholder(item: ResponsesAPIOutputItem): string {
   return boundedResponsesFallback(`output item ${type}`, item);
 }
 
-function isProgrammaticResponsesItem(item: ResponsesAPIOutputItem): boolean {
-  return item?.type === "program" ||
-    item?.type === "program_output" ||
-    (item?.type === "function_call" && item.caller != null);
+function unsupportedResponsesItemReason(
+  item: ResponsesAPIOutputItem,
+): string | null {
+  if (item?.type === "program" || item?.type === "program_output") {
+    return "programmatic tool-calling state";
+  }
+  if (item?.type === "compaction") return "compaction state";
+  if (item?.type === "function_call_output") {
+    return "function-call output state";
+  }
+  if (
+    item?.type === "function_call" &&
+    item.caller != null &&
+    item.caller.type !== "direct"
+  ) {
+    return `function caller ${JSON.stringify(item.caller.type)}`;
+  }
+  return null;
 }
 
-function rejectProgrammaticResponsesItem(item: ResponsesAPIOutputItem): never {
+function isUnsupportedResponsesItem(item: ResponsesAPIOutputItem): boolean {
+  return unsupportedResponsesItemReason(item) !== null;
+}
+
+function rejectUnsupportedResponsesItem(item: ResponsesAPIOutputItem): never {
+  const reason = unsupportedResponsesItemReason(item) || item.type || "unknown";
   throw createApiError(
-    `upstream Responses ${item.type || "programmatic"} item has no ` +
+    `upstream Responses ${reason} has no ` +
       "replay-safe Anthropic Messages equivalent",
     502,
     "upstream_protocol_error",
@@ -197,7 +216,7 @@ function responsesStatusError(payload: any): {
   if (status === "cancelled") {
     return {
       status: 409,
-      type: "api_error",
+      type: "conflict_error",
       code: code || "response_cancelled",
       message: payload?.error?.message || "Responses request was cancelled",
     };
@@ -258,6 +277,7 @@ interface ResponsesAPIPayload {
   object: string;
   model: string;
   created_at: number;
+  service_tier?: string;
   output: ResponsesAPIOutputItem[];
   usage?: {
     input_tokens: number;
@@ -266,6 +286,9 @@ interface ResponsesAPIPayload {
     input_tokens_details?: {
       cached_tokens?: number;
       cache_write_tokens?: number;
+    };
+    output_tokens_details?: {
+      reasoning_tokens?: number;
     };
   };
   status?: string;
@@ -329,6 +352,7 @@ interface ResponsesStreamEvent {
     id?: string;
     model?: string;
     created_at?: number;
+    service_tier?: string;
     status?: string;
     incomplete_details?: {
       reason?: string;
@@ -341,6 +365,9 @@ interface ResponsesStreamEvent {
       input_tokens_details?: {
         cached_tokens?: number;
         cache_write_tokens?: number;
+      };
+      output_tokens_details?: {
+        reasoning_tokens?: number;
       };
     };
     error?: {
@@ -671,13 +698,18 @@ export class OpenAIResponsesTransformer implements Transformer {
           let streamId = "chatcmpl-" + Date.now();
           let streamModel = "unknown";
           let streamCreated = Math.floor(Date.now() / 1000);
-          const textDeltaParts = new Set<string>();
-          const refusalDeltaParts = new Set<string>();
-          const textSnapshotParts = new Set<string>();
-          const refusalSnapshotParts = new Set<string>();
+          type BufferedStreamPart = {
+            text: string;
+            finalized: boolean;
+          };
+          const textPartBuffers = new Map<string, BufferedStreamPart>();
+          const refusalPartBuffers = new Map<string, BufferedStreamPart>();
           const argumentBuffers = new Map<string, string>();
           const reasoningSummaryParts = new Set<string>();
-          const reasoningTextParts = new Set<string>();
+          const reasoningTextPartBuffers = new Map<
+            string,
+            BufferedStreamPart
+          >();
           const reasoningTextItems = new Set<string>();
           const reasoningSignatureItems = new Set<string>();
           const functionItemsAdded = new Set<string>();
@@ -696,6 +728,7 @@ export class OpenAIResponsesTransformer implements Transformer {
           const suppressedReasoningGroups: string[][] = [];
           let sawRefusal = false;
           let sawIncompleteFunctionCall = false;
+          let emittedAudioOmission = false;
           let stopReading = false;
           let fatalStreamError = false;
           // Dedup keys must match between a delta that omits item_id and the
@@ -735,6 +768,60 @@ export class OpenAIResponsesTransformer implements Transformer {
             keys.some((key) => marked.has(key));
           const markAll = (marked: Set<string>, keys: string[]): void =>
             keys.forEach((key) => marked.add(key));
+          const getBufferedStreamPart = (
+            buffers: Map<string, BufferedStreamPart>,
+            keys: string[],
+          ): BufferedStreamPart => {
+            const buffered = keys
+              .map((key) => buffers.get(key))
+              .find((part): part is BufferedStreamPart => !!part) || {
+              text: "",
+              finalized: false,
+            };
+            for (const key of keys) buffers.set(key, buffered);
+            return buffered;
+          };
+          const appendStreamPartDelta = (
+            buffers: Map<string, BufferedStreamPart>,
+            event: ResponsesStreamEvent,
+            delta: string,
+          ): string => {
+            if (!delta) return "";
+            const buffered = getBufferedStreamPart(
+              buffers,
+              getContentPartKeys(event),
+            );
+            // Some compatible endpoints emit a populated item snapshot before
+            // replaying its deltas. Preserve the existing snapshot-first
+            // de-duplication behavior.
+            if (buffered.finalized) return "";
+            buffered.text += delta;
+            return delta;
+          };
+          const reconcileStreamPartSnapshot = (
+            buffers: Map<string, BufferedStreamPart>,
+            event: ResponsesStreamEvent,
+            snapshot: string,
+            kind: string,
+          ): string | null => {
+            const buffered = getBufferedStreamPart(
+              buffers,
+              getContentPartKeys(event),
+            );
+            if (!snapshot.startsWith(buffered.text)) {
+              emitFatalStreamError(
+                `Responses ${kind} snapshot diverged from deltas`,
+                new Error(`${kind} snapshot mismatch`),
+                JSON.stringify(event),
+                `upstream Responses ${kind} is inconsistent`,
+              );
+              return null;
+            }
+            const suffix = snapshot.slice(buffered.text.length);
+            buffered.text = snapshot;
+            buffered.finalized = true;
+            return suffix;
+          };
           const sameFunctionIdentity = (
             left: FunctionIdentity,
             right: FunctionIdentity,
@@ -951,12 +1038,13 @@ export class OpenAIResponsesTransformer implements Transformer {
             outputIndex: number | undefined,
             eventType: string,
           ): void => {
-            if (isProgrammaticResponsesItem(item)) {
+            if (isUnsupportedResponsesItem(item)) {
+              const reason = unsupportedResponsesItemReason(item);
               emitFatalStreamError(
-                "Responses programmatic tool-calling item is unsupported",
-                new Error("programmatic caller cannot be replayed as direct"),
+                "Responses output item is unsupported",
+                new Error(`${reason} cannot be replayed`),
                 JSON.stringify(item),
-                "upstream Responses programmatic tool calling has no " +
+                `upstream Responses ${reason} has no ` +
                   "replay-safe Anthropic Messages equivalent",
               );
               return;
@@ -971,31 +1059,38 @@ export class OpenAIResponsesTransformer implements Transformer {
 
             if (item.type === "message") {
               (item.content || []).forEach((part, index) => {
+                if (fatalStreamError) return;
                 const partKeys = getContentPartKeys(itemEvent, index);
                 if (part.type === "output_text") {
-                  if (
-                    part.text &&
-                    !seenAny(textDeltaParts, partKeys)
-                  ) {
-                    markAll(textDeltaParts, partKeys);
-                    markAll(textSnapshotParts, partKeys);
-                    emitChatDelta(itemId, eventType, {
-                      role: "assistant",
-                      content: part.text,
-                    });
+                  if (typeof part.text === "string") {
+                    const suffix = reconcileStreamPartSnapshot(
+                      textPartBuffers,
+                      { ...itemEvent, content_index: index },
+                      part.text,
+                      "output text",
+                    );
+                    if (suffix) {
+                      emitChatDelta(itemId, eventType, {
+                        role: "assistant",
+                        content: suffix,
+                      });
+                    }
                   }
                 } else if (part.type === "refusal") {
                   sawRefusal = true;
-                  if (
-                    part.refusal &&
-                    !seenAny(refusalDeltaParts, partKeys)
-                  ) {
-                    markAll(refusalDeltaParts, partKeys);
-                    markAll(refusalSnapshotParts, partKeys);
-                    emitChatDelta(itemId, eventType, {
-                      role: "assistant",
-                      refusal: part.refusal,
-                    });
+                  if (typeof part.refusal === "string") {
+                    const suffix = reconcileStreamPartSnapshot(
+                      refusalPartBuffers,
+                      { ...itemEvent, content_index: index },
+                      part.refusal,
+                      "refusal",
+                    );
+                    if (suffix) {
+                      emitChatDelta(itemId, eventType, {
+                        role: "assistant",
+                        refusal: suffix,
+                      });
+                    }
                   }
                 } else if (
                   part.type === "output_image" ||
@@ -1173,14 +1268,16 @@ export class OpenAIResponsesTransformer implements Transformer {
                 markAll(reasoningTextItems, itemKeys);
                 discardBufferedSummariesForItem(itemKeys);
                 for (const { part, index } of reasoningParts) {
-                  const partKeys = getContentPartKeys(itemEvent, index);
-                  if (
-                    part.text &&
-                    !seenAny(reasoningTextParts, partKeys)
-                  ) {
-                    markAll(reasoningTextParts, partKeys);
+                  if (typeof part.text === "string") {
+                    const suffix = reconcileStreamPartSnapshot(
+                      reasoningTextPartBuffers,
+                      { ...itemEvent, content_index: index },
+                      part.text,
+                      "reasoning text",
+                    );
+                    if (!suffix) continue;
                     emitChatDelta(itemId, eventType, {
-                      thinking: { content: part.text },
+                      thinking: { content: suffix },
                     });
                   }
                 }
@@ -1350,6 +1447,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                           object: "chat.completion.chunk",
                           created: streamCreated,
                           model: streamModel,
+                          service_tier: data.response?.service_tier,
                           choices: [],
                         };
                         controller.enqueue(
@@ -1357,14 +1455,46 @@ export class OpenAIResponsesTransformer implements Transformer {
                             `data: ${JSON.stringify(metadataChunk)}\n\n`,
                           ),
                         );
+                      } else if (
+                        data.type === "response.audio.transcript.delta"
+                      ) {
+                        const transcriptDelta =
+                          typeof data.delta === "string" ? data.delta : "";
+                        if (transcriptDelta) {
+                          emitChatDelta(data.item_id, data.type, {
+                            role: "assistant",
+                            content: transcriptDelta,
+                          });
+                        }
+                      } else if (data.type === "response.audio.delta") {
+                        // Anthropic has no generated-audio content block. Never
+                        // leak base64 into visible text; emit one deterministic
+                        // marker for the entire response instead.
+                        if (!emittedAudioOmission) {
+                          emittedAudioOmission = true;
+                          emitChatDelta(data.item_id, data.type, {
+                            role: "assistant",
+                            content: "[generated audio omitted]",
+                          });
+                        }
+                      } else if (
+                        data.type === "response.audio.transcript.done" ||
+                        data.type === "response.audio.done"
+                      ) {
+                        // Delta events already carried all visible semantics.
+                        // Done events are terminators, not snapshots to replay.
+                        continue;
                       } else if (data.type === "response.output_text.delta") {
                         const textDelta =
                           typeof data.delta === "string" ? data.delta : "";
-                        const partKeys = getContentPartKeys(data);
-                        if (!textDelta || seenAny(textSnapshotParts, partKeys)) {
+                        const emittedDelta = appendStreamPartDelta(
+                          textPartBuffers,
+                          data,
+                          textDelta,
+                        );
+                        if (!emittedDelta) {
                           continue;
                         }
-                        markAll(textDeltaParts, partKeys);
                         // 将output_text.delta转换为chat格式
                         const chatChunk = {
                           id: data.item_id || "chatcmpl-" + Date.now(),
@@ -1375,7 +1505,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                             {
                               index: 0,
                               delta: {
-                                content: textDelta,
+                                content: emittedDelta,
                               },
                               finish_reason: null,
                             },
@@ -1390,7 +1520,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                       } else if (
                         data.type === "response.output_item.added" &&
                         data.item &&
-                        isProgrammaticResponsesItem(
+                        isUnsupportedResponsesItem(
                           data.item as ResponsesAPIOutputItem,
                         )
                       ) {
@@ -1416,78 +1546,93 @@ export class OpenAIResponsesTransformer implements Transformer {
                           const partEvent = {
                             ...data,
                             item_id: data.item?.id || data.item_id,
+                            content_index: index,
                           };
-                          if (part.type === "output_text" && part.text) {
-                            markAll(
-                              textDeltaParts,
-                              getContentPartKeys(partEvent, index),
+                          if (
+                            part.type === "output_text" &&
+                            typeof part.text === "string" &&
+                            part.text.length > 0
+                          ) {
+                            const suffix = reconcileStreamPartSnapshot(
+                              textPartBuffers,
+                              partEvent,
+                              part.text,
+                              "output text",
                             );
-                            markAll(
-                              textSnapshotParts,
-                              getContentPartKeys(partEvent, index),
-                            );
-                            emitChatDelta(data.item?.id, data.type, {
-                              role: "assistant",
-                              content: part.text,
-                            });
-                          } else if (part.type === "refusal") {
-                            sawRefusal = true;
-                            if (part.refusal) {
-                              markAll(
-                                refusalDeltaParts,
-                                getContentPartKeys(partEvent, index),
-                              );
-                              markAll(
-                                refusalSnapshotParts,
-                                getContentPartKeys(partEvent, index),
-                              );
+                            if (suffix) {
                               emitChatDelta(data.item?.id, data.type, {
                                 role: "assistant",
-                                refusal: part.refusal,
+                                content: suffix,
                               });
+                            }
+                          } else if (part.type === "refusal") {
+                            sawRefusal = true;
+                            if (
+                              typeof part.refusal === "string" &&
+                              part.refusal.length > 0
+                            ) {
+                              const suffix = reconcileStreamPartSnapshot(
+                                refusalPartBuffers,
+                                partEvent,
+                                part.refusal,
+                                "refusal",
+                              );
+                              if (suffix) {
+                                emitChatDelta(data.item?.id, data.type, {
+                                  role: "assistant",
+                                  refusal: suffix,
+                                });
+                              }
                             }
                           }
                         });
                       } else if (
                         data.type === "response.output_text.done" &&
-                        data.text &&
-                        !seenAny(textDeltaParts, getContentPartKeys(data))
+                        typeof data.text === "string"
                       ) {
-                        markAll(textDeltaParts, getContentPartKeys(data));
-                        emitChatDelta(data.item_id, data.type, {
-                          content: data.text,
-                        });
+                        const suffix = reconcileStreamPartSnapshot(
+                          textPartBuffers,
+                          data,
+                          data.text,
+                          "output text",
+                        );
+                        if (suffix) {
+                          emitChatDelta(data.item_id, data.type, {
+                            content: suffix,
+                          });
+                        }
                       } else if (
                         data.type === "response.refusal.delta"
                       ) {
                         const refusalDelta =
                           typeof data.delta === "string" ? data.delta : "";
                         sawRefusal = true;
-                        const partKeys = getContentPartKeys(data);
-                        if (
-                          refusalDelta &&
-                          !seenAny(refusalSnapshotParts, partKeys)
-                        ) {
-                          markAll(refusalDeltaParts, partKeys);
+                        const emittedDelta = appendStreamPartDelta(
+                          refusalPartBuffers,
+                          data,
+                          refusalDelta,
+                        );
+                        if (emittedDelta) {
                           emitChatDelta(data.item_id, data.type, {
-                            refusal: refusalDelta,
+                            refusal: emittedDelta,
                           });
                         }
                       } else if (
                         data.type === "response.refusal.done"
                       ) {
                         sawRefusal = true;
-                        if (
-                          data.refusal &&
-                          !seenAny(
-                            refusalDeltaParts,
-                            getContentPartKeys(data),
-                          )
-                        ) {
-                          markAll(refusalDeltaParts, getContentPartKeys(data));
-                          emitChatDelta(data.item_id, data.type, {
-                            refusal: data.refusal,
-                          });
+                        if (typeof data.refusal === "string") {
+                          const suffix = reconcileStreamPartSnapshot(
+                            refusalPartBuffers,
+                            data,
+                            data.refusal,
+                            "refusal",
+                          );
+                          if (suffix) {
+                            emitChatDelta(data.item_id, data.type, {
+                              refusal: suffix,
+                            });
+                          }
                         }
                       } else if (
                         data.type === "response.output_text.annotation.added"
@@ -1696,6 +1841,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                           object: "chat.completion.chunk",
                           created: streamCreated,
                           model: data.response?.model || streamModel,
+                          service_tier: data.response?.service_tier,
                           choices: [
                             {
                               index: 0,
@@ -1715,6 +1861,18 @@ export class OpenAIResponsesTransformer implements Transformer {
                                   cached_tokens: cachedTokens,
                                   cache_write_tokens: cacheWriteTokens,
                                 },
+                                ...(typeof data.response.usage
+                                  .output_tokens_details?.reasoning_tokens ===
+                                "number"
+                                  ? {
+                                      completion_tokens_details: {
+                                        reasoning_tokens:
+                                          data.response.usage
+                                            .output_tokens_details
+                                            .reasoning_tokens,
+                                      },
+                                    }
+                                  : {}),
                               }
                             : undefined,
                         };
@@ -1747,9 +1905,11 @@ export class OpenAIResponsesTransformer implements Transformer {
                               : mapResponsesErrorStatus(
                                   errorCode || undefined,
                                 ),
-                          type: mapResponsesErrorType(
-                            errorCode || undefined,
-                          ),
+                          type: data.type === "response.cancelled"
+                            ? "conflict_error"
+                            : mapResponsesErrorType(
+                                errorCode || undefined,
+                              ),
                           code: errorCode || undefined,
                           message:
                             rawError.message || "Responses stream failed",
@@ -1786,6 +1946,11 @@ export class OpenAIResponsesTransformer implements Transformer {
                         const reasoningDelta =
                           typeof data.delta === "string" ? data.delta : "";
                         if (reasoningDelta) {
+                          const emittedDelta = appendStreamPartDelta(
+                            reasoningTextPartBuffers,
+                            data,
+                            reasoningDelta,
+                          );
                           if (omitReasoning) {
                             suppressedReasoningGroups.push(
                               getEventItemKeys(data),
@@ -1796,26 +1961,34 @@ export class OpenAIResponsesTransformer implements Transformer {
                           discardBufferedSummariesForItem(
                             getEventItemKeys(data),
                           );
-                          markAll(reasoningTextParts, getContentPartKeys(data));
-                          emitChatDelta(data.item_id, data.type, {
-                            thinking: { content: reasoningDelta },
-                          });
+                          if (emittedDelta) {
+                            emitChatDelta(data.item_id, data.type, {
+                              thinking: { content: emittedDelta },
+                            });
+                          }
                         }
                       } else if (
                         data.type === "response.reasoning_text.done" &&
-                        data.text &&
-                        !seenAny(reasoningTextParts, getContentPartKeys(data))
+                        typeof data.text === "string"
                       ) {
+                        const suffix = reconcileStreamPartSnapshot(
+                          reasoningTextPartBuffers,
+                          data,
+                          data.text,
+                          "reasoning text",
+                        );
+                        if (suffix === null) break;
                         if (omitReasoning) {
                           suppressedReasoningGroups.push(getEventItemKeys(data));
                           continue;
                         }
                         markAll(reasoningTextItems, getEventItemKeys(data));
                         discardBufferedSummariesForItem(getEventItemKeys(data));
-                        markAll(reasoningTextParts, getContentPartKeys(data));
-                        emitChatDelta(data.item_id, data.type, {
-                          thinking: { content: data.text },
-                        });
+                        if (suffix) {
+                          emitChatDelta(data.item_id, data.type, {
+                            thinking: { content: suffix },
+                          });
+                        }
                       } else if (
                         data.type === "response.output_item.done" &&
                         data.item
@@ -2036,8 +2209,8 @@ export class OpenAIResponsesTransformer implements Transformer {
       // function output must all be replayed together. Anthropic direct client
       // tools cannot represent that state. Never relabel a program-owned call
       // as a direct tool_use.
-      if (isProgrammaticResponsesItem(item)) {
-        rejectProgrammaticResponsesItem(item);
+      if (isUnsupportedResponsesItem(item)) {
+        rejectUnsupportedResponsesItem(item);
       }
       if (item.type === "reasoning") {
         if (!item.id) {
@@ -2172,6 +2345,7 @@ export class OpenAIResponsesTransformer implements Transformer {
       object: "chat.completion",
       created: responseData.created_at,
       model: responseData.model,
+      service_tier: responseData.service_tier,
       choices: [
         {
           index: 0,
@@ -2216,6 +2390,15 @@ export class OpenAIResponsesTransformer implements Transformer {
                 responseData.usage.input_tokens_details?.cache_write_tokens ||
                 0,
             },
+            ...(typeof responseData.usage.output_tokens_details
+              ?.reasoning_tokens === "number"
+              ? {
+                  completion_tokens_details: {
+                    reasoning_tokens:
+                      responseData.usage.output_tokens_details.reasoning_tokens,
+                  },
+                }
+              : {}),
           }
         : null,
     };

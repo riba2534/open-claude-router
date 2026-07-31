@@ -11,6 +11,7 @@ WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/package.json ./
+COPY LICENSE ./LICENSE
 ENV NODE_ENV=production
 ENV PORT=3457
 EXPOSE 3457

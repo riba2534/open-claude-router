@@ -165,6 +165,7 @@ test("Responses rejects missing reasoning IDs and non-terminal JSON statuses", a
     }),
   );
   assert.equal(cancelled.status, 409);
+  assert.equal((await cancelled.json()).error.type, "conflict_error");
 });
 
 test("Responses terminal SSE requires a matching response object and status", async () => {

@@ -368,10 +368,15 @@ test("Responses output order, refusal, citations, unknown items, and cache write
   assert.equal(body.stop_reason, "refusal");
   assert.equal(body.stop_details.explanation, "cannot continue");
   assert.deepEqual(body.usage, {
+    cache_creation: null,
     input_tokens: 50,
     output_tokens: 10,
     cache_read_input_tokens: 20,
     cache_creation_input_tokens: 30,
+    inference_geo: null,
+    output_tokens_details: null,
+    server_tool_use: null,
+    service_tier: null,
   });
 });
 

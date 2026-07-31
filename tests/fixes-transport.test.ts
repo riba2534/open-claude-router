@@ -24,6 +24,7 @@ async function createRouter() {
     const apiError = error as ApiError;
     reply.code(apiError.statusCode ?? 500).send({
       type: "error",
+      request_id: null,
       error: {
         type: apiError.type ?? "api_error",
         message: error.message,
@@ -203,6 +204,7 @@ test("stream:false maps a transport reader failure to upstream 502", async () =>
         response.json(),
         {
           type: "error",
+          request_id: null,
           error: {
             type: "api_error",
             message: "upstream stream transport failed",
@@ -253,6 +255,7 @@ test("stream:true maps a transport reader failure to Anthropic SSE error", async
         JSON.parse(dataLine.slice(6)),
         {
           type: "error",
+          request_id: null,
           error: {
             type: "api_error",
             message: "upstream stream transport failed",
