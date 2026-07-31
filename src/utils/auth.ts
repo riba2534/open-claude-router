@@ -345,6 +345,74 @@ export function parseModelMap(req: FastifyRequest): Map<string, string> {
   return map;
 }
 
+const ANTHROPIC_EFFORT_VALUES = new Set([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+
+/**
+ * Parse `X-Upstream-Effort-Map` into Map<anthropicEffort, upstreamEffort>.
+ * Format: `max=xhigh,low=minimal`. Two extensions:
+ *
+ *  - left side `*` is a fallback applied to any effort without an explicit
+ *    mapping (`*=off` covers every value at once);
+ *  - right side `off` (reserved word) strips the effort field entirely — for
+ *    gateways that reject reasoning effort in some request shapes (e.g.
+ *    "Function tools with reasoning_effort are not supported").
+ *
+ * The router itself never clamps an explicit `output_config.effort` by model
+ * or provider guesswork; this header is the client's EXPLICIT declaration for
+ * upstreams whose reasoning-effort vocabulary differs from Anthropic's (e.g.
+ * a gateway that accepts `xhigh` but rejects `max`). Left-hand side must be a
+ * formal Anthropic effort (or `*`); right-hand side is upstream vocabulary
+ * and is forwarded verbatim (except `off`).
+ */
+export function parseEffortMap(req: FastifyRequest): Map<string, string> {
+  const raw = readHeader(req, "x-upstream-effort-map");
+  if (raw === undefined || raw.trim() === "") return new Map();
+
+  const map = new Map<string, string>();
+  for (const pair of raw.split(",")) {
+    const trimmed = pair.trim();
+    const eq = trimmed.indexOf("=");
+    const from = eq > 0 ? trimmed.slice(0, eq).trim() : "";
+    const to = eq > 0 ? trimmed.slice(eq + 1).trim() : "";
+    if (
+      !from ||
+      !to ||
+      (from !== "*" && !ANTHROPIC_EFFORT_VALUES.has(from)) ||
+      HEADER_VALUE_INVALID_RE.test(to)
+    ) {
+      throw createApiError(
+        "X-Upstream-Effort-Map contains an invalid mapping " +
+          "(expected format: max=xhigh,low=minimal; left side must be an " +
+          "Anthropic effort low/medium/high/xhigh/max or *; " +
+          "right side off strips the field)",
+        400,
+        "invalid_effort_map",
+        "invalid_request_error",
+      );
+    }
+    map.set(from, to);
+  }
+  return map;
+}
+
+/**
+ * Resolve one effort value through the client-declared map.
+ * Returns the mapped value, "off" to strip, or undefined to keep as-is.
+ */
+export function resolveMappedEffort(
+  effort: string | undefined,
+  effortMap: Map<string, string>,
+): string | undefined {
+  if (!effort || effortMap.size === 0) return undefined;
+  return effortMap.get(effort) ?? effortMap.get("*");
+}
+
 /**
  * Resolve upstream model override. Undefined means "do not override"; the
  * transformed request keeps its original body model.

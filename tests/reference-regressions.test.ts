@@ -65,7 +65,7 @@ test("Responses emits a same-turn tool output before the user follow-up", async 
   ]);
 });
 
-test("document-only tool result safely falls back to one JSON text block", async () => {
+test("document-only tool result remains a typed Responses input_file", async () => {
   const document = {
     type: "document",
     source: {
@@ -97,11 +97,17 @@ test("document-only tool result safely falls back to one JSON text block", async
   assert.deepEqual(input[1], {
     type: "function_call_output",
     call_id: "call_doc",
-    output: [{ type: "input_text", text: JSON.stringify(document) }],
+    output: [
+      {
+        type: "input_file",
+        file_data: "data:application/pdf;base64,JVBERi0=",
+        filename: "report",
+      },
+    ],
   });
 });
 
-test("mixed text and document tool result preserves per-block fallback order", async () => {
+test("mixed text and document tool result preserves typed block order", async () => {
   const document = {
     type: "document",
     source: { type: "url", url: "https://example.com/report.pdf" },
@@ -134,7 +140,11 @@ test("mixed text and document tool result preserves per-block fallback order", a
     call_id: "call_doc",
     output: [
       { type: "input_text", text: "before" },
-      { type: "input_text", text: JSON.stringify(document) },
+      {
+        type: "input_file",
+        file_url: "https://example.com/report.pdf",
+        filename: "document.pdf",
+      },
       { type: "input_text", text: "after" },
     ],
   });

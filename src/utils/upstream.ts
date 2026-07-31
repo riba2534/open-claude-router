@@ -1,4 +1,4 @@
-import type { FastifyRequest } from "fastify";
+import type { FastifyReply, FastifyRequest } from "fastify";
 
 const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour, generous for long completions
 
@@ -7,26 +7,59 @@ const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour, generous for long completi
  *   - the request times out, OR
  *   - the client socket is aborted (Ctrl+C in Claude Code) before the reply completes.
  *
- * Note: req.raw 'close' fires on normal completion too. We only abort when
- * `req.raw.aborted === true`, which Node sets when the underlying socket dies
- * mid-response.
+ * IncomingMessage `close` is not a response-lifecycle signal: for a normal
+ * POST it fires once the request body has been consumed, long before the model
+ * finishes. Use request `aborted` for an interrupted upload and the outgoing
+ * response's `close`/`finish` events for disconnect and cleanup instead.
  */
 export function buildUpstreamSignal(
   req: FastifyRequest,
+  reply: FastifyReply,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): AbortSignal {
   const controller = new AbortController();
+  let cleanedUp = false;
+
+  const onRequestAborted = () => abort("client disconnected");
+  const onReplyClose = () => {
+    if (!reply.raw.writableFinished) {
+      abort("client disconnected");
+    } else {
+      cleanup();
+    }
+  };
+  const onReplyFinish = () => cleanup();
+
   const timeout = setTimeout(
-    () => controller.abort(new Error("upstream timeout")),
+    () => abort("upstream timeout"),
     timeoutMs,
   );
   timeout.unref();
-  req.raw.once("close", () => {
+
+  function cleanup(): void {
+    if (cleanedUp) return;
+    cleanedUp = true;
     clearTimeout(timeout);
-    if (req.raw.aborted) {
-      controller.abort(new Error("client disconnected"));
+    req.raw.removeListener("aborted", onRequestAborted);
+    reply.raw.removeListener("close", onReplyClose);
+    reply.raw.removeListener("finish", onReplyFinish);
+  }
+
+  function abort(message: string): void {
+    if (!controller.signal.aborted) {
+      controller.abort(new Error(message));
     }
-  });
+    cleanup();
+  }
+
+  req.raw.once("aborted", onRequestAborted);
+  reply.raw.once("close", onReplyClose);
+  reply.raw.once("finish", onReplyFinish);
+
+  // Cover a socket that disappeared immediately before listeners were armed.
+  if (req.raw.aborted || (reply.raw.destroyed && !reply.raw.writableFinished)) {
+    abort("client disconnected");
+  }
   return controller.signal;
 }
 
@@ -43,6 +76,10 @@ export async function callUpstream(
 ): Promise<Response> {
   return fetch(opts.url, {
     method: "POST",
+    // A redirect response is still an upstream non-2xx response. Following it
+    // here would make the stateless Router issue a second HTTP request, hide
+    // the original status, and bypass the caller-owned retry policy.
+    redirect: "manual",
     headers: {
       ...opts.headers,
       "content-type": "application/json",
@@ -76,8 +113,18 @@ export interface AnthropicError {
 export async function buildAnthropicErrorFromUpstream(
   res: Response,
 ): Promise<{ status: number; body: AnthropicError }> {
-  const text = await res.text();
-  let message = text || res.statusText;
+  let text = "";
+  let message =
+    res.statusText || `upstream returned HTTP ${res.status}`;
+  try {
+    text = await res.text();
+    if (text) message = text;
+  } catch {
+    // The status and retryability are already known even when a truncated
+    // error body cannot be consumed. Keep the original status instead of
+    // turning this into an unrelated local 500.
+    message = `upstream returned HTTP ${res.status}; response body could not be read`;
+  }
   try {
     const parsed = JSON.parse(text);
     if (parsed?.error?.message) message = parsed.error.message;

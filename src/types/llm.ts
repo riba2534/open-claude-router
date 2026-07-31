@@ -33,7 +33,26 @@ export interface ImageContent {
   };
 }
 
-export type MessageContent = TextContent | ImageContent;
+/**
+ * Lossless file/document envelope shared by the protocol transformers.
+ *
+ * `fallback_text` is deliberately outside the OpenAI `file` object. The
+ * Chat-Completions normalizer removes it when `file_data`/`file_id` can be
+ * sent formally, or replaces URL-only/unsupported files with that bounded
+ * text. Responses consumes the same envelope as an `input_file` part.
+ */
+export interface FileContent {
+  type: "file";
+  file: {
+    file_data?: string;
+    file_id?: string;
+    file_url?: string;
+    filename?: string;
+  };
+  fallback_text: string;
+}
+
+export type MessageContent = TextContent | ImageContent | FileContent;
 
 export interface UnifiedMessage {
   role: "user" | "assistant" | "system" | "tool";
@@ -54,6 +73,17 @@ export interface UnifiedMessage {
     content: string;
     signature?: string;
   };
+  /**
+   * Every signed thinking block of the source assistant turn, in order.
+   * `tool_call_id` names the tool call the block immediately preceded, so
+   * Responses replay can restore interleaved reasoning items (`thinking` above
+   * only carries the first block for Chat-Completions compatibility).
+   */
+  thinking_blocks?: Array<{
+    content?: string;
+    signature?: string;
+    tool_call_id?: string;
+  }>;
 }
 
 export interface UnifiedTool {
@@ -74,6 +104,7 @@ export interface UnifiedTool {
 export type ThinkLevel = "none" | "low" | "medium" | "high";
 export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
 export type ReasoningEffort = ThinkLevel | "xhigh" | "max";
+export type ThinkingDisplay = "summarized" | "omitted";
 
 export interface UnifiedChatRequest {
   messages: UnifiedMessage[];
@@ -96,6 +127,12 @@ export interface UnifiedChatRequest {
     effort?: ReasoningEffort;
     max_tokens?: number;
     enabled?: boolean;
+    /**
+     * Explicit Anthropic display preference. This is intentionally absent when
+     * the client omitted `thinking.display`: model-specific defaults belong to
+     * the selected upstream, not to the protocol router.
+     */
+    display?: ThinkingDisplay;
   };
 }
 

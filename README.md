@@ -187,7 +187,7 @@ ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001 \
 claude"
 ```
 
-服务侧会把 OpenAI 的 reasoning summary / `reasoning_text` 事件转成 Anthropic 的 `thinking` 块返回给 Claude Code；refusal 则保守转换成普通 assistant 文本。**其他所有 alias（不带 `X-Upstream-Format` 或显式 `chat-completions`）行为完全不变**。
+服务侧会把 OpenAI 的 reasoning summary / `reasoning_text` 事件转成 Anthropic 的 `thinking` 块返回给 Claude Code；refusal 文本会保留在普通 assistant 文本块中，并以 `stop_reason:"refusal"` 和结构化 `stop_details` 标记终态。**其他所有 alias（不带 `X-Upstream-Format` 或显式 `chat-completions`）行为完全不变**。
 
 ### 3. 启动 Claude Code
 
@@ -204,17 +204,45 @@ myocr
 | 文本流式 SSE | ✅ 正式处理 multi-data、LF/CRLF/CR 与跨 chunk UTF-8；兼容 EOF trailing event | 同左 |
 | 工具调用（`tool_use` / `tool_result` 双向增量） | ✅ 含现代 `tool_calls` 并行工具；流式工具增量会先按调用缓冲，再输出合法的顺序 block | ✅ 含并行工具；历史文本与调用均保留，但原 content block 的交错位置会被归一化 |
 | 顶层多模态图片（base64 / URL） | ✅ 标准 `image_url` | ✅ 标准 `input_image` |
-| `tool_result` 中的图片 | ⚠️ Chat 的 tool message 只能放文本；图片会在整组 tool message 后转成标准 user 多模态 sidecar，保留视觉输入与图片间顺序，但不保留原始跨模态顺序及图片与具体 tool 的强绑定 | ✅ `function_call_output.output` 原生保留 `input_text` / `input_image` 顺序与归属 |
-| document / file block | ⚠️ 未实现原生文件映射；工具结果中的未知 block 会降级成 JSON 文本，顶层未知 block 当前忽略 | 同左；尚未定义 file ID / URL / base64 的统一映射 |
+| `tool_result` 中的图片 / 文件 | ⚠️ Chat 的 tool message 只能放文本；图片及可表示为 `file_data` / `file_id` 的文件会在整组 tool message 后转成标准 user 多模态 sidecar。视觉/文件输入得以保留，但原始跨模态顺序及与具体 tool 的强绑定会降级；URL-only 文件转有界文本 | ✅ `function_call_output.output` 原生保留 `input_text` / `input_image` / `input_file` 多 block 数组的顺序与归属；纯文本保持 string 以兼容旧端点 |
+| document / file block | ✅ base64 / text source 转 Chat `file_data`，Anthropic `file_id` 转 Chat `file_id`；Chat 没有正式 `file_url`，URL source 转含 URL 的有界文本；未知/`source:content` 安全降级 | ✅ 转成 `input_file`，支持 `file_data` / `file_id` / `file_url` / `filename`；未知/`source:content` 安全降级 |
 | `/model sonnet` / `opus` / haiku 切换 | ✅ body.model 字段透传 | 同左 |
 | 客户端中断（Ctrl+C） | ✅ AbortSignal 传到上游 | 同左 |
-| `output_config.effort` | ✅ `low/medium/high/xhigh/max` 精确转成 `reasoning_effort`，不按模型名截断 | ✅ 精确转成 `reasoning.effort`；仅无合法显式值的既有 thinking 路径使用 budget heuristic |
-| `thinking` 块 | ⚠️ 使用兼容扩展 `reasoning_content`；没有通用的 OpenAI 标准等价物 | ✅ reasoning summary / `reasoning_text` 转 thinking；`{item id, encrypted_content}` 封装成 opaque signature，历史可回放 |
-| refusal / content filter | ✅ refusal 保留为普通 assistant 文本；stop reason 保守使用 `end_turn` | 同左 |
+| `output_config.effort` / `thinking` budget | ✅ `low/medium/high/xhigh/max` 精确转成 `reasoning_effort`，不按模型名截断；`thinking.type:"enabled"` 必须提供有限整数且 `budget_tokens >= 1024`，`adaptive` 必须省略 budget | ✅ 显式 effort 精确转成 `reasoning.effort`；没有显式 effort 时，只有合法 enabled budget 才派生 heuristic 档位，adaptive 交给上游默认 |
+| `thinking` 块 / display | ⚠️ 使用兼容扩展 `reasoning_content`；没有通用的 OpenAI 标准等价物。客户端显式 `display:"omitted"` 时保留空 thinking block / signature、隐藏 thinking 文本；未显式设置时不猜模型默认 | ✅ reasoning summary / `reasoning_text` 转 thinking；`{item id, encrypted_content}` 封装成 opaque signature，多个 reasoning item 各自独立封口并按与 tool call 的邻接关系交错回放。显式 omitted 不请求 detailed summary，但仍请求 encrypted state，并在 JSON/SSE 中只返回空 thinking + signature |
+| refusal / content filter | ✅ refusal 文本保留为普通 assistant 文本；`content_filter` 映射 `stop_reason:"refusal"`，并返回 `{type:"refusal",category:null,explanation}` 形式的 `stop_details` | 同左；流式与非流式、SSE 聚合保持一致 |
+| incomplete / 截断工具调用 | ✅ Chat `length` 映射 `max_tokens`；已到达的调用名/参数字节仍保留，但不把截断调用宣传为可执行终态 | ✅ response 或任一 function item 为 incomplete 时 `max_tokens` 优先于 `tool_use`；refusal/content filter 优先级更高；仅完整调用以 `tool_use` 结束 |
+| legacy `function_call`（旧式 Chat 工具调用） | ✅ 流式与非流式均归一为 `tool_use`，不会静默丢弃 | 不适用 |
+| 流式/非流式形态错位 | ✅ 响应形态永远跟随客户端 `stream` 标志：上游对 `stream:true` 回 JSON 时合成完整 SSE，对 `stream:false` 回 SSE 时聚合成 JSON | 同左 |
 | Prompt cache（`cache_control`） | ⚠️ Anthropic 显式 breakpoint 会被剥（避免严格上游 400）；若上游自行报告 cached tokens，usage 会映射返回 | 同左 |
 | `count_tokens` 端点 | ⚠️ 服务本地 `js-tiktoken` 粗略估算（非上游精确值） | 同左 |
 
 Router 只做协议转换，不根据模型名猜测视觉、推理或工具能力。标准图片结构仍被文本模型或能力不完整的兼容端点拒绝时，错误属于所选模型 / 上游；Router 会保留上游状态并按既定策略标记为可重试。完整逐字段审计、责任边界和复现证据见 [`docs/protocol-audit-2026-07-31.md`](docs/protocol-audit-2026-07-31.md)。
+
+### 开发验证
+
+当前 0.5.0 候选代码基于 0.4.0 发布提交 `2683537`；该 0.4.0 基线已经包含“所有上游非 2xx 标记 `X-Should-Retry:true`”的既定行为。本轮没有删除或改变该逻辑，并保留了状态码、单次 fetch 和 retry header 的回归测试。
+
+仓库完整验证：
+
+```bash
+npm ci
+npm run typecheck
+npm test
+npm run test:stream
+npm run build
+```
+
+本轮自动化回归为 119/119 通过。另用 `scripts/verify-live-upstream.ts` 对两套独立的 Chat Completions / Responses 兼容上游各运行 23 个脱敏用例，合计 45 passed / 1 classified skip / 0 failed：覆盖流式/非流式文本、单/并行工具、base64/URL 图片、嵌套 `tool_result`、两协议 document、reasoning usage、reasoning 历史回放，以及两个协议的无效模型错误。一套上游为 23/23 全通过（包括 Responses reasoning 跨轮回放）；另一套为 22 passed / 1 classified skip，其唯一 skip 是跨请求回放 reasoning item 时返回 409 `item not found / different resource`，且不经过 Router 的直接两轮 Responses 回放也得到同类 409，因此归类为该兼容网关的跨资源状态限制。无效模型 404/502 和该 409 均由 Router 保留状态、Anthropic error envelope 与 `X-Should-Retry:true`；报告不记录 endpoint、模型名或凭证。可用自己的上游复跑：
+
+```bash
+OCR_LIVE_ROUTER_URL=http://127.0.0.1:3457 \
+OCR_LIVE_CHAT_URL=<chat-endpoint> \
+OCR_LIVE_RESPONSES_URL=<responses-endpoint> \
+OCR_LIVE_AUTH='<authorization-value>' \
+OCR_LIVE_MODEL=<model> \
+npm run test:live
+```
 
 ## API
 
@@ -234,6 +262,7 @@ Router 只做协议转换，不根据模型名猜测视觉、推理或工具能�
 | `X-Upstream-Authorization` | header | ✅ 必需 | 上游 Authorization 原值（原样透传、**不剥 Bearer**，请填上游需要的完整值；只有 path 模式的 `Authorization` 才会剥 `Bearer ` 前缀） |
 | `X-Upstream-Model` | 两种模式都可用 | 可选 | 真实上游模型名；提供则覆盖 body 里的 `model` |
 | `X-Upstream-Model-Map` | 两种模式都可用 | 可选 | 模型名映射表，格式 `from1=to1,from2=to2`；优先级高于 `X-Upstream-Model` |
+| `X-Upstream-Effort-Map` | 两种模式都可用 | 可选 | effort 词汇映射表，格式 `max=xhigh,low=minimal`；左侧必须是 Anthropic effort（`low/medium/high/xhigh/max`）或通配 `*`，右侧为上游词汇原样转发，保留字 `off` 表示整个剥除该字段（例：`*=off` 适配"tools 与 reasoning_effort 不能同时出现"的网关）。不配置时显式 effort 永远精确透传，Router 自身绝不 clamp |
 | `X-Upstream-Headers` | 两种模式都可用 | 可选 | JSON object，显式声明要额外转发给上游的 header；不能覆盖受保护 header |
 | `Authorization: Bearer <token>` | header | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | 服务自身访问鉴权 |
 | `X-OCR-Token` | path | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | path 模式下 `Authorization` 被上游凭证占用，服务鉴权改走此 header |
@@ -301,7 +330,7 @@ Claude Code 会自动追加 `/v1/messages`，服务端识别并砍掉这个后�
 
 ## 致谢
 
-本项目的协议转换核心代码移植自 [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router)（MIT 协议）。我们把它的 transformer 实现包装成一个完全无状态的 HTTP 服务，配合 Claude Code 客户端的 alias 形态使用。
+本项目的协议转换核心代码移植自 [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router)（MIT 协议）。我们把它的 transformer 实现包装成一个完全无状态的 HTTP 服务，配合 Claude Code 客户端的 alias 形态使用。协议审计还交叉参考了 CLIProxyAPI 与 claude-code-router 的源码和可执行 fixture；它们是证据来源，不是天然正确或需要机械对齐的实现基线。
 
 ## License
 

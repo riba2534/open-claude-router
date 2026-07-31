@@ -4,23 +4,49 @@ import { SseBlockDecoder } from "./sse.js";
 
 const REASONING_SIGNATURE_PREFIX = "ocr-responses-reasoning-v1:";
 
+interface RouterReasoningEnvelope {
+  id: string;
+  encrypted_content?: string;
+  summary?: Array<{ type?: string; text?: string }>;
+  content?: Array<{ type?: string; text?: string }>;
+}
+
 function encodeReasoningSignature(
-  id: string | undefined,
-  encryptedContent: string | undefined,
+  item: Pick<
+    ResponsesAPIOutputItem,
+    "id" | "encrypted_content" | "summary" | "content"
+  >,
 ): string | undefined {
-  if (!id || !encryptedContent) return undefined;
+  if (!item.id) return undefined;
+  const envelope: RouterReasoningEnvelope = { id: item.id };
+  if (item.encrypted_content) {
+    envelope.encrypted_content = item.encrypted_content;
+  } else {
+    // Keep the established encrypted envelope byte-compatible. Some
+    // Responses-compatible endpoints omit encrypted_content, however, so in
+    // that case retain the visible reasoning fields needed to replay the item
+    // instead of emitting an id-only shell that the next request may reject.
+    const summary = item.summary?.filter(
+      (part) => typeof part?.text === "string",
+    );
+    if (summary?.length) envelope.summary = summary;
+    const content = item.content
+      ?.filter(
+        (part) =>
+          part?.type === "reasoning_text" && typeof part.text === "string",
+      )
+      .map((part) => ({ type: part.type, text: part.text }));
+    if (content?.length) envelope.content = content;
+  }
   return (
     REASONING_SIGNATURE_PREFIX +
-    Buffer.from(
-      JSON.stringify({ id, encrypted_content: encryptedContent }),
-      "utf8",
-    ).toString("base64url")
+    Buffer.from(JSON.stringify(envelope), "utf8").toString("base64url")
   );
 }
 
 function decodeReasoningSignature(
   signature: string | undefined,
-): { id: string; encrypted_content: string } | null {
+): RouterReasoningEnvelope | null {
   if (!signature?.startsWith(REASONING_SIGNATURE_PREFIX)) return null;
   try {
     const decoded = JSON.parse(
@@ -32,13 +58,12 @@ function decodeReasoningSignature(
     if (
       typeof decoded?.id === "string" &&
       decoded.id.length > 0 &&
-      typeof decoded?.encrypted_content === "string" &&
-      decoded.encrypted_content.length > 0
+      (decoded.encrypted_content === undefined ||
+        typeof decoded.encrypted_content === "string") &&
+      (decoded.summary === undefined || Array.isArray(decoded.summary)) &&
+      (decoded.content === undefined || Array.isArray(decoded.content))
     ) {
-      return {
-        id: decoded.id,
-        encrypted_content: decoded.encrypted_content,
-      };
+      return decoded as RouterReasoningEnvelope;
     }
   } catch {
     // Unknown/native Anthropic signatures must never leak into Responses.
@@ -83,6 +108,9 @@ interface ResponsesAPIOutputItem {
   reasoning?: string;
   summary?: Array<{ type?: string; text?: string }>;
   encrypted_content?: string;
+  result?: string;
+  status?: string;
+  role?: string;
 }
 
 interface ResponsesAPIPayload {
@@ -134,6 +162,8 @@ interface ResponsesStreamEvent {
     reasoning?: string; // 添加 reasoning 字段支持
     summary?: Array<{ type?: string; text?: string }>;
     encrypted_content?: string;
+    result?: string;
+    status?: string;
   };
   text?: string;
   refusal?: string;
@@ -146,10 +176,7 @@ interface ResponsesStreamEvent {
     incomplete_details?: {
       reason?: string;
     };
-    output?: Array<{
-      type: string;
-      encrypted_content?: string;
-    }>;
+    output?: ResponsesAPIOutputItem[];
     usage?: {
       input_tokens?: number;
       output_tokens?: number;
@@ -199,10 +226,12 @@ export class OpenAIResponsesTransformer implements Transformer {
     const reasoningEffort =
       request.reasoning_effort ?? request.reasoning?.effort;
     const reasoningOutputRequested = request.reasoning?.enabled === true;
-    if (reasoningEffort || reasoningOutputRequested) {
+    const reasoningSummaryRequested =
+      reasoningOutputRequested && request.reasoning?.display !== "omitted";
+    if (reasoningEffort || reasoningSummaryRequested) {
       (request as any).reasoning = {
         ...(reasoningEffort ? { effort: reasoningEffort } : {}),
-        ...(reasoningOutputRequested ? { summary: "detailed" } : {}),
+        ...(reasoningSummaryRequested ? { summary: "detailed" } : {}),
       };
     } else {
       delete request.reasoning;
@@ -219,7 +248,7 @@ export class OpenAIResponsesTransformer implements Transformer {
 
       if (Array.isArray(message.content)) {
         const convertedContent = message.content
-          .map((content) => this.normalizeRequestContent(content, message.role))
+          .map((content) => this.normalizeRequestContent(content))
           .filter(
             (content): content is Record<string, unknown> => content !== null
           );
@@ -235,23 +264,54 @@ export class OpenAIResponsesTransformer implements Transformer {
         input.push({
           type: "function_call_output",
           call_id: message.tool_call_id,
+          // Responses formally supports a typed content array here. Keep the
+          // original block boundaries and bytes instead of inserting newlines
+          // into text-only tool results. A source string remains a string.
           output: convertedMessage.content ?? "",
         });
         return;
       }
 
+      // Replay every Router-wrapped reasoning item, re-interleaved: blocks
+      // paired with a tool call are emitted immediately before that
+      // function_call item (Responses validates reasoning/item adjacency);
+      // unpaired blocks precede the assistant message itself.
+      const reasoningByToolCall = new Map<string, any[]>();
       if (message.role === "assistant") {
-        const thinking = message.thinking;
-        const replayableReasoning = decodeReasoningSignature(
-          thinking?.signature,
-        );
-        if (replayableReasoning) {
-          input.push({
+        const thinkingBlocks =
+          Array.isArray(message.thinking_blocks) &&
+          message.thinking_blocks.length
+            ? message.thinking_blocks
+            : message.thinking
+              ? [message.thinking]
+              : [];
+        for (const block of thinkingBlocks) {
+          const replayableReasoning = decodeReasoningSignature(
+            (block as any)?.signature,
+          );
+          if (!replayableReasoning) continue;
+          const reasoningItem = {
             type: "reasoning",
             id: replayableReasoning.id,
-            encrypted_content: replayableReasoning.encrypted_content,
-            summary: [],
-          });
+            ...(replayableReasoning.encrypted_content
+              ? {
+                  encrypted_content:
+                    replayableReasoning.encrypted_content,
+                }
+              : {}),
+            summary: replayableReasoning.summary ?? [],
+            ...(replayableReasoning.content
+              ? { content: replayableReasoning.content }
+              : {}),
+          };
+          const pairedToolCallId = (block as any)?.tool_call_id;
+          if (pairedToolCallId) {
+            const group = reasoningByToolCall.get(pairedToolCallId) ?? [];
+            group.push(reasoningItem);
+            reasoningByToolCall.set(pairedToolCallId, group);
+          } else {
+            input.push(reasoningItem);
+          }
         }
 
         const hasContent =
@@ -262,6 +322,7 @@ export class OpenAIResponsesTransformer implements Transformer {
         if (hasContent || !Array.isArray(message.tool_calls)) {
           delete convertedMessage.tool_calls;
           delete convertedMessage.thinking;
+          delete convertedMessage.thinking_blocks;
           delete convertedMessage.cache_control;
           input.push(convertedMessage);
         }
@@ -272,6 +333,11 @@ export class OpenAIResponsesTransformer implements Transformer {
 
       if (message.role === "assistant" && Array.isArray(message.tool_calls)) {
         message.tool_calls.forEach((tool) => {
+          const pairedReasoning = reasoningByToolCall.get(tool.id);
+          if (pairedReasoning) {
+            input.push(...pairedReasoning);
+            reasoningByToolCall.delete(tool.id);
+          }
           input.push({
             type: "function_call",
             arguments: tool.function.arguments,
@@ -356,25 +422,15 @@ export class OpenAIResponsesTransformer implements Transformer {
 
       const encoder = new TextEncoder();
       let isStreamEnded = false;
+      let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+      let downstreamCancelled = false;
 
       const transformer = this;
       const stream = new ReadableStream({
         async start(controller) {
           const reader = response.body!.getReader();
+          activeReader = reader;
           const sseDecoder = new SseBlockDecoder();
-
-          // 索引跟踪变量，只有在事件类型切换时才增加索引
-          let currentIndex = -1;
-          let lastEventType = "";
-
-          // 获取当前应该使用的索引的函数
-          const getCurrentIndex = (eventType: string) => {
-            if (eventType !== lastEventType) {
-              currentIndex++;
-              lastEventType = eventType;
-            }
-            return currentIndex;
-          };
 
           // tool_call index 映射：按 item_id 路由到递增的 tool_calls 数组索引
           // 支持多工具并行调用场景
@@ -388,21 +444,119 @@ export class OpenAIResponsesTransformer implements Transformer {
           const argumentDeltaItems = new Set<string>();
           const reasoningSummaryParts = new Set<string>();
           const reasoningTextParts = new Set<string>();
+          const reasoningTextItems = new Set<string>();
+          const reasoningSignatureItems = new Set<string>();
           const functionItemsAdded = new Set<string>();
+          const imageGenerationItems = new Set<string>();
+          let sawRefusal = false;
+          let sawIncompleteFunctionCall = false;
           let stopReading = false;
           let fatalStreamError = false;
-          const getEventItemKey = (event: ResponsesStreamEvent): string =>
-            event.item_id ||
-            event.item?.id ||
-            `output:${event.output_index ?? "unknown"}`;
-          const getContentPartKey = (
+          // Dedup keys must match between a delta that omits item_id and the
+          // done/fallback event that carries it, so every event is keyed by
+          // BOTH identities when available: mark all, match on any.
+          const getEventItemKeys = (event: ResponsesStreamEvent): string[] => {
+            const keys: string[] = [];
+            const itemId = event.item_id || event.item?.id;
+            if (itemId) keys.push(`item:${itemId}`);
+            if (event.output_index !== undefined) {
+              keys.push(`output:${event.output_index}`);
+            }
+            return keys.length ? keys : ["output:unknown"];
+          };
+          const getContentPartKeys = (
             event: ResponsesStreamEvent,
             contentIndex = event.content_index ?? 0,
-          ): string => `${getEventItemKey(event)}:content:${contentIndex}`;
-          const getSummaryPartKey = (
+          ): string[] =>
+            getEventItemKeys(event).map(
+              (key) => `${key}:content:${contentIndex}`,
+            );
+          const getSummaryPartKeys = (
             event: ResponsesStreamEvent,
             summaryIndex = event.summary_index ?? 0,
-          ): string => `${getEventItemKey(event)}:summary:${summaryIndex}`;
+          ): string[] =>
+            getEventItemKeys(event).map(
+              (key) => `${key}:summary:${summaryIndex}`,
+            );
+          const seenAny = (marked: Set<string>, keys: string[]): boolean =>
+            keys.some((key) => marked.has(key));
+          const markAll = (marked: Set<string>, keys: string[]): void =>
+            keys.forEach((key) => marked.add(key));
+          type BufferedSummary = {
+            itemKeys: string[];
+            partKeys: string[];
+            text: string;
+          };
+          const bufferedSummaryByKey = new Map<string, BufferedSummary>();
+          const bufferedSummaries = new Set<BufferedSummary>();
+          const bufferSummary = (
+            event: ResponsesStreamEvent,
+            text: string,
+            replace: boolean,
+          ): void => {
+            if (!text) return;
+            const partKeys = getSummaryPartKeys(event);
+            let buffered = partKeys
+              .map((key) => bufferedSummaryByKey.get(key))
+              .find((entry): entry is BufferedSummary => !!entry);
+            if (!buffered) {
+              buffered = {
+                itemKeys: getEventItemKeys(event),
+                partKeys,
+                text: "",
+              };
+              bufferedSummaries.add(buffered);
+            }
+            buffered.text = replace ? text : buffered.text + text;
+            for (const key of partKeys) bufferedSummaryByKey.set(key, buffered);
+          };
+          const discardBufferedSummary = (buffered: BufferedSummary): void => {
+            bufferedSummaries.delete(buffered);
+            for (const key of buffered.partKeys) {
+              if (bufferedSummaryByKey.get(key) === buffered) {
+                bufferedSummaryByKey.delete(key);
+              }
+            }
+          };
+          const discardBufferedSummariesForItem = (itemKeys: string[]): void => {
+            for (const buffered of [...bufferedSummaries]) {
+              if (buffered.itemKeys.some((key) => itemKeys.includes(key))) {
+                discardBufferedSummary(buffered);
+              }
+            }
+          };
+          const flushBufferedSummariesForItem = (
+            event: ResponsesStreamEvent,
+          ): void => {
+            const itemKeys = getEventItemKeys(event);
+            if (seenAny(reasoningTextItems, itemKeys)) {
+              discardBufferedSummariesForItem(itemKeys);
+              return;
+            }
+            for (const buffered of [...bufferedSummaries]) {
+              if (!buffered.itemKeys.some((key) => itemKeys.includes(key))) {
+                continue;
+              }
+              if (buffered.text) {
+                markAll(reasoningSummaryParts, buffered.partKeys);
+                emitChatDelta(event.item_id || event.item?.id, event.type, {
+                  thinking: { content: buffered.text },
+                });
+              }
+              discardBufferedSummary(buffered);
+            }
+          };
+          const flushAllBufferedSummaries = (): void => {
+            for (const buffered of [...bufferedSummaries]) {
+              if (!seenAny(reasoningTextItems, buffered.itemKeys) && buffered.text) {
+                markAll(reasoningSummaryParts, buffered.partKeys);
+                emitChatDelta(undefined, "reasoning-summary-fallback", {
+                  thinking: { content: buffered.text },
+                });
+              }
+              discardBufferedSummary(buffered);
+            }
+          };
           const getToolCallIndex = (itemId: string): number => {
             if (!toolCallIndexMap.has(itemId)) {
               toolCallIndexMap.set(itemId, nextToolCallIndex++);
@@ -411,7 +565,7 @@ export class OpenAIResponsesTransformer implements Transformer {
           };
           const emitChatDelta = (
             itemId: string | undefined,
-            eventType: string,
+            _eventType: string,
             delta: Record<string, unknown>,
           ) => {
             controller.enqueue(
@@ -423,7 +577,10 @@ export class OpenAIResponsesTransformer implements Transformer {
                   model: streamModel,
                   choices: [
                     {
-                      index: getCurrentIndex(eventType),
+                      // Chat `choices[].index` is the n-best choice index and
+                      // the router always emits a single choice — never reuse
+                      // it as a content-part counter.
+                      index: 0,
                       delta,
                       finish_reason: null,
                     },
@@ -431,6 +588,151 @@ export class OpenAIResponsesTransformer implements Transformer {
                 })}\n\n`,
               ),
             );
+          };
+          const emitResponseItemFallback = (
+            item: ResponsesAPIOutputItem,
+            outputIndex: number | undefined,
+            eventType: string,
+          ): void => {
+            const itemId = item.id || item.call_id || "";
+            const itemEvent: ResponsesStreamEvent = {
+              type: eventType,
+              item_id: item.id,
+              output_index: outputIndex,
+              item: item as ResponsesStreamEvent["item"],
+            };
+
+            if (item.type === "message") {
+              (item.content || []).forEach((part, index) => {
+                const partKeys = getContentPartKeys(itemEvent, index);
+                if (
+                  part.type === "output_text" &&
+                  part.text &&
+                  !seenAny(textDeltaParts, partKeys)
+                ) {
+                  markAll(textDeltaParts, partKeys);
+                  emitChatDelta(itemId, eventType, {
+                    role: "assistant",
+                    content: part.text,
+                  });
+                } else if (part.type === "refusal") {
+                  sawRefusal = true;
+                  if (
+                    part.refusal &&
+                    !seenAny(refusalDeltaParts, partKeys)
+                  ) {
+                    markAll(refusalDeltaParts, partKeys);
+                    emitChatDelta(itemId, eventType, {
+                      role: "assistant",
+                      content: part.refusal,
+                    });
+                  }
+                }
+              });
+              return;
+            }
+
+            if (item.type === "function_call") {
+              if (item.status === "incomplete") {
+                sawIncompleteFunctionCall = true;
+              }
+              if (!functionItemsAdded.has(itemId)) {
+                functionItemsAdded.add(itemId);
+                if (item.arguments) argumentDeltaItems.add(itemId);
+                emitChatDelta(itemId, eventType, {
+                  role: "assistant",
+                  tool_calls: [
+                    {
+                      index: getToolCallIndex(itemId),
+                      id: item.call_id || item.id,
+                      function: {
+                        name: item.name || "",
+                        arguments: item.arguments || "",
+                      },
+                      type: "function",
+                    },
+                  ],
+                });
+              } else if (
+                item.arguments &&
+                !argumentDeltaItems.has(itemId)
+              ) {
+                argumentDeltaItems.add(itemId);
+                emitChatDelta(itemId, eventType, {
+                  tool_calls: [
+                    {
+                      index: getToolCallIndex(itemId),
+                      function: { arguments: item.arguments },
+                    },
+                  ],
+                });
+              }
+              return;
+            }
+
+            if (item.type === "reasoning") {
+              const itemKeys = getEventItemKeys(itemEvent);
+              const reasoningParts = (item.content || [])
+                .map((part, index) => ({ part, index }))
+                .filter(({ part }) => part.type === "reasoning_text");
+              if (reasoningParts.length > 0) {
+                markAll(reasoningTextItems, itemKeys);
+                discardBufferedSummariesForItem(itemKeys);
+                for (const { part, index } of reasoningParts) {
+                  const partKeys = getContentPartKeys(itemEvent, index);
+                  if (
+                    part.text &&
+                    !seenAny(reasoningTextParts, partKeys)
+                  ) {
+                    markAll(reasoningTextParts, partKeys);
+                    emitChatDelta(itemId, eventType, {
+                      thinking: { content: part.text },
+                    });
+                  }
+                }
+              } else if (item.summary?.length) {
+                item.summary.forEach((part, index) => {
+                  const partKeys = getSummaryPartKeys(itemEvent, index);
+                  if (
+                    part.text &&
+                    !seenAny(reasoningSummaryParts, partKeys)
+                  ) {
+                    markAll(reasoningSummaryParts, partKeys);
+                    emitChatDelta(itemId, eventType, {
+                      thinking: { content: part.text },
+                    });
+                  }
+                });
+                discardBufferedSummariesForItem(itemKeys);
+              } else {
+                flushBufferedSummariesForItem(itemEvent);
+              }
+
+              if (!seenAny(reasoningSignatureItems, itemKeys)) {
+                const signature = encodeReasoningSignature({
+                  ...item,
+                  id: item.id || itemId,
+                });
+                if (signature) {
+                  markAll(reasoningSignatureItems, itemKeys);
+                  emitChatDelta(itemId, eventType, {
+                    thinking: { signature },
+                  });
+                }
+              }
+              return;
+            }
+
+            if (item.type === "image_generation_call") {
+              const itemKeys = getEventItemKeys(itemEvent);
+              if (!seenAny(imageGenerationItems, itemKeys)) {
+                markAll(imageGenerationItems, itemKeys);
+                emitChatDelta(itemId, eventType, {
+                  role: "assistant",
+                  content: "[generated image omitted]",
+                });
+              }
+            }
           };
           const emitFatalStreamError = (
             message: string,
@@ -471,6 +773,10 @@ export class OpenAIResponsesTransformer implements Transformer {
 
               for (const event of events) {
                 const dataStr = event.data.trim();
+                if (!dataStr) {
+                  // Empty data fields are legal SSE keepalives, not corruption.
+                  continue;
+                }
                 try {
                   if (dataStr === "[DONE]") {
                     isStreamEnded = true;
@@ -504,7 +810,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                         const textDelta =
                           typeof data.delta === "string" ? data.delta : "";
                         if (!textDelta) continue;
-                        textDeltaParts.add(getContentPartKey(data));
+                        markAll(textDeltaParts, getContentPartKeys(data));
                         // 将output_text.delta转换为chat格式
                         const chatChunk = {
                           id: data.item_id || "chatcmpl-" + Date.now(),
@@ -513,7 +819,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                           model: streamModel,
                           choices: [
                             {
-                              index: getCurrentIndex(data.type),
+                              index: 0,
                               delta: {
                                 content: textDelta,
                               },
@@ -531,6 +837,9 @@ export class OpenAIResponsesTransformer implements Transformer {
                         data.type === "response.output_item.added" &&
                         data.item?.type === "function_call"
                       ) {
+                        if (data.item.status === "incomplete") {
+                          sawIncompleteFunctionCall = true;
+                        }
                         if (data.item?.id) {
                           functionItemsAdded.add(data.item.id);
                         }
@@ -545,7 +854,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                           model: streamModel,
                           choices: [
                             {
-                              index: getCurrentIndex(data.type),
+                              index: 0,
                               delta: {
                                 role: "assistant",
                                 tool_calls: [
@@ -591,15 +900,20 @@ export class OpenAIResponsesTransformer implements Transformer {
                             item_id: data.item?.id || data.item_id,
                           };
                           if (part.type === "output_text" && part.text) {
-                            textDeltaParts.add(
-                              getContentPartKey(partEvent, index),
+                            markAll(
+                              textDeltaParts,
+                              getContentPartKeys(partEvent, index),
                             );
                             initialContent.push(part.text);
-                          } else if (part.type === "refusal" && part.refusal) {
-                            refusalDeltaParts.add(
-                              getContentPartKey(partEvent, index),
-                            );
-                            initialContent.push(part.refusal);
+                          } else if (part.type === "refusal") {
+                            sawRefusal = true;
+                            if (part.refusal) {
+                              markAll(
+                                refusalDeltaParts,
+                                getContentPartKeys(partEvent, index),
+                              );
+                              initialContent.push(part.refusal);
+                            }
                           }
                         });
                         if (initialContent.length > 0) {
@@ -611,9 +925,9 @@ export class OpenAIResponsesTransformer implements Transformer {
                       } else if (
                         data.type === "response.output_text.done" &&
                         data.text &&
-                        !textDeltaParts.has(getContentPartKey(data))
+                        !seenAny(textDeltaParts, getContentPartKeys(data))
                       ) {
-                        textDeltaParts.add(getContentPartKey(data));
+                        markAll(textDeltaParts, getContentPartKeys(data));
                         emitChatDelta(data.item_id, data.type, {
                           content: data.text,
                         });
@@ -622,21 +936,29 @@ export class OpenAIResponsesTransformer implements Transformer {
                       ) {
                         const refusalDelta =
                           typeof data.delta === "string" ? data.delta : "";
+                        sawRefusal = true;
                         if (refusalDelta) {
-                          refusalDeltaParts.add(getContentPartKey(data));
+                          markAll(refusalDeltaParts, getContentPartKeys(data));
                           emitChatDelta(data.item_id, data.type, {
                             content: refusalDelta,
                           });
                         }
                       } else if (
-                        data.type === "response.refusal.done" &&
-                        data.refusal &&
-                        !refusalDeltaParts.has(getContentPartKey(data))
+                        data.type === "response.refusal.done"
                       ) {
-                        refusalDeltaParts.add(getContentPartKey(data));
-                        emitChatDelta(data.item_id, data.type, {
-                          content: data.refusal,
-                        });
+                        sawRefusal = true;
+                        if (
+                          data.refusal &&
+                          !seenAny(
+                            refusalDeltaParts,
+                            getContentPartKeys(data),
+                          )
+                        ) {
+                          markAll(refusalDeltaParts, getContentPartKeys(data));
+                          emitChatDelta(data.item_id, data.type, {
+                            content: data.refusal,
+                          });
+                        }
                       } else if (
                         data.type === "response.output_text.annotation.added"
                       ) {
@@ -647,7 +969,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                           model: streamModel,
                           choices: [
                             {
-                              index: getCurrentIndex(data.type),
+                              index: 0,
                               delta: {
                                 annotations: [
                                   {
@@ -689,7 +1011,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                           model: streamModel,
                           choices: [
                             {
-                              index: getCurrentIndex(data.type),
+                              index: 0,
                               delta: {
                                 tool_calls: [
                                   {
@@ -730,15 +1052,47 @@ export class OpenAIResponsesTransformer implements Transformer {
                         data.type === "response.completed" ||
                         data.type === "response.incomplete"
                       ) {
-                        const finishReason = data.response?.output?.some(
-                          (item: any) => item.type === "function_call"
-                        )
-                          ? "tool_calls"
-                          : data.type === "response.incomplete"
-                            ? data.response?.incomplete_details?.reason ===
-                              "content_filter"
-                              ? "content_filter"
-                              : "length"
+                        // The terminal event contains a complete Response. Use it
+                        // as a deduplicated fallback for compatible endpoints
+                        // that omit some/all output_item and delta events.
+                        (data.response?.output || []).forEach((item, index) => {
+                          emitResponseItemFallback(item, index, data.type);
+                        });
+                        flushAllBufferedSummaries();
+                        const terminalHasRefusal =
+                          sawRefusal ||
+                          data.response?.output?.some(
+                            (item) =>
+                              item.type === "message" &&
+                              item.content?.some(
+                                (part) => part.type === "refusal",
+                              ),
+                          );
+                        const terminalIsIncomplete =
+                          data.type === "response.incomplete" ||
+                          data.response?.status === "incomplete" ||
+                          sawIncompleteFunctionCall ||
+                          data.response?.output?.some(
+                            (item) =>
+                              item.type === "function_call" &&
+                              item.status === "incomplete",
+                          );
+                        const terminalIsRefusal =
+                          terminalHasRefusal ||
+                          (terminalIsIncomplete &&
+                            data.response?.incomplete_details?.reason ===
+                              "content_filter");
+                        // Partial call bytes remain in the emitted tool-call
+                        // block for fidelity, but an incomplete response/item
+                        // must never advertise an executable tool terminal.
+                        const finishReason = terminalIsRefusal
+                          ? "content_filter"
+                          : terminalIsIncomplete
+                            ? "length"
+                            : data.response?.output?.some(
+                                (item) => item.type === "function_call",
+                              )
+                            ? "tool_calls"
                             : "stop";
                         const cachedTokens =
                           data.response?.usage?.input_tokens_details
@@ -814,27 +1168,27 @@ export class OpenAIResponsesTransformer implements Transformer {
                         const summaryDelta =
                           typeof data.delta === "string" ? data.delta : "";
                         if (summaryDelta) {
-                          reasoningSummaryParts.add(getSummaryPartKey(data));
-                          emitChatDelta(data.item_id, data.type, {
-                            thinking: { content: summaryDelta },
-                          });
+                          // Buffer summaries until the reasoning item closes.
+                          // If reasoning_text also exists, non-streaming prefers
+                          // it and streaming must not concatenate both channels.
+                          bufferSummary(data, summaryDelta, false);
                         }
                       } else if (
                         data.type === "response.reasoning_summary_text.done" &&
-                        data.text &&
-                        !reasoningSummaryParts.has(getSummaryPartKey(data))
+                        data.text
                       ) {
-                        reasoningSummaryParts.add(getSummaryPartKey(data));
-                        emitChatDelta(data.item_id, data.type, {
-                          thinking: { content: data.text },
-                        });
+                        bufferSummary(data, data.text, true);
                       } else if (
                         data.type === "response.reasoning_text.delta"
                       ) {
                         const reasoningDelta =
                           typeof data.delta === "string" ? data.delta : "";
                         if (reasoningDelta) {
-                          reasoningTextParts.add(getContentPartKey(data));
+                          markAll(reasoningTextItems, getEventItemKeys(data));
+                          discardBufferedSummariesForItem(
+                            getEventItemKeys(data),
+                          );
+                          markAll(reasoningTextParts, getContentPartKeys(data));
                           emitChatDelta(data.item_id, data.type, {
                             thinking: { content: reasoningDelta },
                           });
@@ -842,137 +1196,26 @@ export class OpenAIResponsesTransformer implements Transformer {
                       } else if (
                         data.type === "response.reasoning_text.done" &&
                         data.text &&
-                        !reasoningTextParts.has(getContentPartKey(data))
+                        !seenAny(reasoningTextParts, getContentPartKeys(data))
                       ) {
-                        reasoningTextParts.add(getContentPartKey(data));
+                        markAll(reasoningTextItems, getEventItemKeys(data));
+                        discardBufferedSummariesForItem(getEventItemKeys(data));
+                        markAll(reasoningTextParts, getContentPartKeys(data));
                         emitChatDelta(data.item_id, data.type, {
                           thinking: { content: data.text },
                         });
                       } else if (
                         data.type === "response.output_item.done" &&
-                        data.item?.type === "message"
+                        data.item
                       ) {
-                        const itemId = data.item.id || data.item_id || "";
-                        (data.item.content || []).forEach((part, index) => {
-                          const partEvent = {
-                            ...data,
-                            item_id: itemId,
-                          };
-                          const partKey = getContentPartKey(partEvent, index);
-                          if (
-                            part.type === "output_text" &&
-                            part.text &&
-                            !textDeltaParts.has(partKey)
-                          ) {
-                            textDeltaParts.add(partKey);
-                            emitChatDelta(itemId, data.type, {
-                              role: "assistant",
-                              content: part.text,
-                            });
-                          } else if (
-                            part.type === "refusal" &&
-                            part.refusal &&
-                            !refusalDeltaParts.has(partKey)
-                          ) {
-                            refusalDeltaParts.add(partKey);
-                            emitChatDelta(itemId, data.type, {
-                              role: "assistant",
-                              content: part.refusal,
-                            });
-                          }
-                        });
-                      } else if (
-                        data.type === "response.output_item.done" &&
-                        data.item?.type === "function_call"
-                      ) {
-                        const itemId = data.item.id || data.item_id || "";
-                        if (!functionItemsAdded.has(itemId)) {
-                          functionItemsAdded.add(itemId);
-                          if (data.item.arguments) {
-                            argumentDeltaItems.add(itemId);
-                          }
-                          emitChatDelta(itemId, data.type, {
-                            role: "assistant",
-                            tool_calls: [
-                              {
-                                index: getToolCallIndex(itemId),
-                                id: data.item.call_id || data.item.id,
-                                function: {
-                                  name: data.item.name || "",
-                                  arguments: data.item.arguments || "",
-                                },
-                                type: "function",
-                              },
-                            ],
-                          });
-                        } else if (
-                          data.item.arguments &&
-                          !argumentDeltaItems.has(itemId)
-                        ) {
-                          argumentDeltaItems.add(itemId);
-                          emitChatDelta(itemId, data.type, {
-                            tool_calls: [
-                              {
-                                index: getToolCallIndex(itemId),
-                                function: {
-                                  arguments: data.item.arguments,
-                                },
-                              },
-                            ],
-                          });
-                        }
-                      } else if (
-                        data.type === "response.output_item.done" &&
-                        data.item?.type === "reasoning"
-                      ) {
-                        const itemId = data.item.id || data.item_id || "";
-                        const reasoningParts = (data.item.content || [])
-                          .map((part, index) => ({ part, index }))
-                          .filter(({ part }) => part.type === "reasoning_text");
-                        if (reasoningParts.length > 0) {
-                          reasoningParts.forEach(({ part, index }) => {
-                            const partEvent = {
-                              ...data,
-                              item_id: itemId,
-                            };
-                            const partKey = getContentPartKey(partEvent, index);
-                            if (
-                              part.text &&
-                              !reasoningTextParts.has(partKey)
-                            ) {
-                              reasoningTextParts.add(partKey);
-                              emitChatDelta(itemId, data.type, {
-                                thinking: { content: part.text },
-                              });
-                            }
-                          });
-                        } else {
-                          (data.item.summary || []).forEach((part, index) => {
-                            const partEvent = {
-                              ...data,
-                              item_id: itemId,
-                            };
-                            const partKey = getSummaryPartKey(partEvent, index);
-                            if (
-                              part.text &&
-                              !reasoningSummaryParts.has(partKey)
-                            ) {
-                              reasoningSummaryParts.add(partKey);
-                              emitChatDelta(itemId, data.type, {
-                                thinking: { content: part.text },
-                              });
-                            }
-                          });
-                        }
-                        const signature = encodeReasoningSignature(
-                          data.item.id || data.item_id,
-                          data.item.encrypted_content,
+                        emitResponseItemFallback(
+                          {
+                            ...(data.item as ResponsesAPIOutputItem),
+                            id: data.item.id || data.item_id,
+                          },
+                          data.output_index,
+                          data.type,
                         );
-                        if (signature) {
-                          emitChatDelta(itemId, data.type, {
-                            thinking: { signature },
-                          });
-                        }
                       }
                     if (stopReading) break;
                   } catch (error) {
@@ -1008,20 +1251,44 @@ export class OpenAIResponsesTransformer implements Transformer {
             }
 
             // 确保流结束时发送结束标记
-            if (!isStreamEnded) {
+            if (!isStreamEnded && !downstreamCancelled) {
               const doneChunk = `data: [DONE]\n\n`;
               controller.enqueue(encoder.encode(doneChunk));
             }
           } catch (error) {
+            if (downstreamCancelled) return;
             transformer.logger?.error({ err: error }, "Stream error");
             controller.error(error);
           } finally {
+            activeReader = null;
             try {
               reader.releaseLock();
             } catch (e) {
               transformer.logger?.error({ err: e }, "Error releasing reader lock");
             }
-            controller.close();
+            if (!downstreamCancelled) {
+              try {
+                controller.close();
+              } catch (e) {
+                transformer.logger?.error(
+                  { err: e },
+                  "Error closing Responses downstream stream",
+                );
+              }
+            }
+          }
+        },
+        async cancel(reason) {
+          downstreamCancelled = true;
+          const reader = activeReader;
+          if (!reader) return;
+          try {
+            await reader.cancel(reason);
+          } catch (error) {
+            transformer.logger?.error(
+              { err: error },
+              "Responses upstream stream cancel failed",
+            );
           }
         },
       });
@@ -1041,17 +1308,20 @@ export class OpenAIResponsesTransformer implements Transformer {
     return response;
   }
 
-  private normalizeRequestContent(content: any, role: string | undefined) {
+  private normalizeRequestContent(content: any) {
     if (content.type === "text") {
       return {
-        type: role === "assistant" ? "output_text" : "input_text",
+        // This object is emitted as an EasyInputMessage even for historical
+        // assistant turns. `output_text` belongs only to a full
+        // ResponseOutputMessage carrying id/status/type metadata.
+        type: "input_text",
         text: content.text,
       };
     }
 
     if (content.type === "image_url") {
       const imagePayload: Record<string, unknown> = {
-        type: role === "assistant" ? "output_image" : "input_image",
+        type: "input_image",
       };
 
       if (typeof content.image_url?.url === "string") {
@@ -1059,6 +1329,21 @@ export class OpenAIResponsesTransformer implements Transformer {
       }
 
       return imagePayload;
+    }
+
+    if (content.type === "file" && content.file) {
+      const filePayload: Record<string, unknown> = { type: "input_file" };
+      for (const key of [
+        "file_data",
+        "file_id",
+        "file_url",
+        "filename",
+      ] as const) {
+        if (typeof content.file[key] === "string") {
+          filePayload[key] = content.file[key];
+        }
+      }
+      return filePayload;
     }
 
     return null;
@@ -1071,8 +1356,8 @@ export class OpenAIResponsesTransformer implements Transformer {
     const functionCallOutputs = responseData.output?.filter(
       (item) => item.type === "function_call",
     );
-    const reasoningOutputs = responseData.output?.filter(
-      (item) => item.type === "reasoning",
+    const imageGenerationOutputs = responseData.output?.filter(
+      (item) => item.type === "image_generation_call",
     );
     const annotations = messageOutputs
       .flatMap((message) => message.content || [])
@@ -1092,41 +1377,65 @@ export class OpenAIResponsesTransformer implements Transformer {
     let toolCalls: any = null;
     let thinking: any = null;
 
-    const reasoningText = reasoningOutputs
-      .map((item) => {
-        const contentText = (item.content || [])
-          .filter((part) => part.type === "reasoning_text")
-          .map((part) => part.text || "")
-          .join("");
-        if (contentText) return contentText;
-        return (item.summary || [])
-          .map((part) => part.text || "")
-          .join("");
-      })
-      .filter(Boolean)
-      .join("\n");
-    const encryptedContent = reasoningOutputs.find(
-      (item) => item.encrypted_content,
-    )?.encrypted_content;
-    const reasoningItem = reasoningOutputs.find(
-      (item) => item.encrypted_content,
-    );
-    if (reasoningText || encryptedContent) {
+    // One thinking block per reasoning item — each keeps its own id +
+    // replay envelope, paired only with a directly following function_call.
+    // Any intervening visible/unknown output flushes the reasoning as unpaired;
+    // otherwise reasoning -> message -> function_call would be reordered into
+    // message -> reasoning -> function_call by the unified Chat shape.
+    // Collapsing items into one block loses every id after the first.
+    const reasoningItemText = (item: ResponsesAPIOutputItem): string => {
+      const contentText = (item.content || [])
+        .filter((part) => part.type === "reasoning_text")
+        .map((part) => part.text || "")
+        .join("");
+      if (contentText) return contentText;
+      return (item.summary || []).map((part) => part.text || "").join("");
+    };
+    const thinkingBlocks: Array<{
+      content: string;
+      signature?: string;
+      tool_call_id?: string;
+    }> = [];
+    {
+      let pendingThinking: typeof thinkingBlocks = [];
+      for (const item of responseData.output || []) {
+        if (item.type === "reasoning") {
+          const text = reasoningItemText(item);
+          const signature = encodeReasoningSignature(item);
+          if (text || signature) {
+            pendingThinking.push({ content: text, signature });
+          }
+        } else if (item.type === "function_call") {
+          const pairedCallId = item.call_id || item.id;
+          if (pairedCallId) {
+            for (const block of pendingThinking) {
+              block.tool_call_id = pairedCallId;
+            }
+          }
+          thinkingBlocks.push(...pendingThinking);
+          pendingThinking = [];
+        } else {
+          thinkingBlocks.push(...pendingThinking);
+          pendingThinking = [];
+        }
+      }
+      thinkingBlocks.push(...pendingThinking);
+    }
+    if (thinkingBlocks.length) {
       thinking = {
-        content: reasoningText,
-        signature: encodeReasoningSignature(
-          reasoningItem?.id,
-          encryptedContent,
-        ),
+        content: thinkingBlocks[0].content,
+        signature: thinkingBlocks[0].signature,
       };
     }
 
+    const contentParts: MessageContent[] = [];
+    let hasRefusal = false;
     if (messageOutputs.length > 0) {
-      const contentParts: MessageContent[] = [];
       messageOutputs.flatMap((message) => message.content || []).forEach((item: any) => {
         if (item.type === "output_text") {
           contentParts.push({ type: "text", text: item.text || "" });
         } else if (item.type === "refusal") {
+          hasRefusal = true;
           contentParts.push({ type: "text", text: item.refusal || "" });
         } else if (item.type === "output_image") {
           const imageContent = this.buildImageContent({
@@ -1143,6 +1452,15 @@ export class OpenAIResponsesTransformer implements Transformer {
         }
       });
 
+    }
+    // The formal image-generation output is an output item, not a message
+    // content part. Anthropic has no equivalent response block; emit a bounded
+    // placeholder rather than returning a successful-looking empty message or
+    // inlining a potentially multi-megabyte base64 result.
+    for (const _image of imageGenerationOutputs) {
+      contentParts.push({ type: "text", text: "[generated image omitted]" });
+    }
+    if (contentParts.length > 0) {
       if (contentParts.some((part) => part.type === "image_url")) {
         messageContent = contentParts;
       } else {
@@ -1166,6 +1484,14 @@ export class OpenAIResponsesTransformer implements Transformer {
     }
 
     const incompleteReason = responseData.incomplete_details?.reason;
+    const hasIncompleteFunctionCall = functionCallOutputs.some(
+      (item) => item.status === "incomplete",
+    );
+    const responseIsIncomplete =
+      responseData.status === "incomplete" || hasIncompleteFunctionCall;
+    const responseIsRefusal =
+      hasRefusal ||
+      (responseIsIncomplete && incompleteReason === "content_filter");
     const chatResponse = {
       id: responseData.id || "chatcmpl-" + Date.now(),
       object: "chat.completion",
@@ -1179,16 +1505,21 @@ export class OpenAIResponsesTransformer implements Transformer {
             content: messageContent || null,
             tool_calls: toolCalls,
             thinking: thinking,
+            thinking_blocks: thinkingBlocks.length
+              ? thinkingBlocks
+              : undefined,
             annotations: annotations.length > 0 ? annotations : undefined,
           },
           logprobs: null,
-          finish_reason: toolCalls
-            ? "tool_calls"
-            : responseData.status === "incomplete"
-              ? incompleteReason === "content_filter"
-                ? "content_filter"
-                : "length"
-              : "stop",
+          // Keep partial call bytes for fidelity, but length/refusal is the
+          // execution boundary: an incomplete call must not become tool_use.
+          finish_reason: responseIsRefusal
+            ? "content_filter"
+            : responseIsIncomplete
+              ? "length"
+              : toolCalls
+                ? "tool_calls"
+                : "stop",
         },
       ],
       usage: responseData.usage

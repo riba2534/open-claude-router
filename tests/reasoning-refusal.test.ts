@@ -154,7 +154,7 @@ test("Responses reasoning_text done-only event is preserved once", async () => {
   );
 });
 
-test("Responses reasoning and summary dedupe is scoped to each formal part index", async () => {
+test("Responses raw reasoning takes precedence over summary for the same item", async () => {
   const events = await responsesStreamToAnthropic(
     sse([
       {
@@ -200,7 +200,7 @@ test("Responses reasoning and summary dedupe is scoped to each formal part index
     events
       .filter((event) => event.delta?.type === "thinking_delta")
       .map((event) => event.delta.thinking),
-    ["A", "B", "C", "D"],
+    ["A", "B"],
   );
 });
 
@@ -310,9 +310,10 @@ test("Chat streaming refusal is preserved as assistant text", async () => {
     events.find((event) => event.delta?.type === "text_delta")?.delta.text,
     "I cannot help.",
   );
+  // content_filter maps to Anthropic's semantically exact `refusal`.
   assert.equal(
     events.find((event) => event.type === "message_delta")?.delta.stop_reason,
-    "end_turn",
+    "refusal",
   );
 });
 
@@ -344,7 +345,7 @@ test("Chat non-stream refusal is preserved as assistant text", async () => {
   const body: any = await converted.json();
 
   assert.deepEqual(body.content, [{ type: "text", text: "I cannot help." }]);
-  assert.equal(body.stop_reason, "end_turn");
+  assert.equal(body.stop_reason, "refusal");
 });
 
 test("empty Responses deltas do not suppress complete done values", async () => {

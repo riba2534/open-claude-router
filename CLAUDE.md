@@ -10,11 +10,14 @@ open-claude-router 是一个**无状态**的 Anthropic Messages API ↔ OpenAI �
 
 - `npm run dev` — tsx watch 启动，默认监听 `:3457`
 - `npm run typecheck` — `tsc --noEmit`，改动后必跑
+- `npm test` — Node test runner 自动化回归套件
+- `npm run test:stream` — 流式集成/回归测试
+- `npm run test:live` — 使用 `OCR_LIVE_*` 环境变量运行真实 Chat / Responses 上游矩阵
 - `npm run build` — esbuild 打包成 `dist/server.js` 单文件
 - `npm start` — 跑 build 产物
 - `docker buildx build --platform linux/amd64,linux/arm64 -t riba2534/open-claude-router:latest --push .` — 推 Dockerhub（多架构）
 
-**项目目前没有自动化测试套件**。验证靠 curl 模拟 Claude Code 请求或开新 terminal 跑 alias 联调；README 的"快速开始"段给出完整步骤。
+完整验收先执行 `npm ci`，再执行 `npm run typecheck && npm test && npm run test:stream && npm run build`。协议转换改动必须补对应 fixture；需要真实上游 canary 时使用 `scripts/verify-live-upstream.ts`，不得把 endpoint、模型名或凭证写进仓库。
 
 ## 高层架构
 
@@ -37,8 +40,8 @@ open-claude-router 是一个**无状态**的 Anthropic Messages API ↔ OpenAI �
 
 | Transformer | 文件 | 方向 | 何时介入 |
 |---|---|---|---|
-| `AnthropicTransformer` | `src/transformers/anthropic.ts`（~1100 行） | 客户端方向：Anthropic ↔ unified（unified 形态等同 OpenAI Chat Completions） | **永远介入** |
-| `OpenAIResponsesTransformer` | `src/transformers/responses.ts`（~840 行） | 上游方向：unified ↔ OpenAI Responses 协议 | 仅当 `X-Upstream-Format: responses` |
+| `AnthropicTransformer` | `src/transformers/anthropic.ts` | 客户端方向：Anthropic ↔ unified（unified 形态接近 OpenAI Chat Completions，并含内部保真 envelope） | **永远介入** |
+| `OpenAIResponsesTransformer` | `src/transformers/responses.ts` | 上游方向：unified ↔ OpenAI Responses 协议 | 仅当 `X-Upstream-Format: responses` |
 
 请求处理流水线（`forwardMessages`）：
 
@@ -46,21 +49,27 @@ open-claude-router 是一个**无状态**的 Anthropic Messages API ↔ OpenAI �
 client body (Anthropic Messages)
   ↓ anthropic.transformRequestOut
 unified  (request.thinking → result.reasoning；保留 cache_control；
+           document → 内部 file envelope；tool_result 保留 typed 多 block；
            每条 assistant 的 signed thinking 块 → message.thinking)
   ↓ 应用上游模型覆盖  (路由层已用 resolveUpstreamModel 按 X-Upstream-Model-Map /
                        X-Upstream-Model 算出 upstream.model，此处写入 unified.model)
-  ↓ scrubAnthropicOnlyFields  (always: 递归剥 cache_control)
+  ↓ scrubAnthropicOnlyFields  (always: 只剥 protocol wrapper 位置的 cache_control，
+                               不递归破坏用户 JSON Schema 同名字段)
   ↓ 分支:
       format=responses:
-        scrubResponsesReasoningArtifacts  (剥每条 message 的 thinking /
-                                            reasoning_content，防泄漏进 input)
+        scrubResponsesReasoningArtifacts  (剥 Chat 专用 reasoning_content；
+                                            signed thinking 由 Responses transformer 消费)
         → responses.transformRequestIn    (消费 unified.reasoning 转成
-                                            Responses reasoning:{effort,summary})
+                                            Responses reasoning:{effort,summary}；
+                                            file → input_file；tool output 保留 typed 数组)
       format=chat-completions (默认):
         convertThinkingToReasoningContent  (assistant thinking → reasoning_content；
                                             reasoning 启用时给带 tool_calls 的消息
                                             兜底补 reasoning_content，满足 DeepSeek
                                             类上游"thinking 启用必带 reasoning_content")
+        → normalizeMultimodalToolResultsForChatCompletions
+                                           (tool image/file → user sidecar；
+                                            file_data/file_id 保留，URL-only file 转文本)
         → scrubChatCompletionsIncompatibleFields  (剥顶层 reasoning)
         → [若流式] 注入 stream_options:{include_usage:true}
 upstream-shaped body
@@ -70,7 +79,10 @@ upstream response
   ↓ [if format=responses] responses.transformResponseOut
 unified-shaped response
   ↓ anthropic.transformResponseIn  (含上游 reasoning_content → Anthropic
-                                    thinking 块归一化；流式路径额外合成 signature 封口)
+                                    thinking 块归一化；流式路径额外合成 signature 封口；
+                                    incomplete tool call 不产生 tool_use 成功终态)
+  ↓ src/utils/anthropic-sse.ts  (客户端 stream 标志决定最终 SSE / JSON 形态；
+                                 JSON↔SSE 转换保留 stop_reason/stop_details/usage)
 client SSE / JSON
 ```
 
@@ -100,7 +112,18 @@ Claude Code 客户端会带 `anthropic-version`、`anthropic-beta`、`x-stainles
 
 ### transformer 的 logger 必须赋值
 
-`anthropic.ts` 内仍有多处裸 `this.logger.debug(...)`（无可选链），未赋值会 runtime crash；`responses.ts` 已统一改为可选链 `this.logger?.`，不再有此风险。`routes/messages.ts` 的 `registerMessagesRoute` 实例化两个 transformer 后都统一赋值 `transformer.logger = fastify.log`，改动时务必保持（重新 vendor `anthropic.ts` 后尤其要确认 logger 仍被赋值）。
+两个 transformer 当前都使用 `this.logger?.` 防御性可选调用，不赋值不会 runtime crash。`routes/messages.ts` 的 `registerMessagesRoute` 仍必须在实例化后统一赋值 `transformer.logger = fastify.log`，保证转换异常和调试信息可观测；重新 vendor 后同时检查可选链与赋值。
+
+### 协议保真不变量
+
+- Router 只做协议转换，不按工具名、业务场景或模型名猜测视觉/推理/工具能力。
+- Anthropic document 的 base64/text source 进入内部 `file_data`，file source 进入 `file_id`，URL source 进入 `file_url`；Responses 统一发 `input_file`。Chat 只正式发送 `file_data`/`file_id`，URL-only 与无法表示的 content source 使用有界文本 fallback。
+- `tool_result.content` 数组必须逐 block 保留。Responses 的 `function_call_output.output` 可为 string 或 `input_text`/`input_image`/`input_file` 数组；Chat 的 tool message 保持 text-only，多模态内容移到随后 user sidecar。
+- `thinking.type:"enabled"` 的 `budget_tokens` 必须是有限整数且至少 1024；`adaptive`/`disabled` 不得携带 budget。不要机械校验 `budget_tokens < max_tokens`，Anthropic 的 interleaved thinking + tools 有正式例外。显式 `output_config.effort` 原值映射，Router 不按模型能力 clamp。
+- refusal/content filter 终态为 `stop_reason:"refusal"`，同时携带 `{type:"refusal",category:null,explanation}` 的 `stop_details`；JSON/SSE 和聚合路径必须一致。
+- 已接收的截断 function call 名称/参数字节可以保留，但 response 或任一 function item incomplete 时终态必须是 `max_tokens`，不得宣传为可执行 `tool_use`；refusal 优先级更高。
+- `thinking.display:"omitted"` 只在客户端显式请求时生效：JSON 返回空 `thinking` 并保留上游已有签名，SSE 不发 `thinking_delta` 但仍发 `signature_delta`；Responses 不请求 detailed summary，但必须继续请求 encrypted state 以便历史回放。Chat 上游不提供签名时只能沿用现有兼容占位。不得按模型名猜 display 默认。
+- 客户端取消必须 cancel 当前上游 reader/fetch；未知内容安全、有界降级，不能整体 `JSON.stringify` 后丢失 typed 语义。
 
 ## 改动指引
 
@@ -137,6 +160,10 @@ Claude Code 客户端会带 `anthropic-version`、`anthropic-beta`、`x-stainles
 > | `max_tokens` → `max_output_tokens` 映射、`tool_choice` 扁平化 | `responses.ts` `transformRequestIn` | 直接 `delete max_tokens`（丢失输出长度限制） |
 > | 流式多工具 `getToolCallIndex(item.id)` 索引映射 | `responses.ts` `transformResponseOut` | 写死 `index:0`，只支持单工具 |
 > | 非流式多 `function_call` 收集（`.filter().map()`） | `responses.ts` `transformResponseOut` | `.find()` 只取第一个 |
+> | document/file 与 typed `tool_result` 多 block | `anthropic.ts` + `responses.ts` + `strip.ts` | document/图片被字符串化、丢弃或送入非标准 tool content |
+> | 请求形状与 thinking budget 本地校验 | `anthropic.ts` | malformed 输入可能 500；enabled budget 缺失/过小仍进入上游 |
+> | refusal `stop_details`、stream shape normalization | `anthropic.ts` + `utils/anthropic-sse.ts` | 仅保留文本或响应形态跟随上游而非客户端 |
+> | incomplete function call 终态保护 | `responses.ts` | 部分调用可能被误标为可执行 `tool_use` |
 >
 > 此外，请求侧的 thinking→reasoning_content 转换在 `src/utils/strip.ts`（`convertThinkingToReasoningContent`），不在 transformer 内，重新 vendor 不影响它，但二者协作，改动需一起验证。
 

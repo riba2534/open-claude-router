@@ -6,7 +6,9 @@ import {
   checkServiceAuth,
   checkServiceAuthFromOcrTokenHeader,
   isEmbeddedUpstreamPath,
+  parseEffortMap,
   parseModelMap,
+  resolveMappedEffort,
   parseUpstreamConfig,
   parseUpstreamHeaders,
   parseUpstreamFromEmbeddedPath,
@@ -28,6 +30,11 @@ import {
   callUpstream,
   buildAnthropicErrorFromUpstream,
 } from "../utils/upstream.js";
+import {
+  anthropicMessageToSseText,
+  aggregateAnthropicSseToMessage,
+  guardAnthropicSseStream,
+} from "../utils/anthropic-sse.js";
 import { countAnthropicTokens } from "../utils/tokenizer.js";
 
 interface MessagesBody {
@@ -59,6 +66,28 @@ async function forwardMessages(
   const unified = await anthropicT.transformRequestOut!(body);
   if (upstream.model) {
     unified.model = upstream.model;
+  }
+  // Client-declared effort vocabulary mapping (X-Upstream-Effort-Map). The
+  // router never clamps explicit efforts on its own; this only applies what
+  // the client explicitly configured for its upstream. The reserved target
+  // `off` strips the field.
+  const effortMap = parseEffortMap(req);
+  if (effortMap.size) {
+    const mappedTop = resolveMappedEffort(unified.reasoning_effort, effortMap);
+    if (mappedTop === "off") {
+      delete unified.reasoning_effort;
+    } else if (mappedTop) {
+      (unified as any).reasoning_effort = mappedTop;
+    }
+    const mappedReasoning = resolveMappedEffort(
+      unified.reasoning?.effort,
+      effortMap,
+    );
+    if (mappedReasoning === "off") {
+      delete unified.reasoning!.effort;
+    } else if (mappedReasoning) {
+      (unified.reasoning as any).effort = mappedReasoning;
+    }
   }
   scrubAnthropicOnlyFields(unified as unknown as Record<string, unknown>);
 
@@ -113,7 +142,7 @@ async function forwardMessages(
   // Keep request validation outside the fetch try/catch so bad alias headers
   // return 400 instead of being rewritten as upstream_unreachable/502.
   const upstreamHeaders = parseUpstreamHeaders(req);
-  const signal = buildUpstreamSignal(req);
+  const signal = buildUpstreamSignal(req, reply);
   let upstreamResponse: Response;
   try {
     upstreamResponse = await callUpstream({
@@ -136,12 +165,15 @@ async function forwardMessages(
   }
 
   if (!upstreamResponse.ok) {
+    // Status and retry ownership are known before the body is consumed. Keep
+    // them even if a truncated upstream error body cannot be read.
+    reply.header("x-should-retry", "true");
+    reply.code(upstreamResponse.status);
     const { status, body: errBody } =
       await buildAnthropicErrorFromUpstream(upstreamResponse);
     // Preserve the upstream status/body, but explicitly let Claude Code apply
     // its own bounded retry policy to every upstream HTTP error. The router
     // remains single-attempt and stateless, so retries have exactly one owner.
-    reply.header("x-should-retry", "true");
     reply.code(status);
     return errBody;
   }
@@ -171,13 +203,54 @@ async function forwardMessages(
     reply.header(k, v);
   });
 
-  if (wantsStream) {
+  // The reply shape must follow the CLIENT's `stream` flag. The converted
+  // response's shape follows the upstream's Content-Type, and gateways may
+  // answer a stream:true request with plain JSON (or stream despite
+  // stream:false) — piping the mismatch through verbatim hangs or breaks the
+  // client (SSE headers around a JSON body produce zero parseable events).
+  const finalIsStream = !!finalResponse.headers
+    .get("content-type")
+    ?.includes("text/event-stream");
+
+  if (wantsStream && finalIsStream) {
+    if (!finalResponse.body) {
+      throw createApiError(
+        "upstream stream response body is missing",
+        502,
+        "upstream_stream_error",
+        "api_error",
+      );
+    }
+    const guardedStream = guardAnthropicSseStream(finalResponse.body);
     reply.header("content-type", "text/event-stream");
     reply.header("cache-control", "no-cache");
     reply.header("connection", "keep-alive");
-    return reply.send(finalResponse.body);
+    return reply.send(guardedStream);
   }
-  return await finalResponse.json();
+
+  if (!wantsStream && !finalIsStream) {
+    return await finalResponse.json();
+  }
+
+  if (wantsStream && !finalIsStream) {
+    const payload: any = await finalResponse.json();
+    if (finalResponse.status >= 400 || payload?.type === "error") {
+      // Anthropic clients accept a non-2xx JSON error envelope on a
+      // streaming request; never wrap an error body in SSE framing.
+      reply.header("content-type", "application/json");
+      return payload;
+    }
+    reply.header("content-type", "text/event-stream");
+    reply.header("cache-control", "no-cache");
+    reply.header("connection", "keep-alive");
+    return reply.send(anthropicMessageToSseText(payload));
+  }
+
+  // stream:false but the upstream streamed anyway: aggregate to one message.
+  // Stream-level errors throw a 502 ApiError instead of a fake completion.
+  const aggregated = await aggregateAnthropicSseToMessage(finalResponse);
+  reply.header("content-type", "application/json");
+  return aggregated;
 }
 
 function handleCountTokens(req: FastifyRequest, reply: FastifyReply) {
