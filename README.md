@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-20+-3B82A6?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js" /></a>
+  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-20.18.1+-3B82A6?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js" /></a>
   <a href="https://hub.docker.com/r/riba2534/open-claude-router"><img src="https://img.shields.io/docker/pulls/riba2534/open-claude-router?style=for-the-badge&color=2496ED&logo=docker&logoColor=white" alt="Docker Pulls" /></a>
   <a href="https://github.com/riba2534/open-claude-router/stargazers"><img src="https://img.shields.io/github/stars/riba2534/open-claude-router?style=for-the-badge&color=f5a623" alt="Stars" /></a>
   <a href="https://github.com/riba2534/open-claude-router/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-teal.svg?style=for-the-badge" alt="License" /></a>
@@ -113,6 +113,19 @@ npm run dev
 > ⚠️ `ANTHROPIC_AUTH_TOKEN` 在 path 模式（A/C）里是**上游凭证**，在 header 模式（B）里是**服务自身鉴权 token**——别填反，否则上游 401。
 >
 > **多 header 写法**：`ANTHROPIC_CUSTOM_HEADERS` 以换行分隔多个 header，所以多个 header 必须用 bash/zsh 的 `$'...\n...'`（ANSI-C 引用，让 `\n` 成为真实换行）；只有一个 header 时用普通单引号 `'...'` 即可。非 bash/zsh shell（如 fish）引用语法不同，需自行转换。
+
+若使用 path alias，两套上游协议的最小差异只有下面两处；Claude Code 仍统一请求 Anthropic `/v1/messages`：
+
+```bash
+# Chat Completions：默认格式，不需要 X-Upstream-Format
+ANTHROPIC_BASE_URL=http://localhost:3457/https://upstream.example.com/v1/chat/completions
+
+# Responses：上游 URL 改为 /v1/responses，并显式选择协议
+ANTHROPIC_BASE_URL=http://localhost:3457/https://upstream.example.com/v1/responses
+ANTHROPIC_CUSTOM_HEADERS='X-Upstream-Format: responses'
+```
+
+这不是仅按 curl 推断：发布候选已用 Claude Code 2.1.220 的真实 `claude -p` 测过两种环境变量组合。两边的普通流式对话均成功；两边也都完成了 `Read(PNG) → tool_result(text/image) → 后续回答` 的 3-turn 工具往返。服务日志分别确认请求进入 `format=chat-completions` 和 `format=responses`。
 
 #### 方式 A：URL path 内嵌上游（推荐，复制一个 alias 即可）
 

@@ -220,6 +220,13 @@ go test ./internal/translator/codex/claude \
 - Responses reasoning 历史跨轮回放（每套上游各 1）：一套成功完成签名回放；另一套返回 409 `item not found / different resource`，Router 保留状态与 retry header；直接绕过 Router 的两轮正式 Responses 回放也得到同类 409，因此只对该上游归类为跨资源状态限制并 skip；
 - 两协议无效模型探针（每套上游各 2）分别返回 HTTP 404/502，Anthropic error envelope 和 `X-Should-Retry:true` 均保留。
 
+另外使用本机 Claude Code 2.1.220 直接验证 shell 环境变量接入，而不是绕过客户端调用 Router：
+
+- Chat Completions：embedded-path `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`，普通 `claude -p` 成功；
+- Responses：embedded-path `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_CUSTOM_HEADERS='X-Upstream-Format: responses'`，普通 `claude -p` 成功；
+- 两种格式分别允许 `Read` 读取 PNG，并完整完成 3-turn `tool_use → tool_result(text/image) → assistant` 往返；
+- Router 运行日志分别确认 `format=chat-completions` / `format=responses`，所有模型请求均为 HTTP 200。
+
 报告不记录真实 endpoint、模型名或凭证。使用自有上游复跑：
 
 ```bash
