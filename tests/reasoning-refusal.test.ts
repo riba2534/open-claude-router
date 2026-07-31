@@ -348,7 +348,7 @@ test("Chat non-stream refusal is preserved as assistant text", async () => {
   assert.equal(body.stop_reason, "refusal");
 });
 
-test("empty Responses deltas do not suppress complete done values", async () => {
+test("empty Responses deltas preserve done text but malformed tool metadata fails", async () => {
   const events = await responsesStreamToAnthropic(
     sse([
       {
@@ -403,10 +403,11 @@ test("empty Responses deltas do not suppress complete done values", async () => 
     ["answer", "REFUSED"],
   );
   assert.equal(
-    events.find((event) => event.delta?.type === "input_json_delta")?.delta
-      .partial_json,
-    '{"ok":true}',
+    events.some((event) => event.delta?.type === "input_json_delta"),
+    false,
   );
+  assert.equal(events.some((event) => event.type === "error"), true);
+  assert.equal(events.some((event) => event.type === "message_stop"), false);
 });
 
 test("multi-part message item fallback stays textual and does not duplicate", async () => {
@@ -442,9 +443,10 @@ test("multi-part message item fallback stays textual and does not duplicate", as
   );
 
   assert.deepEqual(
-    events
+    [events
       .filter((event) => event.delta?.type === "text_delta")
-      .map((event) => event.delta.text),
+      .map((event) => event.delta.text)
+      .join("")],
     ["answer refused"],
   );
 });

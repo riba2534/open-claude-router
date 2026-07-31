@@ -84,6 +84,12 @@ export interface UnifiedMessage {
     signature?: string;
     tool_call_id?: string;
   }>;
+  /**
+   * Router-internal, already ordered response blocks. Responses can interleave
+   * reasoning, messages, and function calls, while a Chat Completions message
+   * stores text and tool_calls in separate fields and loses that order.
+   */
+  output_blocks?: Array<Record<string, any>>;
 }
 
 export interface UnifiedTool {
@@ -98,6 +104,16 @@ export interface UnifiedTool {
       additionalProperties?: boolean;
       $schema?: string;
     };
+    strict?: boolean;
+  };
+}
+
+export interface UnifiedResponseFormat {
+  type: "json_schema";
+  json_schema: {
+    name: string;
+    schema: Record<string, unknown>;
+    strict: true;
   };
 }
 
@@ -122,6 +138,7 @@ export interface UnifiedChatRequest {
     | "required"
     | string
     | { type: "function"; function: { name: string } };
+  response_format?: UnifiedResponseFormat;
   reasoning_effort?: AnthropicEffort;
   reasoning?: {
     effort?: ReasoningEffort;

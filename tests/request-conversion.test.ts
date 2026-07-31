@@ -303,6 +303,7 @@ test("Responses treats tool names generically and rejects native signatures", as
         allowed_domains: { type: "array" },
       },
     },
+    strict: false,
   });
 });
 

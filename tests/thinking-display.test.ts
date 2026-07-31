@@ -178,16 +178,15 @@ test("Responses omitted display requests encrypted state without a detailed summ
   assert.deepEqual(summarized.reasoning, { summary: "detailed" });
 });
 
-test("Chat JSON hides thinking only for explicit omitted display", async () => {
-  const hiddenResponse = await anthropicTransformer().transformResponseIn!(
-    chatJson("private chat reasoning"),
-    omittedContext,
+test("Chat JSON rejects omitted reasoning without replayable state", async () => {
+  await assert.rejects(
+    anthropicTransformer().transformResponseIn!(
+      chatJson("private chat reasoning"),
+      omittedContext,
+    ),
+    (error: any) =>
+      error?.statusCode === 502 && error?.code === "upstream_protocol_error",
   );
-  const hidden: any = await hiddenResponse.json();
-  assert.equal(hidden.content[0].type, "thinking");
-  assert.equal(hidden.content[0].thinking, "");
-  assert.equal(typeof hidden.content[0].signature, "string");
-  assert.equal(hidden.content[1].text, "answer");
 
   const visibleResponse = await anthropicTransformer().transformResponseIn!(
     chatJson("visible chat reasoning"),
@@ -216,7 +215,7 @@ test("Responses JSON hides text but preserves its replayable signature", async (
   assert.equal(body.content.find((block: any) => block.type === "text").text, "answer");
 });
 
-test("Chat SSE omitted display emits an empty signed block and no thinking_delta", async () => {
+test("Chat SSE rejects omitted reasoning without replayable state", async () => {
   const upstream = sse([
     {
       id: "chatcmpl-thinking-display",
@@ -253,13 +252,10 @@ test("Chat SSE omitted display emits an empty signed block and no thinking_delta
   const events = parseAnthropicSse(await converted.text());
 
   assert.equal(events.some((event) => event.delta?.type === "thinking_delta"), false);
-  assert.equal(
-    events.find((event) => event.content_block?.type === "thinking")?.content_block
-      .thinking,
-    "",
-  );
-  assert.equal(typeof events.find((event) => event.delta?.type === "signature_delta")?.delta.signature, "string");
-  assert.equal(events.find((event) => event.delta?.type === "text_delta")?.delta.text, "answer");
+  assert.equal(events.some((event) => event.delta?.type === "signature_delta"), false);
+  assert.equal(events.some((event) => event.delta?.type === "text_delta"), false);
+  assert.equal(events.some((event) => event.type === "error"), true);
+  assert.equal(events.some((event) => event.type === "message_stop"), false);
 });
 
 test("Responses SSE omitted display suppresses text and retains encrypted replay state", async () => {

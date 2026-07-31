@@ -483,6 +483,7 @@ test("Responses done-only function arguments are preserved", async () => {
         },
         {
           type: "response.output_item.added",
+          output_index: 0,
           item: {
             id: "fc_1",
             type: "function_call",

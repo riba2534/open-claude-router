@@ -297,8 +297,9 @@ test("non-stream incomplete function calls preserve bytes but stop at max_tokens
 
     const anthropic = await responsesJsonToAnthropic(payload);
     const tool = anthropic.content.find((block: any) => block.type === "tool_use");
-    assert.equal(tool.name, "dangerous_action");
-    assert.deepEqual(tool.input, { text: "{\"target\":" });
+    assert.equal(tool, undefined, "a partial call must not look executable");
+    assert.match(anthropic.content[0].text, /dangerous_action/);
+    assert.match(anthropic.content[0].text, /\{"target":/);
     assert.equal(anthropic.stop_reason, "max_tokens");
   }
 });
@@ -332,12 +333,13 @@ test("stream incomplete function calls never produce a tool_use terminal", async
         event.type === "content_block_start" &&
         event.content_block?.type === "tool_use",
     );
-    assert.equal(toolStart?.content_block.name, "dangerous_action");
-    assert.equal(
-      events.find((event) => event.delta?.type === "input_json_delta")?.delta
-        .partial_json,
-      "{\"target\":",
-    );
+    assert.equal(toolStart, undefined);
+    const diagnostic = events
+      .filter((event) => event.delta?.type === "text_delta")
+      .map((event) => event.delta.text)
+      .join("");
+    assert.match(diagnostic, /dangerous_action/);
+    assert.match(diagnostic, /\{"target":/);
     assert.equal(
       events.find((event) => event.type === "message_delta")?.delta.stop_reason,
       "max_tokens",

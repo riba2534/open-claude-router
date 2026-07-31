@@ -30,6 +30,21 @@ jobs:
           node-version: 20.18.1
           cache: npm
 
+      - name: Validate tag and package version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(node -p 'require("./package.json").version')"
+          semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! "${tag_version}" =~ ${semver_re} ]]; then
+            echo "Release tag must be a SemVer tag (optionally prefixed with v)." >&2
+            exit 1
+          fi
+          if [[ "${tag_version}" != "${package_version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${package_version}." >&2
+            exit 1
+          fi
+
       - name: Install dependencies
         run: npm ci
 
@@ -77,7 +92,6 @@ jobs:
           images: ${{ env.DOCKER_IMAGE }}
           flavor: latest=false
           tags: |
-            type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ steps.release.outputs.stable == 'true' }}
@@ -109,4 +123,37 @@ jobs:
 
       - name: Verify published manifest
         shell: bash
-        run: docker buildx imagetools inspect "${DOCKER_IMAGE}@${{ steps.build.outputs.digest }}"
+        env:
+          EXPECTED_DIGEST: ${{ steps.build.outputs.digest }}
+          PUBLISHED_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          while IFS= read -r image_tag; do
+            [[ -z "${image_tag}" ]] && continue
+            actual_digest="$(docker buildx imagetools inspect "${image_tag}" --format '{{.Manifest.Digest}}')"
+            if [[ "${actual_digest}" != "${EXPECTED_DIGEST}" ]]; then
+              echo "${image_tag} resolved to ${actual_digest}, expected ${EXPECTED_DIGEST}." >&2
+              exit 1
+            fi
+          done <<< "${PUBLISHED_TAGS}"
+
+          RAW_MANIFEST="$(docker buildx imagetools inspect "${DOCKER_IMAGE}@${EXPECTED_DIGEST}" --raw)" node <<'NODE'
+          const manifest = JSON.parse(process.env.RAW_MANIFEST || "{}");
+          const entries = Array.isArray(manifest.manifests) ? manifest.manifests : [];
+          const runnable = new Set(
+            entries
+              .filter((entry) => entry.platform?.os === "linux" && entry.platform?.architecture)
+              .filter((entry) => entry.annotations?.["vnd.docker.reference.type"] !== "attestation-manifest")
+              .map((entry) => `${entry.platform.os}/${entry.platform.architecture}`),
+          );
+          for (const expected of ["linux/amd64", "linux/arm64"]) {
+            if (!runnable.has(expected)) {
+              throw new Error(`published manifest is missing ${expected}`);
+            }
+          }
+          const attestations = entries.filter(
+            (entry) => entry.annotations?.["vnd.docker.reference.type"] === "attestation-manifest",
+          );
+          if (attestations.length < 2) {
+            throw new Error("published manifest is missing per-platform attestations");
+          }
+          NODE

@@ -18,6 +18,13 @@ export function scrubChatCompletionsIncompatibleFields(
   body: Record<string, unknown>,
 ): void {
   delete body.reasoning;
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return;
+  for (const message of messages) {
+    if (message && typeof message === "object") {
+      delete (message as Record<string, unknown>).output_blocks;
+    }
+  }
 }
 
 export function scrubResponsesReasoningArtifacts(

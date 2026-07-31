@@ -113,6 +113,12 @@ export function anthropicMessageToSseText(message: any): string {
           ...(usage.cache_read_input_tokens !== undefined
             ? { cache_read_input_tokens: usage.cache_read_input_tokens }
             : {}),
+          ...(usage.cache_creation_input_tokens !== undefined
+            ? {
+                cache_creation_input_tokens:
+                  usage.cache_creation_input_tokens,
+              }
+            : {}),
         },
       },
     }),
@@ -214,6 +220,12 @@ export function anthropicMessageToSseText(message: any): string {
         ...(usage.cache_read_input_tokens !== undefined
           ? { cache_read_input_tokens: usage.cache_read_input_tokens }
           : {}),
+        ...(usage.cache_creation_input_tokens !== undefined
+          ? {
+              cache_creation_input_tokens:
+                usage.cache_creation_input_tokens,
+            }
+          : {}),
       },
     }),
   );
@@ -262,10 +274,18 @@ export async function aggregateAnthropicSseToMessage(
 
   for (const event of events) {
     if (event.type === "error") {
+      const status =
+        Number.isInteger(event.error?.status) &&
+        event.error.status >= 400 &&
+        event.error.status <= 599
+          ? event.error.status
+          : 502;
       throw createApiError(
         event.error?.message ?? "upstream stream error",
-        502,
-        "upstream_stream_error",
+        status,
+        status !== 502 || event.error?.status === 502
+          ? "upstream_responses_error"
+          : "upstream_stream_error",
         typeof event.error?.type === "string" ? event.error.type : "api_error",
       );
     }
@@ -299,7 +319,7 @@ export async function aggregateAnthropicSseToMessage(
         try {
           block.input = JSON.parse(block.__partial_json || "{}");
         } catch {
-          block.input = { text: block.__partial_json };
+          block.__invalid_partial_json = block.__partial_json;
         }
         delete block.__partial_json;
       }
@@ -334,6 +354,25 @@ export async function aggregateAnthropicSseToMessage(
 
   message.content = [...blocks.entries()]
     .sort(([left], [right]) => left - right)
-    .map(([, block]) => block);
+    .map(([, block]) => {
+      if (typeof block.__invalid_partial_json !== "string") return block;
+      const raw = block.__invalid_partial_json;
+      if (
+        message.stop_reason !== "max_tokens" &&
+        message.stop_reason !== "refusal"
+      ) {
+        throw createApiError(
+          "upstream tool arguments must be a valid JSON object",
+          502,
+          "upstream_protocol_error",
+          "api_error",
+        );
+      }
+      const bounded = raw.length <= 4096 ? raw : `${raw.slice(0, 4096)}…`;
+      return {
+        type: "text",
+        text: `[incomplete tool_use ${block.name || "unknown"}: ${bounded}]`,
+      };
+    });
   return message;
 }

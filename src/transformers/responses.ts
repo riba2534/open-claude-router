@@ -1,6 +1,7 @@
 import { UnifiedChatRequest, MessageContent } from "../types/llm.js";
-import { Transformer } from "../types/transformer.js";
+import { Transformer, TransformerContext } from "../types/transformer.js";
 import { SseBlockDecoder } from "./sse.js";
+import { createApiError } from "./errors.js";
 
 const REASONING_SIGNATURE_PREFIX = "ocr-responses-reasoning-v1:";
 
@@ -16,12 +17,13 @@ function encodeReasoningSignature(
     ResponsesAPIOutputItem,
     "id" | "encrypted_content" | "summary" | "content"
   >,
+  includeVisibleFallback = true,
 ): string | undefined {
   if (!item.id) return undefined;
   const envelope: RouterReasoningEnvelope = { id: item.id };
   if (item.encrypted_content) {
     envelope.encrypted_content = item.encrypted_content;
-  } else {
+  } else if (includeVisibleFallback) {
     // Keep the established encrypted envelope byte-compatible. Some
     // Responses-compatible endpoints omit encrypted_content, however, so in
     // that case retain the visible reasoning fields needed to replay the item
@@ -42,6 +44,15 @@ function encodeReasoningSignature(
     REASONING_SIGNATURE_PREFIX +
     Buffer.from(JSON.stringify(envelope), "utf8").toString("base64url")
   );
+}
+
+function reasoningText(item: ResponsesAPIOutputItem): string {
+  const contentText = (item.content || [])
+    .filter((part) => part.type === "reasoning_text")
+    .map((part) => part.text || "")
+    .join("");
+  if (contentText) return contentText;
+  return (item.summary || []).map((part) => part.text || "").join("");
 }
 
 function decodeReasoningSignature(
@@ -72,7 +83,14 @@ function decodeReasoningSignature(
 }
 
 function mapResponsesErrorType(code: string | undefined): string {
-  if (code === "rate_limit_exceeded") return "rate_limit_error";
+  if (
+    code === "rate_limit_exceeded" ||
+    code === "rate_limit_error" ||
+    code === "quota_exceeded" ||
+    code === "insufficient_quota"
+  ) {
+    return "rate_limit_error";
+  }
   if (
     code === "invalid_prompt" ||
     code?.startsWith("invalid_") ||
@@ -83,6 +101,97 @@ function mapResponsesErrorType(code: string | undefined): string {
     return "invalid_request_error";
   }
   return "api_error";
+}
+
+function mapResponsesErrorStatus(code: string | undefined): number {
+  if (
+    code === "rate_limit_exceeded" ||
+    code === "rate_limit_error" ||
+    code === "quota_exceeded" ||
+    code === "insufficient_quota"
+  ) {
+    return 429;
+  }
+  if (mapResponsesErrorType(code) === "invalid_request_error") return 400;
+  return 500;
+}
+
+function parseResponsesToolArguments(raw: unknown): Record<string, any> {
+  try {
+    const parsed =
+      typeof raw === "string" ? JSON.parse(raw || "{}") : (raw ?? {});
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("tool arguments are not an object");
+    }
+    return parsed as Record<string, any>;
+  } catch {
+    throw createApiError(
+      "upstream Responses function_call arguments must be a valid JSON object",
+      502,
+      "upstream_protocol_error",
+      "api_error",
+    );
+  }
+}
+
+function unsupportedOutputPlaceholder(item: ResponsesAPIOutputItem): string {
+  const type =
+    typeof item?.type === "string" && item.type ? item.type : "unknown";
+  return boundedResponsesFallback(`output item ${type}`, item);
+}
+
+const MAX_RESPONSES_FALLBACK_CHARS = 4096;
+
+function boundedResponsesFallback(kind: string, value: unknown): string {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value) ?? String(value ?? "");
+  } catch {
+    serialized = String(value ?? "");
+  }
+  if (serialized.length > MAX_RESPONSES_FALLBACK_CHARS) {
+    return `[unsupported Responses ${kind} omitted: ${serialized.length} chars]`;
+  }
+  return `[unsupported Responses ${kind}: ${serialized}]`;
+}
+
+function responsesStatusError(payload: any): {
+  status: number;
+  type: string;
+  code?: string;
+  message: string;
+} | null {
+  const status = payload?.status;
+  if (
+    status === undefined ||
+    status === "completed" ||
+    status === "incomplete"
+  ) {
+    return null;
+  }
+  const code = payload?.error?.code;
+  if (status === "failed") {
+    return {
+      status: mapResponsesErrorStatus(code),
+      type: mapResponsesErrorType(code),
+      code,
+      message: payload?.error?.message || "Responses request failed",
+    };
+  }
+  if (status === "cancelled") {
+    return {
+      status: 409,
+      type: "api_error",
+      code: code || "response_cancelled",
+      message: payload?.error?.message || "Responses request was cancelled",
+    };
+  }
+  return {
+    status: 502,
+    type: "api_error",
+    code: code || "invalid_response_status",
+    message: `upstream Responses returned non-terminal status ${JSON.stringify(status)}`,
+  };
 }
 
 interface ResponsesAPIOutputItem {
@@ -98,7 +207,9 @@ interface ResponsesAPIOutputItem {
     image_url?: string;
     mime_type?: string;
     image_base64?: string;
+    b64_json?: string;
     annotations?: Array<{
+      type?: string;
       url?: string;
       title?: string;
       start_index?: number;
@@ -111,6 +222,14 @@ interface ResponsesAPIOutputItem {
   result?: string;
   status?: string;
   role?: string;
+  action?: {
+    type?: string;
+    query?: string;
+    queries?: string[];
+    url?: string;
+    pattern?: string;
+    [key: string]: unknown;
+  };
 }
 
 interface ResponsesAPIPayload {
@@ -125,12 +244,17 @@ interface ResponsesAPIPayload {
     total_tokens: number;
     input_tokens_details?: {
       cached_tokens?: number;
+      cache_write_tokens?: number;
     };
   };
   status?: string;
   incomplete_details?: {
     reason?: string;
   };
+  error?: {
+    code?: string;
+    message?: string;
+  } | null;
 }
 
 interface ResponsesStreamEvent {
@@ -138,6 +262,7 @@ interface ResponsesStreamEvent {
   item_id?: string;
   output_index?: number;
   content_index?: number;
+  annotation_index?: number;
   summary_index?: number;
   delta?:
     | string
@@ -158,12 +283,22 @@ interface ResponsesStreamEvent {
       refusal?: string;
       image_url?: string;
       mime_type?: string;
+      image_base64?: string;
+      b64_json?: string;
+      annotations?: Array<{
+        type?: string;
+        url?: string;
+        title?: string;
+        start_index?: number;
+        end_index?: number;
+      }>;
     }>;
     reasoning?: string; // 添加 reasoning 字段支持
     summary?: Array<{ type?: string; text?: string }>;
     encrypted_content?: string;
     result?: string;
     status?: string;
+    action?: ResponsesAPIOutputItem["action"];
   };
   text?: string;
   refusal?: string;
@@ -183,6 +318,7 @@ interface ResponsesStreamEvent {
       total_tokens?: number;
       input_tokens_details?: {
         cached_tokens?: number;
+        cache_write_tokens?: number;
       };
     };
     error?: {
@@ -197,9 +333,11 @@ interface ResponsesStreamEvent {
     type?: string;
     code?: string;
     message?: string;
+    status?: number;
   };
   reasoning_summary?: string; // 添加推理摘要支持
   annotation?: {
+    type?: string;
     url?: string;
     title?: string;
     start_index?: number;
@@ -258,6 +396,51 @@ export class OpenAIResponsesTransformer implements Transformer {
         } else {
           convertedMessage.content = "";
         }
+      }
+
+      if (
+        message.role === "assistant" &&
+        Array.isArray(message.output_blocks)
+      ) {
+        // Anthropic assistant content is an ordered block stream. Replaying
+        // only the flattened Chat `content` + `tool_calls` fields moves text
+        // ahead of reasoning/tool items. Consume the Router-internal ordered
+        // representation when present so history remains lossless.
+        for (const block of message.output_blocks) {
+          if (block?.type === "thinking") {
+            const replayableReasoning = decodeReasoningSignature(
+              block.signature,
+            );
+            if (!replayableReasoning) continue;
+            input.push({
+              type: "reasoning",
+              id: replayableReasoning.id,
+              ...(replayableReasoning.encrypted_content
+                ? { encrypted_content: replayableReasoning.encrypted_content }
+                : {}),
+              summary: replayableReasoning.summary ?? [],
+              ...(replayableReasoning.content
+                ? { content: replayableReasoning.content }
+                : {}),
+            });
+          } else if (block?.type === "tool_use") {
+            input.push({
+              type: "function_call",
+              call_id: block.id,
+              name: block.name,
+              arguments: JSON.stringify(block.input ?? {}),
+            });
+          } else if (block?.type === "text") {
+            input.push({
+              role: "assistant",
+              content: block.text ?? "",
+            });
+          }
+        }
+        if (message.output_blocks.length === 0) {
+          input.push({ role: "assistant", content: "" });
+        }
+        return;
       }
 
       if (message.role === "tool") {
@@ -323,6 +506,7 @@ export class OpenAIResponsesTransformer implements Transformer {
           delete convertedMessage.tool_calls;
           delete convertedMessage.thinking;
           delete convertedMessage.thinking_blocks;
+          delete convertedMessage.output_blocks;
           delete convertedMessage.cache_control;
           input.push(convertedMessage);
         }
@@ -357,7 +541,21 @@ export class OpenAIResponsesTransformer implements Transformer {
         name: tool.function.name,
         description: tool.function.description,
         parameters: tool.function.parameters,
+        strict: tool.function.strict ?? false,
       }));
+    }
+
+    if (request.response_format?.type === "json_schema") {
+      const schema = request.response_format.json_schema;
+      (request as any).text = {
+        format: {
+          type: "json_schema",
+          name: schema.name,
+          schema: schema.schema,
+          strict: schema.strict,
+        },
+      };
+      delete request.response_format;
     }
 
     // tool_choice 格式转换：unified { type: "function", function: { name } }
@@ -376,32 +574,43 @@ export class OpenAIResponsesTransformer implements Transformer {
     return request;
   }
 
-  async transformResponseOut(response: Response): Promise<Response> {
+  async transformResponseOut(
+    response: Response,
+    context?: TransformerContext,
+  ): Promise<Response> {
     const contentType = response.headers.get("Content-Type") || "";
 
     if (contentType.includes("application/json")) {
       const jsonResponse: any = await response.json();
 
       // 检查是否为responses API格式的JSON响应
-      if (jsonResponse.object === "response" && jsonResponse.output) {
-        if (jsonResponse.status === "failed") {
+      if (jsonResponse.object === "response") {
+        const semanticError = responsesStatusError(jsonResponse);
+        if (semanticError) {
           return new Response(
             JSON.stringify({
               error: {
-                type: mapResponsesErrorType(jsonResponse.error?.code),
-                message:
-                  jsonResponse.error?.message ||
-                  "Responses request failed",
+                type: semanticError.type,
+                code: semanticError.code,
+                message: semanticError.message,
               },
             }),
             {
-              status: 500,
+              status: semanticError.status,
               headers: { "Content-Type": "application/json" },
             },
           );
         }
+        if (!Array.isArray(jsonResponse.output)) {
+          throw createApiError(
+            "upstream Responses payload is missing output",
+            502,
+            "upstream_protocol_error",
+            "api_error",
+          );
+        }
         // 将responses格式转换为chat格式
-        const chatResponse = this.convertResponseToChat(jsonResponse);
+        const chatResponse = this.convertResponseToChat(jsonResponse, context);
         return new Response(JSON.stringify(chatResponse), {
           status: response.status,
           statusText: response.statusText,
@@ -426,6 +635,7 @@ export class OpenAIResponsesTransformer implements Transformer {
       let downstreamCancelled = false;
 
       const transformer = this;
+      const omitReasoning = context?.thinkingDisplay === "omitted";
       const stream = new ReadableStream({
         async start(controller) {
           const reader = response.body!.getReader();
@@ -441,13 +651,27 @@ export class OpenAIResponsesTransformer implements Transformer {
           let streamCreated = Math.floor(Date.now() / 1000);
           const textDeltaParts = new Set<string>();
           const refusalDeltaParts = new Set<string>();
-          const argumentDeltaItems = new Set<string>();
+          const textSnapshotParts = new Set<string>();
+          const refusalSnapshotParts = new Set<string>();
+          const argumentBuffers = new Map<string, string>();
           const reasoningSummaryParts = new Set<string>();
           const reasoningTextParts = new Set<string>();
           const reasoningTextItems = new Set<string>();
           const reasoningSignatureItems = new Set<string>();
           const functionItemsAdded = new Set<string>();
+          const functionOutputIndexesAdded = new Set<number>();
+          type FunctionIdentity = {
+            itemId: string;
+            callId: string;
+            name: string;
+            outputIndex?: number;
+          };
+          const functionIdentityByItem = new Map<string, FunctionIdentity>();
+          const functionIdentityByOutput = new Map<number, FunctionIdentity>();
           const imageGenerationItems = new Set<string>();
+          const unsupportedItems = new Set<string>();
+          const encryptedReasoningItems = new Set<string>();
+          const suppressedReasoningGroups: string[][] = [];
           let sawRefusal = false;
           let sawIncompleteFunctionCall = false;
           let stopReading = false;
@@ -478,10 +702,121 @@ export class OpenAIResponsesTransformer implements Transformer {
             getEventItemKeys(event).map(
               (key) => `${key}:summary:${summaryIndex}`,
             );
+          const getAnnotationKeys = (
+            event: ResponsesStreamEvent,
+            annotationIndex = event.annotation_index ?? 0,
+          ): string[] =>
+            getContentPartKeys(event).map(
+              (key) => `${key}:annotation:${annotationIndex}`,
+            );
           const seenAny = (marked: Set<string>, keys: string[]): boolean =>
             keys.some((key) => marked.has(key));
           const markAll = (marked: Set<string>, keys: string[]): void =>
             keys.forEach((key) => marked.add(key));
+          const sameFunctionIdentity = (
+            left: FunctionIdentity,
+            right: FunctionIdentity,
+          ): boolean =>
+            left.itemId === right.itemId &&
+            left.callId === right.callId &&
+            left.name === right.name;
+          const registerFunctionIdentity = (
+            item: ResponsesAPIOutputItem,
+            outputIndex: number | undefined,
+          ): FunctionIdentity | null => {
+            const itemId = item.id || item.call_id || "";
+            const callId = item.call_id || item.id || "";
+            if (!itemId || !callId || !item.name) return null;
+            const identity = { itemId, callId, name: item.name, outputIndex };
+            const existingItem = functionIdentityByItem.get(itemId);
+            const existingOutput =
+              outputIndex === undefined
+                ? undefined
+                : functionIdentityByOutput.get(outputIndex);
+            if (
+              (existingItem && !sameFunctionIdentity(existingItem, identity)) ||
+              (existingOutput && !sameFunctionIdentity(existingOutput, identity))
+            ) {
+              emitFatalStreamError(
+                "Responses function identity changed during stream",
+                new Error("function identity mismatch"),
+                JSON.stringify(item),
+                "upstream Responses function identity changed during stream",
+              );
+              return null;
+            }
+            functionIdentityByItem.set(itemId, identity);
+            if (outputIndex !== undefined) {
+              functionIdentityByOutput.set(outputIndex, identity);
+            }
+            return identity;
+          };
+          const isBareFunctionSkeleton = (
+            item: ResponsesAPIOutputItem,
+          ): boolean =>
+            item.type === "function_call" &&
+            !item.id &&
+            !item.call_id &&
+            !item.name &&
+            item.arguments === undefined &&
+            item.status === undefined;
+          const validateTerminalFunctions = (
+            output: ResponsesAPIOutputItem[],
+          ): boolean => {
+            for (const [outputIndex, expected] of functionIdentityByOutput) {
+              const item = output[outputIndex];
+              if (!item || item.type !== "function_call") {
+                emitFatalStreamError(
+                  "Responses terminal output omitted a streamed function call",
+                  new Error("missing terminal function_call"),
+                  JSON.stringify(output),
+                  "upstream Responses terminal output omitted a function call",
+                );
+                return false;
+              }
+              if (isBareFunctionSkeleton(item)) continue;
+              const actualItemId = item.id || item.call_id || "";
+              const actual = {
+                itemId: actualItemId,
+                callId: item.call_id || item.id || "",
+                name: item.name || "",
+                outputIndex,
+              };
+              if (!sameFunctionIdentity(expected, actual)) {
+                emitFatalStreamError(
+                  "Responses terminal function identity mismatch",
+                  new Error("terminal function identity mismatch"),
+                  JSON.stringify(item),
+                  "upstream Responses terminal function identity mismatch",
+                );
+                return false;
+              }
+            }
+            for (const expected of functionIdentityByItem.values()) {
+              if (expected.outputIndex !== undefined) continue;
+              const hasMatch = output.some((item) => {
+                if (item.type !== "function_call" || isBareFunctionSkeleton(item)) {
+                  return false;
+                }
+                const actual = {
+                  itemId: item.id || item.call_id || "",
+                  callId: item.call_id || item.id || "",
+                  name: item.name || "",
+                };
+                return sameFunctionIdentity(expected, actual);
+              });
+              if (!hasMatch) {
+                emitFatalStreamError(
+                  "Responses terminal output omitted an unindexed function call",
+                  new Error("missing unindexed terminal function_call"),
+                  JSON.stringify(output),
+                  "upstream Responses terminal output omitted a function call",
+                );
+                return false;
+              }
+            }
+            return true;
+          };
           type BufferedSummary = {
             itemKeys: string[];
             partKeys: string[];
@@ -605,16 +940,18 @@ export class OpenAIResponsesTransformer implements Transformer {
             if (item.type === "message") {
               (item.content || []).forEach((part, index) => {
                 const partKeys = getContentPartKeys(itemEvent, index);
-                if (
-                  part.type === "output_text" &&
-                  part.text &&
-                  !seenAny(textDeltaParts, partKeys)
-                ) {
-                  markAll(textDeltaParts, partKeys);
-                  emitChatDelta(itemId, eventType, {
-                    role: "assistant",
-                    content: part.text,
-                  });
+                if (part.type === "output_text") {
+                  if (
+                    part.text &&
+                    !seenAny(textDeltaParts, partKeys)
+                  ) {
+                    markAll(textDeltaParts, partKeys);
+                    markAll(textSnapshotParts, partKeys);
+                    emitChatDelta(itemId, eventType, {
+                      role: "assistant",
+                      content: part.text,
+                    });
+                  }
                 } else if (part.type === "refusal") {
                   sawRefusal = true;
                   if (
@@ -622,9 +959,55 @@ export class OpenAIResponsesTransformer implements Transformer {
                     !seenAny(refusalDeltaParts, partKeys)
                   ) {
                     markAll(refusalDeltaParts, partKeys);
+                    markAll(refusalSnapshotParts, partKeys);
                     emitChatDelta(itemId, eventType, {
                       role: "assistant",
-                      content: part.refusal,
+                      refusal: part.refusal,
+                    });
+                  }
+                } else if (
+                  part.type === "output_image" ||
+                  part.type === "output_image_base64"
+                ) {
+                  const partKey = `${partKeys[0]}:generated-image`;
+                  if (!unsupportedItems.has(partKey)) {
+                    unsupportedItems.add(partKey);
+                    emitChatDelta(itemId, eventType, {
+                      role: "assistant",
+                      content: "[generated image omitted]",
+                    });
+                  }
+                } else {
+                  const partKey = `${partKeys[0]}:unsupported`;
+                  if (!unsupportedItems.has(partKey)) {
+                    unsupportedItems.add(partKey);
+                    emitChatDelta(itemId, eventType, {
+                      role: "assistant",
+                      content: boundedResponsesFallback(
+                        `message content ${part.type || "unknown"}`,
+                        part,
+                      ),
+                    });
+                  }
+                }
+                // An annotation describes the preceding output_text bytes.
+                // Keep fallback order identical to the live event sequence:
+                // text/refusal first, then each citation at its own position.
+                for (const [annotationIndex, annotation] of (
+                  part.annotations || []
+                ).entries()) {
+                  const annotationKeys = getAnnotationKeys(
+                    itemEvent,
+                    annotationIndex,
+                  );
+                  if (!seenAny(unsupportedItems, annotationKeys)) {
+                    markAll(unsupportedItems, annotationKeys);
+                    emitChatDelta(itemId, eventType, {
+                      role: "assistant",
+                      content: boundedResponsesFallback(
+                        "citation annotation",
+                        annotation,
+                      ),
                     });
                   }
                 }
@@ -633,12 +1016,59 @@ export class OpenAIResponsesTransformer implements Transformer {
             }
 
             if (item.type === "function_call") {
+              const isBareCompatibilitySkeleton = isBareFunctionSkeleton(item);
+              if (
+                isBareCompatibilitySkeleton &&
+                outputIndex !== undefined &&
+                functionOutputIndexesAdded.has(outputIndex)
+              ) {
+                return;
+              }
+              if (!itemId || !item.name) {
+                emitFatalStreamError(
+                  "Responses function_call is missing identifiers",
+                  new Error("missing call_id/id or name"),
+                  JSON.stringify(item),
+                  "upstream Responses function_call is missing call_id or name",
+                );
+                return;
+              }
+              if (!registerFunctionIdentity(item, outputIndex)) return;
               if (item.status === "incomplete") {
                 sawIncompleteFunctionCall = true;
               }
+              const bufferedArguments = argumentBuffers.get(itemId) || "";
+              let completeArguments = bufferedArguments;
+              let argumentSuffix = "";
+              if (typeof item.arguments === "string") {
+                const metadataArrivedAfterArguments =
+                  eventType === "response.output_item.added" &&
+                  bufferedArguments.startsWith(item.arguments);
+                if (
+                  bufferedArguments &&
+                  !item.arguments.startsWith(bufferedArguments) &&
+                  !metadataArrivedAfterArguments
+                ) {
+                  emitFatalStreamError(
+                    "Responses function arguments snapshot diverged from deltas",
+                    new Error("argument snapshot mismatch"),
+                    JSON.stringify(item),
+                    "upstream Responses function arguments are inconsistent",
+                  );
+                  return;
+                }
+                completeArguments =
+                  metadataArrivedAfterArguments
+                    ? bufferedArguments
+                    : item.arguments;
+                argumentSuffix = completeArguments.slice(bufferedArguments.length);
+                argumentBuffers.set(itemId, completeArguments);
+              }
+              if (outputIndex !== undefined) {
+                functionOutputIndexesAdded.add(outputIndex);
+              }
               if (!functionItemsAdded.has(itemId)) {
                 functionItemsAdded.add(itemId);
-                if (item.arguments) argumentDeltaItems.add(itemId);
                 emitChatDelta(itemId, eventType, {
                   role: "assistant",
                   tool_calls: [
@@ -647,22 +1077,21 @@ export class OpenAIResponsesTransformer implements Transformer {
                       id: item.call_id || item.id,
                       function: {
                         name: item.name || "",
-                        arguments: item.arguments || "",
+                        // Argument events can precede output_item.added on
+                        // compatible endpoints. Keep those bytes buffered until
+                        // identifiers arrive, then publish one coherent tool.
+                        arguments: completeArguments,
                       },
                       type: "function",
                     },
                   ],
                 });
-              } else if (
-                item.arguments &&
-                !argumentDeltaItems.has(itemId)
-              ) {
-                argumentDeltaItems.add(itemId);
+              } else if (argumentSuffix) {
                 emitChatDelta(itemId, eventType, {
                   tool_calls: [
                     {
                       index: getToolCallIndex(itemId),
-                      function: { arguments: item.arguments },
+                      function: { arguments: argumentSuffix },
                     },
                   ],
                 });
@@ -671,7 +1100,40 @@ export class OpenAIResponsesTransformer implements Transformer {
             }
 
             if (item.type === "reasoning") {
+              if (!item.id) {
+                emitFatalStreamError(
+                  "Responses reasoning item is missing id",
+                  new Error("missing reasoning id"),
+                  JSON.stringify(item),
+                  "upstream Responses reasoning item is missing id",
+                );
+                return;
+              }
               const itemKeys = getEventItemKeys(itemEvent);
+              const visibleReasoning = reasoningText(item);
+              if (omitReasoning) {
+                if (visibleReasoning && !item.encrypted_content) {
+                  emitFatalStreamError(
+                    "Responses omitted reasoning lacked encrypted state",
+                    new Error("visible reasoning cannot be replayed when omitted"),
+                    JSON.stringify(item),
+                    "upstream omitted encrypted reasoning state",
+                  );
+                  return;
+                }
+                discardBufferedSummariesForItem(itemKeys);
+                if (item.encrypted_content) {
+                  markAll(encryptedReasoningItems, itemKeys);
+                  const signature = encodeReasoningSignature(item, false);
+                  if (signature && !seenAny(reasoningSignatureItems, itemKeys)) {
+                    markAll(reasoningSignatureItems, itemKeys);
+                    emitChatDelta(itemId, eventType, {
+                      thinking: { signature },
+                    });
+                  }
+                }
+                return;
+              }
               const reasoningParts = (item.content || [])
                 .map((part, index) => ({ part, index }))
                 .filter(({ part }) => part.type === "reasoning_text");
@@ -732,16 +1194,42 @@ export class OpenAIResponsesTransformer implements Transformer {
                   content: "[generated image omitted]",
                 });
               }
+              return;
+            }
+
+            if (item.type === "web_search_call") {
+              const itemKeys = getEventItemKeys(itemEvent);
+              const unsupportedKey = `${itemKeys[0]}:web_search_call`;
+              if (unsupportedItems.has(unsupportedKey)) return;
+              unsupportedItems.add(unsupportedKey);
+              emitChatDelta(item.id, eventType, {
+                role: "assistant",
+                content: boundedResponsesFallback("web_search_call", item),
+              });
+              return;
+            }
+
+            const unsupportedKey = itemId || `output:${outputIndex ?? "unknown"}`;
+            if (!unsupportedItems.has(unsupportedKey)) {
+              unsupportedItems.add(unsupportedKey);
+              emitChatDelta(itemId, eventType, {
+                role: "assistant",
+                content: unsupportedOutputPlaceholder(item),
+              });
             }
           };
           const emitFatalStreamError = (
             message: string,
             error: unknown,
             data: string,
+            publicMessage = "malformed upstream SSE event",
           ) => {
             if (fatalStreamError) return;
             transformer.logger?.error(
-              { err: error, data },
+              {
+                err: error,
+                data: omitReasoning ? "[omitted by thinking.display]" : data,
+              },
               message,
             );
             controller.enqueue(
@@ -753,7 +1241,38 @@ export class OpenAIResponsesTransformer implements Transformer {
                   model: streamModel,
                   error: {
                     type: "api_error",
-                    message: "malformed upstream SSE event",
+                    message: publicMessage,
+                    status: 502,
+                  },
+                  choices: [],
+                })}\n\n`,
+              ),
+            );
+            fatalStreamError = true;
+            isStreamEnded = true;
+            stopReading = true;
+          };
+          const emitSemanticStreamError = (
+            error: {
+              status: number;
+              type: string;
+              code?: string;
+              message: string;
+            },
+          ): void => {
+            if (fatalStreamError) return;
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({
+                  id: streamId,
+                  object: "chat.completion.chunk",
+                  created: streamCreated,
+                  model: streamModel,
+                  error: {
+                    type: error.type,
+                    code: error.code,
+                    message: error.message,
+                    status: error.status,
                   },
                   choices: [],
                 })}\n\n`,
@@ -809,8 +1328,11 @@ export class OpenAIResponsesTransformer implements Transformer {
                       } else if (data.type === "response.output_text.delta") {
                         const textDelta =
                           typeof data.delta === "string" ? data.delta : "";
-                        if (!textDelta) continue;
-                        markAll(textDeltaParts, getContentPartKeys(data));
+                        const partKeys = getContentPartKeys(data);
+                        if (!textDelta || seenAny(textSnapshotParts, partKeys)) {
+                          continue;
+                        }
+                        markAll(textDeltaParts, partKeys);
                         // 将output_text.delta转换为chat格式
                         const chatChunk = {
                           id: data.item_id || "chatcmpl-" + Date.now(),
@@ -837,63 +1359,15 @@ export class OpenAIResponsesTransformer implements Transformer {
                         data.type === "response.output_item.added" &&
                         data.item?.type === "function_call"
                       ) {
-                        if (data.item.status === "incomplete") {
-                          sawIncompleteFunctionCall = true;
-                        }
-                        if (data.item?.id) {
-                          functionItemsAdded.add(data.item.id);
-                        }
-                        // 处理function call开始 - 创建初始的tool call chunk
-                        const functionCallChunk = {
-                          id:
-                            data.item.call_id ||
-                            data.item.id ||
-                            "chatcmpl-" + Date.now(),
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: streamModel,
-                          choices: [
-                            {
-                              index: 0,
-                              delta: {
-                                role: "assistant",
-                                tool_calls: [
-                                  {
-                                    // Key the index map by item.id (= the
-                                    // `item_id` carried on later
-                                    // function_call_arguments.delta events).
-                                    // call_id is a *different* identifier, so
-                                    // keying by it here would never match the
-                                    // delta lookup below and would scatter a
-                                    // tool call's name and arguments across two
-                                    // indices.
-                                    index: getToolCallIndex(
-                                      data.item.id || data.item.call_id || ""
-                                    ),
-                                    id: data.item.call_id || data.item.id,
-                                    function: {
-                                      name: data.item.name || "",
-                                      arguments: "",
-                                    },
-                                    type: "function",
-                                  },
-                                ],
-                              },
-                              finish_reason: null,
-                            },
-                          ],
-                        };
-
-                        controller.enqueue(
-                          encoder.encode(
-                            `data: ${JSON.stringify(functionCallChunk)}\n\n`
-                          )
+                        emitResponseItemFallback(
+                          data.item as ResponsesAPIOutputItem,
+                          data.output_index,
+                          data.type,
                         );
                       } else if (
                         data.type === "response.output_item.added" &&
                         data.item?.type === "message"
                       ) {
-                        const initialContent: string[] = [];
                         (data.item.content || []).forEach((part, index) => {
                           const partEvent = {
                             ...data,
@@ -904,7 +1378,14 @@ export class OpenAIResponsesTransformer implements Transformer {
                               textDeltaParts,
                               getContentPartKeys(partEvent, index),
                             );
-                            initialContent.push(part.text);
+                            markAll(
+                              textSnapshotParts,
+                              getContentPartKeys(partEvent, index),
+                            );
+                            emitChatDelta(data.item?.id, data.type, {
+                              role: "assistant",
+                              content: part.text,
+                            });
                           } else if (part.type === "refusal") {
                             sawRefusal = true;
                             if (part.refusal) {
@@ -912,16 +1393,17 @@ export class OpenAIResponsesTransformer implements Transformer {
                                 refusalDeltaParts,
                                 getContentPartKeys(partEvent, index),
                               );
-                              initialContent.push(part.refusal);
+                              markAll(
+                                refusalSnapshotParts,
+                                getContentPartKeys(partEvent, index),
+                              );
+                              emitChatDelta(data.item?.id, data.type, {
+                                role: "assistant",
+                                refusal: part.refusal,
+                              });
                             }
                           }
                         });
-                        if (initialContent.length > 0) {
-                          emitChatDelta(data.item.id, data.type, {
-                            role: "assistant",
-                            content: initialContent.join(""),
-                          });
-                        }
                       } else if (
                         data.type === "response.output_text.done" &&
                         data.text &&
@@ -937,10 +1419,14 @@ export class OpenAIResponsesTransformer implements Transformer {
                         const refusalDelta =
                           typeof data.delta === "string" ? data.delta : "";
                         sawRefusal = true;
-                        if (refusalDelta) {
-                          markAll(refusalDeltaParts, getContentPartKeys(data));
+                        const partKeys = getContentPartKeys(data);
+                        if (
+                          refusalDelta &&
+                          !seenAny(refusalSnapshotParts, partKeys)
+                        ) {
+                          markAll(refusalDeltaParts, partKeys);
                           emitChatDelta(data.item_id, data.type, {
-                            content: refusalDelta,
+                            refusal: refusalDelta,
                           });
                         }
                       } else if (
@@ -956,108 +1442,168 @@ export class OpenAIResponsesTransformer implements Transformer {
                         ) {
                           markAll(refusalDeltaParts, getContentPartKeys(data));
                           emitChatDelta(data.item_id, data.type, {
-                            content: data.refusal,
+                            refusal: data.refusal,
                           });
                         }
                       } else if (
                         data.type === "response.output_text.annotation.added"
                       ) {
-                        const annotationChunk = {
-                          id: data.item_id || "chatcmpl-" + Date.now(),
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: streamModel,
-                          choices: [
-                            {
-                              index: 0,
-                              delta: {
-                                annotations: [
-                                  {
-                                    type: "url_citation",
-                                    url_citation: {
-                                      url: data.annotation?.url || "",
-                                      title: data.annotation?.title || "",
-                                      content: "",
-                                      start_index:
-                                        data.annotation?.start_index || 0,
-                                      end_index:
-                                        data.annotation?.end_index || 0,
-                                    },
-                                  },
-                                ],
-                              },
-                              finish_reason: null,
-                            },
-                          ],
-                        };
-
-                        controller.enqueue(
-                          encoder.encode(
-                            `data: ${JSON.stringify(annotationChunk)}\n\n`
-                          )
-                        );
+                        const annotationKeys = getAnnotationKeys(data);
+                        if (!seenAny(unsupportedItems, annotationKeys)) {
+                          markAll(unsupportedItems, annotationKeys);
+                          emitChatDelta(data.item_id, data.type, {
+                            role: "assistant",
+                            content: boundedResponsesFallback(
+                              "citation annotation",
+                              data.annotation,
+                            ),
+                          });
+                        }
                       } else if (
                         data.type === "response.function_call_arguments.delta"
                       ) {
                         const argumentDelta =
                           typeof data.delta === "string" ? data.delta : "";
                         if (!argumentDelta) continue;
-                        if (data.item_id) argumentDeltaItems.add(data.item_id);
-                        // 处理function call参数增量
-                        const functionCallChunk = {
-                          id: data.item_id || "chatcmpl-" + Date.now(),
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: streamModel,
-                          choices: [
-                            {
-                              index: 0,
-                              delta: {
-                                tool_calls: [
-                                  {
-                                    index: getToolCallIndex(
-                                      data.item_id || ""
-                                    ),
-                                    function: {
-                                      arguments: argumentDelta,
-                                    },
-                                  },
-                                ],
-                              },
-                              finish_reason: null,
-                            },
-                          ],
-                        };
-
-                        controller.enqueue(
-                          encoder.encode(
-                            `data: ${JSON.stringify(functionCallChunk)}\n\n`
-                          )
+                        if (!data.item_id) {
+                          emitFatalStreamError(
+                            "Responses function argument delta is missing item_id",
+                            new Error("missing function item_id"),
+                            dataStr,
+                            "upstream Responses function arguments are missing item_id",
+                          );
+                          break;
+                        }
+                        argumentBuffers.set(
+                          data.item_id,
+                          (argumentBuffers.get(data.item_id) || "") +
+                            argumentDelta,
                         );
+                        // Never publish argument-only tool chunks. Until the
+                        // output item supplies call_id/name, these bytes are not
+                        // an executable call and must remain buffered.
+                        if (functionItemsAdded.has(data.item_id)) {
+                          emitChatDelta(data.item_id, data.type, {
+                            tool_calls: [
+                              {
+                                index: getToolCallIndex(data.item_id),
+                                function: { arguments: argumentDelta },
+                              },
+                            ],
+                          });
+                        }
                       } else if (
                         data.type === "response.function_call_arguments.done" &&
-                        data.arguments &&
-                        !argumentDeltaItems.has(data.item_id || "")
+                        typeof data.arguments === "string"
                       ) {
-                        if (data.item_id) argumentDeltaItems.add(data.item_id);
-                        emitChatDelta(data.item_id, data.type, {
-                          tool_calls: [
-                            {
-                              index: getToolCallIndex(data.item_id || ""),
-                              function: { arguments: data.arguments },
-                            },
-                          ],
-                        });
+                        const itemId = data.item_id || "";
+                        if (!itemId) {
+                          emitFatalStreamError(
+                            "Responses function arguments snapshot is missing item_id",
+                            new Error("missing function item_id"),
+                            dataStr,
+                            "upstream Responses function arguments are missing item_id",
+                          );
+                          break;
+                        }
+                        const existing = argumentBuffers.get(itemId) || "";
+                        if (!data.arguments.startsWith(existing)) {
+                          emitFatalStreamError(
+                            "Responses function arguments snapshot diverged from deltas",
+                            new Error("argument snapshot mismatch"),
+                            dataStr,
+                            "upstream Responses function arguments are inconsistent",
+                          );
+                        } else {
+                          const suffix = data.arguments.slice(existing.length);
+                          if (suffix) {
+                            argumentBuffers.set(itemId, data.arguments);
+                            if (functionItemsAdded.has(itemId)) {
+                              emitChatDelta(data.item_id, data.type, {
+                                tool_calls: [
+                                  {
+                                    index: getToolCallIndex(itemId),
+                                    function: { arguments: suffix },
+                                  },
+                                ],
+                              });
+                            }
+                          }
+                        }
                       } else if (
                         data.type === "response.completed" ||
                         data.type === "response.incomplete"
                       ) {
+                        if (!data.response || typeof data.response !== "object") {
+                          emitFatalStreamError(
+                            "Responses terminal event is missing response",
+                            new Error("missing terminal response"),
+                            dataStr,
+                            "upstream Responses terminal event is missing response",
+                          );
+                          break;
+                        }
+                        const terminalSemanticError = responsesStatusError(
+                          data.response,
+                        );
+                        if (terminalSemanticError) {
+                          emitSemanticStreamError(terminalSemanticError);
+                          break;
+                        }
+                        const expectedStatus =
+                          data.type === "response.completed"
+                            ? "completed"
+                            : "incomplete";
+                        if (
+                          data.response.status !== undefined &&
+                          data.response.status !== expectedStatus
+                        ) {
+                          emitFatalStreamError(
+                            "Responses terminal event/status mismatch",
+                            new Error(
+                              `${data.type} carried status ${data.response.status}`,
+                            ),
+                            dataStr,
+                            "upstream Responses terminal event/status mismatch",
+                          );
+                          break;
+                        }
+                        if (data.response.error) {
+                          const code = data.response.error.code;
+                          emitSemanticStreamError({
+                            status: mapResponsesErrorStatus(code),
+                            type: mapResponsesErrorType(code),
+                            code,
+                            message:
+                              data.response.error.message ||
+                              "Responses request failed",
+                          });
+                          break;
+                        }
                         // The terminal event contains a complete Response. Use it
                         // as a deduplicated fallback for compatible endpoints
                         // that omit some/all output_item and delta events.
-                        (data.response?.output || []).forEach((item, index) => {
+                        const terminalOutput = data.response?.output || [];
+                        if (!validateTerminalFunctions(terminalOutput)) break;
+                        for (const [index, item] of terminalOutput.entries()) {
                           emitResponseItemFallback(item, index, data.type);
-                        });
+                          if (fatalStreamError) break;
+                        }
+                        if (fatalStreamError) break;
+                        if (
+                          omitReasoning &&
+                          suppressedReasoningGroups.some(
+                            (keys) => !seenAny(encryptedReasoningItems, keys),
+                          )
+                        ) {
+                          emitFatalStreamError(
+                            "Responses omitted reasoning lacked encrypted state",
+                            new Error("missing encrypted reasoning state"),
+                            JSON.stringify(data.response),
+                            "upstream omitted encrypted reasoning state",
+                          );
+                          break;
+                        }
                         flushAllBufferedSummaries();
                         const terminalHasRefusal =
                           sawRefusal ||
@@ -1097,6 +1643,9 @@ export class OpenAIResponsesTransformer implements Transformer {
                         const cachedTokens =
                           data.response?.usage?.input_tokens_details
                             ?.cached_tokens || 0;
+                        const cacheWriteTokens =
+                          data.response?.usage?.input_tokens_details
+                            ?.cache_write_tokens || 0;
 
                         const endChunk = {
                           id: data.response?.id || streamId,
@@ -1120,6 +1669,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                                   data.response.usage.total_tokens || 0,
                                 prompt_tokens_details: {
                                   cached_tokens: cachedTokens,
+                                  cache_write_tokens: cacheWriteTokens,
                                 },
                               }
                             : undefined,
@@ -1134,40 +1684,44 @@ export class OpenAIResponsesTransformer implements Transformer {
                         stopReading = true;
                       } else if (
                         data.type === "error" ||
-                        data.type === "response.failed"
+                        data.type === "response.failed" ||
+                        data.type === "response.cancelled"
                       ) {
-                        const errorChunk = {
-                          id: data.response?.id || streamId,
-                          object: "chat.completion.chunk",
-                          created: streamCreated,
-                          model: data.response?.model || streamModel,
-                          error:
-                            data.type === "error"
-                              ? {
-                                  type: data.code || "api_error",
-                                  message:
-                                    data.message || "Responses stream error",
-                                }
-                              : data.response?.error ||
-                                data.error || {
-                                  type: "api_error",
-                                  message: "Responses stream failed",
-                                },
-                          choices: [],
-                        };
-                        controller.enqueue(
-                          encoder.encode(
-                            `data: ${JSON.stringify(errorChunk)}\n\n`,
+                        const rawError =
+                          data.type === "error"
+                            ? {
+                                code: data.code || data.error?.code,
+                                message:
+                                  data.message || data.error?.message,
+                              }
+                            : data.response?.error || data.error || {};
+                        const errorCode = rawError.code;
+                        emitSemanticStreamError({
+                          status:
+                            data.type === "response.cancelled"
+                              ? 409
+                              : mapResponsesErrorStatus(
+                                  errorCode || undefined,
+                                ),
+                          type: mapResponsesErrorType(
+                            errorCode || undefined,
                           ),
-                        );
-                        isStreamEnded = true;
-                        stopReading = true;
+                          code: errorCode || undefined,
+                          message:
+                            rawError.message || "Responses stream failed",
+                        });
                       } else if (
                         data.type === "response.reasoning_summary_text.delta"
                       ) {
                         const summaryDelta =
                           typeof data.delta === "string" ? data.delta : "";
                         if (summaryDelta) {
+                          if (omitReasoning) {
+                            suppressedReasoningGroups.push(
+                              getEventItemKeys(data),
+                            );
+                            continue;
+                          }
                           // Buffer summaries until the reasoning item closes.
                           // If reasoning_text also exists, non-streaming prefers
                           // it and streaming must not concatenate both channels.
@@ -1177,13 +1731,23 @@ export class OpenAIResponsesTransformer implements Transformer {
                         data.type === "response.reasoning_summary_text.done" &&
                         data.text
                       ) {
-                        bufferSummary(data, data.text, true);
+                        if (omitReasoning) {
+                          suppressedReasoningGroups.push(getEventItemKeys(data));
+                        } else {
+                          bufferSummary(data, data.text, true);
+                        }
                       } else if (
                         data.type === "response.reasoning_text.delta"
                       ) {
                         const reasoningDelta =
                           typeof data.delta === "string" ? data.delta : "";
                         if (reasoningDelta) {
+                          if (omitReasoning) {
+                            suppressedReasoningGroups.push(
+                              getEventItemKeys(data),
+                            );
+                            continue;
+                          }
                           markAll(reasoningTextItems, getEventItemKeys(data));
                           discardBufferedSummariesForItem(
                             getEventItemKeys(data),
@@ -1198,6 +1762,10 @@ export class OpenAIResponsesTransformer implements Transformer {
                         data.text &&
                         !seenAny(reasoningTextParts, getContentPartKeys(data))
                       ) {
+                        if (omitReasoning) {
+                          suppressedReasoningGroups.push(getEventItemKeys(data));
+                          continue;
+                        }
                         markAll(reasoningTextItems, getEventItemKeys(data));
                         discardBufferedSummariesForItem(getEventItemKeys(data));
                         markAll(reasoningTextParts, getContentPartKeys(data));
@@ -1349,144 +1917,189 @@ export class OpenAIResponsesTransformer implements Transformer {
     return null;
   }
 
-  private convertResponseToChat(responseData: ResponsesAPIPayload): any {
-    const messageOutputs = responseData.output?.filter(
-      (item) => item.type === "message",
-    );
-    const functionCallOutputs = responseData.output?.filter(
-      (item) => item.type === "function_call",
-    );
-    const imageGenerationOutputs = responseData.output?.filter(
-      (item) => item.type === "image_generation_call",
-    );
-    const annotations = messageOutputs
-      .flatMap((message) => message.content || [])
-      .flatMap((item) => item.annotations || [])
-      .map((item) => ({
-          type: "url_citation",
-          url_citation: {
-            url: item.url || "",
-            title: item.title || "",
-            content: "",
-            start_index: item.start_index || 0,
-            end_index: item.end_index || 0,
-          },
-        }));
-
-    let messageContent: string | MessageContent[] | null = null;
-    let toolCalls: any = null;
-    let thinking: any = null;
-
-    // One thinking block per reasoning item — each keeps its own id +
-    // replay envelope, paired only with a directly following function_call.
-    // Any intervening visible/unknown output flushes the reasoning as unpaired;
-    // otherwise reasoning -> message -> function_call would be reordered into
-    // message -> reasoning -> function_call by the unified Chat shape.
-    // Collapsing items into one block loses every id after the first.
-    const reasoningItemText = (item: ResponsesAPIOutputItem): string => {
-      const contentText = (item.content || [])
-        .filter((part) => part.type === "reasoning_text")
-        .map((part) => part.text || "")
-        .join("");
-      if (contentText) return contentText;
-      return (item.summary || []).map((part) => part.text || "").join("");
-    };
+  private convertResponseToChat(
+    responseData: ResponsesAPIPayload,
+    context?: TransformerContext,
+  ): any {
+    const omitReasoning = context?.thinkingDisplay === "omitted";
+    const outputBlocks: Array<Record<string, any>> = [];
+    const visibleText: string[] = [];
+    const toolCalls: any[] = [];
     const thinkingBlocks: Array<{
       content: string;
       signature?: string;
       tool_call_id?: string;
     }> = [];
-    {
-      let pendingThinking: typeof thinkingBlocks = [];
-      for (const item of responseData.output || []) {
-        if (item.type === "reasoning") {
-          const text = reasoningItemText(item);
-          const signature = encodeReasoningSignature(item);
-          if (text || signature) {
-            pendingThinking.push({ content: text, signature });
-          }
-        } else if (item.type === "function_call") {
-          const pairedCallId = item.call_id || item.id;
-          if (pairedCallId) {
-            for (const block of pendingThinking) {
-              block.tool_call_id = pairedCallId;
-            }
-          }
-          thinkingBlocks.push(...pendingThinking);
-          pendingThinking = [];
-        } else {
-          thinkingBlocks.push(...pendingThinking);
-          pendingThinking = [];
-        }
+    let pendingThinking: typeof thinkingBlocks = [];
+    let refusalText = "";
+    let hasRefusal = false;
+    let hasIncompleteFunctionCall = false;
+    const annotations: any[] = [];
+    const annotationKeys = new Set<string>();
+
+    const flushPendingThinking = (toolCallId?: string) => {
+      if (toolCallId) {
+        for (const block of pendingThinking) block.tool_call_id = toolCallId;
       }
       thinkingBlocks.push(...pendingThinking);
-    }
-    if (thinkingBlocks.length) {
-      thinking = {
-        content: thinkingBlocks[0].content,
-        signature: thinkingBlocks[0].signature,
-      };
-    }
-
-    const contentParts: MessageContent[] = [];
-    let hasRefusal = false;
-    if (messageOutputs.length > 0) {
-      messageOutputs.flatMap((message) => message.content || []).forEach((item: any) => {
-        if (item.type === "output_text") {
-          contentParts.push({ type: "text", text: item.text || "" });
-        } else if (item.type === "refusal") {
-          hasRefusal = true;
-          contentParts.push({ type: "text", text: item.refusal || "" });
-        } else if (item.type === "output_image") {
-          const imageContent = this.buildImageContent({
-            url: item.image_url,
-            mime_type: item.mime_type,
-          });
-          if (imageContent) contentParts.push(imageContent);
-        } else if (item.type === "output_image_base64") {
-          const imageContent = this.buildImageContent({
-            b64_json: item.image_base64,
-            mime_type: item.mime_type,
-          });
-          if (imageContent) contentParts.push(imageContent);
-        }
+      pendingThinking = [];
+    };
+    const pushVisibleText = (text: string) => {
+      outputBlocks.push({ type: "text", text });
+      visibleText.push(text);
+    };
+    const recordCitation = (annotation: any) => {
+      if (
+        annotation?.type !== "url_citation" ||
+        typeof annotation.url !== "string" ||
+        annotation.url.length === 0
+      ) {
+        return;
+      }
+      const key = JSON.stringify([
+        annotation.url,
+        annotation.title || "",
+        annotation.start_index || 0,
+        annotation.end_index || 0,
+      ]);
+      if (annotationKeys.has(key)) return;
+      annotationKeys.add(key);
+      annotations.push({
+        type: "url_citation",
+        url_citation: {
+          url: annotation.url,
+          title: annotation.title || "",
+          content: "",
+          start_index: annotation.start_index || 0,
+          end_index: annotation.end_index || 0,
+        },
       });
+    };
 
-    }
-    // The formal image-generation output is an output item, not a message
-    // content part. Anthropic has no equivalent response block; emit a bounded
-    // placeholder rather than returning a successful-looking empty message or
-    // inlining a potentially multi-megabyte base64 result.
-    for (const _image of imageGenerationOutputs) {
-      contentParts.push({ type: "text", text: "[generated image omitted]" });
-    }
-    if (contentParts.length > 0) {
-      if (contentParts.some((part) => part.type === "image_url")) {
-        messageContent = contentParts;
+    for (const item of responseData.output || []) {
+      if (item.type === "reasoning") {
+        if (!item.id) {
+          throw createApiError(
+            "upstream Responses reasoning item is missing id",
+            502,
+            "upstream_protocol_error",
+            "api_error",
+          );
+        }
+        const text = reasoningText(item);
+        if (omitReasoning && text && !item.encrypted_content) {
+          throw createApiError(
+            "upstream omitted encrypted reasoning state",
+            502,
+            "upstream_protocol_error",
+            "api_error",
+          );
+        }
+        if (omitReasoning && !item.encrypted_content) continue;
+        const signature = encodeReasoningSignature(item, !omitReasoning);
+        if (text || signature) {
+          const content = omitReasoning ? "" : text;
+          outputBlocks.push({
+            type: "thinking",
+            thinking: content,
+            signature,
+          });
+          pendingThinking.push({ content, signature });
+        }
+        continue;
+      }
+
+      if (item.type === "function_call") {
+        const callId = item.call_id || item.id;
+        if (!callId || !item.name) {
+          throw createApiError(
+            "upstream Responses function_call is missing call_id or name",
+            502,
+            "upstream_protocol_error",
+            "api_error",
+          );
+        }
+        const callIsIncomplete =
+          responseData.status === "incomplete" || item.status === "incomplete";
+        flushPendingThinking(callIsIncomplete ? undefined : callId);
+        const rawArguments =
+          typeof item.arguments === "string"
+            ? item.arguments
+            : JSON.stringify(item.arguments ?? {});
+        toolCalls.push({
+          id: callId,
+          function: {
+            name: item.name || "",
+            arguments: rawArguments,
+          },
+          type: "function",
+        });
+        if (callIsIncomplete) {
+          hasIncompleteFunctionCall = true;
+          const boundedArguments =
+            rawArguments.length <= 4096
+              ? rawArguments
+              : `${rawArguments.slice(0, 4096)}…`;
+          pushVisibleText(
+            `[incomplete function_call ${item.name || "unknown"}: ${boundedArguments}]`,
+          );
+        } else {
+          outputBlocks.push({
+            type: "tool_use",
+            id: callId,
+            name: item.name || "",
+            input: parseResponsesToolArguments(item.arguments),
+          });
+        }
+        continue;
+      }
+
+      // Any visible/non-reasoning item breaks reasoning/function adjacency.
+      flushPendingThinking();
+      if (item.type === "web_search_call") {
+        // Responses citations do not identify which web_search_call produced
+        // them, so even a mapping that looks plausible becomes ambiguous as
+        // soon as multiple calls exist. Preserve the complete formal payload
+        // as bounded text instead of guessing call/result ownership.
+        pushVisibleText(boundedResponsesFallback("web_search_call", item));
+      } else if (item.type === "message") {
+        for (const part of item.content || []) {
+          if (part.type === "output_text") {
+            pushVisibleText(part.text || "");
+          } else if (part.type === "refusal") {
+            hasRefusal = true;
+            const text = part.refusal || "";
+            refusalText += text;
+            pushVisibleText(text);
+          } else if (
+            part.type === "output_image" ||
+            part.type === "output_image_base64"
+          ) {
+            pushVisibleText("[generated image omitted]");
+          } else {
+            pushVisibleText(
+              boundedResponsesFallback(
+                `message content ${part.type || "unknown"}`,
+                part,
+              ),
+            );
+          }
+          for (const annotation of part.annotations || []) {
+            recordCitation(annotation);
+            pushVisibleText(
+              boundedResponsesFallback("citation annotation", annotation),
+            );
+          }
+        }
+      } else if (item.type === "image_generation_call") {
+        pushVisibleText("[generated image omitted]");
       } else {
-        messageContent = contentParts
-          .filter((part) => part.type === "text")
-          .map((part) => part.text)
-          .join("");
+        pushVisibleText(unsupportedOutputPlaceholder(item));
       }
     }
-
-    if (functionCallOutputs && functionCallOutputs.length > 0) {
-      // 处理function_call类型的输出（支持多工具并行调用）
-      toolCalls = functionCallOutputs.map((fc: any) => ({
-        id: fc.call_id || fc.id,
-        function: {
-          name: fc.name,
-          arguments: fc.arguments,
-        },
-        type: "function",
-      }));
-    }
+    flushPendingThinking();
 
     const incompleteReason = responseData.incomplete_details?.reason;
-    const hasIncompleteFunctionCall = functionCallOutputs.some(
-      (item) => item.status === "incomplete",
-    );
     const responseIsIncomplete =
       responseData.status === "incomplete" || hasIncompleteFunctionCall;
     const responseIsRefusal =
@@ -1502,13 +2115,20 @@ export class OpenAIResponsesTransformer implements Transformer {
           index: 0,
           message: {
             role: "assistant",
-            content: messageContent || null,
-            tool_calls: toolCalls,
-            thinking: thinking,
+            content: visibleText.length > 0 ? visibleText.join("") : null,
+            tool_calls: toolCalls.length > 0 ? toolCalls : null,
+            thinking: thinkingBlocks.length
+              ? {
+                  content: thinkingBlocks[0].content,
+                  signature: thinkingBlocks[0].signature,
+                }
+              : null,
             thinking_blocks: thinkingBlocks.length
               ? thinkingBlocks
               : undefined,
+            output_blocks: outputBlocks,
             annotations: annotations.length > 0 ? annotations : undefined,
+            refusal: refusalText || undefined,
           },
           logprobs: null,
           // Keep partial call bytes for fidelity, but length/refusal is the
@@ -1517,7 +2137,7 @@ export class OpenAIResponsesTransformer implements Transformer {
             ? "content_filter"
             : responseIsIncomplete
               ? "length"
-              : toolCalls
+              : toolCalls.length > 0
                 ? "tool_calls"
                 : "stop",
         },
@@ -1530,6 +2150,9 @@ export class OpenAIResponsesTransformer implements Transformer {
             prompt_tokens_details: {
               cached_tokens:
                 responseData.usage.input_tokens_details?.cached_tokens || 0,
+              cache_write_tokens:
+                responseData.usage.input_tokens_details?.cache_write_tokens ||
+                0,
             },
           }
         : null,

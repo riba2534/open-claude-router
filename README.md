@@ -45,6 +45,7 @@ Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(Ope
 - **同时支持 OpenAI 两套协议**：默认走 Chat Completions（兼容 OpenAI 官方、OpenRouter、各类 OpenAI 兼容网关 / Kimi / DeepSeek 等），通过 `X-Upstream-Format: responses` opt-in 切到 Responses API（OpenAI o-series / gpt-5 原生协议，含 reasoning summary 转 Anthropic `thinking` 块）
 - **alias 里完成全部配置**：模型映射、上游 URL、上游凭证、服务鉴权、额外网关 header 都能通过 Claude Code alias 注入
 - **模型名映射**：客户端保留 `claude-*` 名称以启用 Claude Code 能力，上游收到真实模型名
+- **结构化输出与严格工具**：Anthropic `output_config.format` 和 `tools[].strict` 分别映射到 Chat Completions / Responses 的正式结构，不按模型名猜测支持能力
 - **上游错误统一交给客户端重试**：上游返回任意非 2xx 时保留原状态码和错误内容，同时响应 `X-Should-Retry: true`，由 Claude Code 使用自身有界重试策略处理；服务端不重复请求上游
 - **两种接入方式**：上游信息可以放 HTTP header，也可以直接拼在 URL path 里
 - **轻量好部署**：esbuild 打包为单文件，Docker 镜像几十 MB，开箱即用
@@ -215,16 +216,18 @@ myocr
 | 能力 | 默认（Chat Completions） | Responses API |
 |---|---|---|
 | 文本流式 SSE | ✅ 正式处理 multi-data、LF/CRLF/CR 与跨 chunk UTF-8；兼容 EOF trailing event | 同左 |
-| 工具调用（`tool_use` / `tool_result` 双向增量） | ✅ 含现代 `tool_calls` 并行工具；流式工具增量会先按调用缓冲，再输出合法的顺序 block | ✅ 含并行工具；历史文本与调用均保留，但原 content block 的交错位置会被归一化 |
+| 工具调用（`tool_use` / `tool_result` 双向增量） | ✅ 含现代 `tool_calls` 并行工具；流式工具增量会先按调用缓冲，再输出合法的顺序 block | ✅ 含并行工具；历史 thinking/text/tool block 通过内部有序表示保真回放为 Responses items |
 | 顶层多模态图片（base64 / URL） | ✅ 标准 `image_url` | ✅ 标准 `input_image` |
 | `tool_result` 中的图片 / 文件 | ⚠️ Chat 的 tool message 只能放文本；图片及可表示为 `file_data` / `file_id` 的文件会在整组 tool message 后转成标准 user 多模态 sidecar。视觉/文件输入得以保留，但原始跨模态顺序及与具体 tool 的强绑定会降级；URL-only 文件转有界文本 | ✅ `function_call_output.output` 原生保留 `input_text` / `input_image` / `input_file` 多 block 数组的顺序与归属；纯文本保持 string 以兼容旧端点 |
 | document / file block | ✅ base64 / text source 转 Chat `file_data`，Anthropic `file_id` 转 Chat `file_id`；Chat 没有正式 `file_url`，URL source 转含 URL 的有界文本；未知/`source:content` 安全降级 | ✅ 转成 `input_file`，支持 `file_data` / `file_id` / `file_url` / `filename`；未知/`source:content` 安全降级 |
 | `/model sonnet` / `opus` / haiku 切换 | ✅ body.model 字段透传 | 同左 |
 | 客户端中断（Ctrl+C） | ✅ AbortSignal 传到上游 | 同左 |
 | `output_config.effort` / `thinking` budget | ✅ `low/medium/high/xhigh/max` 精确转成 `reasoning_effort`，不按模型名截断；`thinking.type:"enabled"` 必须提供有限整数且 `budget_tokens >= 1024`，`adaptive` 必须省略 budget | ✅ 显式 effort 精确转成 `reasoning.effort`；没有显式 effort 时，只有合法 enabled budget 才派生 heuristic 档位，adaptive 交给上游默认 |
-| `thinking` 块 / display | ⚠️ 使用兼容扩展 `reasoning_content`；没有通用的 OpenAI 标准等价物。客户端显式 `display:"omitted"` 时保留空 thinking block / signature、隐藏 thinking 文本；未显式设置时不猜模型默认 | ✅ reasoning summary / `reasoning_text` 转 thinking；`{item id, encrypted_content}` 封装成 opaque signature，多个 reasoning item 各自独立封口并按与 tool call 的邻接关系交错回放。显式 omitted 不请求 detailed summary，但仍请求 encrypted state，并在 JSON/SSE 中只返回空 thinking + signature |
+| `thinking` 块 / display | ⚠️ 使用兼容扩展 `reasoning_content`；Chat 没有可承载 encrypted replay state 的标准字段。普通 visible reasoning 可转换；显式 `display:"omitted"` 遇到只有明文 reasoning 的 Chat 上游时返回 502，而不是伪造不可回放的 signature | ✅ reasoning summary / `reasoning_text` 转 thinking；`{item id, encrypted_content}` 封装成 opaque signature，多个 reasoning item 独立封口并按与 tool call 的邻接关系回放。显式 omitted 不请求 detailed summary，但仍请求 encrypted state；缺 id 或 encrypted state 时按上游协议错误处理 |
+| 严格工具 / 结构化输出 | ✅ `tools[].strict` 保真；`output_config.format` → `response_format.json_schema` | ✅ 未声明 strict 时显式发送 `strict:false`；`output_config.format` → `text.format` |
+| citations / web search | ⚠️ Chat annotation 没有对应 server call/action 时有界文本降级，不伪造空 query | ⚠️ `web_search_call` 与 citation 都按有界 typed JSON 文本保留 id/action/query/URL/range；Responses citation 没有 search-call 归属字段，Router 不猜测配对关系。document citations 与 structured output 同时启用时本地返回 400 |
 | refusal / content filter | ✅ refusal 文本保留为普通 assistant 文本；`content_filter` 映射 `stop_reason:"refusal"`，并返回 `{type:"refusal",category:null,explanation}` 形式的 `stop_details` | 同左；流式与非流式、SSE 聚合保持一致 |
-| incomplete / 截断工具调用 | ✅ Chat `length` 映射 `max_tokens`；已到达的调用名/参数字节仍保留，但不把截断调用宣传为可执行终态 | ✅ response 或任一 function item 为 incomplete 时 `max_tokens` 优先于 `tool_use`；refusal/content filter 优先级更高；仅完整调用以 `tool_use` 结束 |
+| incomplete / 截断工具调用 | ✅ Chat `length` 映射 `max_tokens`；调用名/参数原始字节以有界文本诊断保留，不生成可执行 `tool_use` | ✅ response 或任一 function item 为 incomplete 时同样以有界文本保留 partial bytes，`max_tokens` 优先于 `tool_use`；仅完整调用以 `tool_use` 结束 |
 | legacy `function_call`（旧式 Chat 工具调用） | ✅ 流式与非流式均归一为 `tool_use`，不会静默丢弃 | 不适用 |
 | 流式/非流式形态错位 | ✅ 响应形态永远跟随客户端 `stream` 标志：上游对 `stream:true` 回 JSON 时合成完整 SSE，对 `stream:false` 回 SSE 时聚合成 JSON | 同左 |
 | Prompt cache（`cache_control`） | ⚠️ Anthropic 显式 breakpoint 会被剥（避免严格上游 400）；若上游自行报告 cached tokens，usage 会映射返回 | 同左 |
@@ -246,7 +249,7 @@ npm run test:stream
 npm run build
 ```
 
-本轮自动化回归为 119/119 通过。另用 `scripts/verify-live-upstream.ts` 对两套独立的 Chat Completions / Responses 兼容上游各运行 23 个脱敏用例，合计 45 passed / 1 classified skip / 0 failed：覆盖流式/非流式文本、单/并行工具、base64/URL 图片、嵌套 `tool_result`、两协议 document、reasoning usage、reasoning 历史回放，以及两个协议的无效模型错误。一套上游为 23/23 全通过（包括 Responses reasoning 跨轮回放）；另一套为 22 passed / 1 classified skip，其唯一 skip 是跨请求回放 reasoning item 时返回 409 `item not found / different resource`，且不经过 Router 的直接两轮 Responses 回放也得到同类 409，因此归类为该兼容网关的跨资源状态限制。无效模型 404/502 和该 409 均由 Router 保留状态、Anthropic error envelope 与 `X-Should-Retry:true`；报告不记录 endpoint、模型名或凭证。可用自己的上游复跑：
+本轮自动化回归为 141/141 通过。另用 `scripts/verify-live-upstream.ts` 对两套独立的 Chat Completions / Responses 兼容上游运行脱敏真实用例，既有完整矩阵合计 45 passed / 1 classified skip / 0 failed；本次收口又以最新生产构建在可访问的独立上游复跑全部 23 项文本、流式、单/并行工具、base64/URL 图片、document、嵌套 `tool_result`、reasoning 回放和错误边界用例，23/23 通过。另一内网上游从当前执行环境无法建立连接，因此只记为环境不可达，不归因于协议转换。完整矩阵中的唯一 classified skip 是兼容网关跨请求回放 reasoning item 时返回 409 `item not found / different resource`，且不经过 Router 的直接两轮 Responses 回放也得到同类 409，因此归类为该网关的跨资源状态限制。无效模型 404/502 和该 409 均由 Router 保留状态、Anthropic error envelope 与 `X-Should-Retry:true`；报告不记录 endpoint、模型名或凭证。可用自己的上游复跑：
 
 ```bash
 OCR_LIVE_ROUTER_URL=http://127.0.0.1:3457 \
@@ -256,6 +259,19 @@ OCR_LIVE_AUTH='<authorization-value>' \
 OCR_LIVE_MODEL=<model> \
 npm run test:live
 ```
+
+### 发布 Docker 镜像
+
+推送版本 tag 时，GitHub Actions 会自动执行类型检查、全部回归、流式验证和构建，通过后发布 `linux/amd64`、`linux/arm64` 多架构镜像并校验 manifest / attestations。发布前须在仓库 Actions secrets 配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`；tag 必须是 SemVer（可带 `v` 前缀），且版本必须与 `package.json` 完全一致：
+
+```bash
+npm version 0.5.0 --no-git-tag-version --allow-same-version
+git commit -am "chore: release 0.5.0"
+git tag v0.5.0
+git push origin HEAD --follow-tags
+```
+
+稳定版本会发布 `0.5.0`、`0.5` 和 `latest`；预发布版本不会覆盖 `latest`。
 
 ## API
 

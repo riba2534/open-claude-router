@@ -183,7 +183,16 @@ async function forwardMessages(
   if (format === "responses") {
     upstreamForAnthropic = await responsesT.transformResponseOut!(
       upstreamResponse,
+      {
+        thinkingDisplay: (body as any).thinking?.display,
+      },
     );
+    // Some Responses-compatible endpoints encode a failed response inside an
+    // HTTP 2xx JSON body. Once converted to its semantic 4xx/5xx status, keep
+    // the same retry contract as ordinary upstream HTTP errors.
+    if (upstreamForAnthropic.status >= 400) {
+      reply.header("x-should-retry", "true");
+    }
   }
 
   // Step 5: unified -> Anthropic SSE / JSON
@@ -248,7 +257,20 @@ async function forwardMessages(
 
   // stream:false but the upstream streamed anyway: aggregate to one message.
   // Stream-level errors throw a 502 ApiError instead of a fake completion.
-  const aggregated = await aggregateAnthropicSseToMessage(finalResponse);
+  let aggregated: any;
+  try {
+    aggregated = await aggregateAnthropicSseToMessage(finalResponse);
+  } catch (error: any) {
+    if (
+      format === "responses" &&
+      error?.code === "upstream_responses_error" &&
+      Number.isInteger(error?.statusCode) &&
+      error.statusCode >= 400
+    ) {
+      reply.header("x-should-retry", "true");
+    }
+    throw error;
+  }
   reply.header("content-type", "application/json");
   return aggregated;
 }
