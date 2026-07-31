@@ -1,5 +1,64 @@
 import { UnifiedChatRequest, MessageContent } from "../types/llm.js";
 import { Transformer } from "../types/transformer.js";
+import { SseBlockDecoder } from "./sse.js";
+
+const REASONING_SIGNATURE_PREFIX = "ocr-responses-reasoning-v1:";
+
+function encodeReasoningSignature(
+  id: string | undefined,
+  encryptedContent: string | undefined,
+): string | undefined {
+  if (!id || !encryptedContent) return undefined;
+  return (
+    REASONING_SIGNATURE_PREFIX +
+    Buffer.from(
+      JSON.stringify({ id, encrypted_content: encryptedContent }),
+      "utf8",
+    ).toString("base64url")
+  );
+}
+
+function decodeReasoningSignature(
+  signature: string | undefined,
+): { id: string; encrypted_content: string } | null {
+  if (!signature?.startsWith(REASONING_SIGNATURE_PREFIX)) return null;
+  try {
+    const decoded = JSON.parse(
+      Buffer.from(
+        signature.slice(REASONING_SIGNATURE_PREFIX.length),
+        "base64url",
+      ).toString("utf8"),
+    );
+    if (
+      typeof decoded?.id === "string" &&
+      decoded.id.length > 0 &&
+      typeof decoded?.encrypted_content === "string" &&
+      decoded.encrypted_content.length > 0
+    ) {
+      return {
+        id: decoded.id,
+        encrypted_content: decoded.encrypted_content,
+      };
+    }
+  } catch {
+    // Unknown/native Anthropic signatures must never leak into Responses.
+  }
+  return null;
+}
+
+function mapResponsesErrorType(code: string | undefined): string {
+  if (code === "rate_limit_exceeded") return "rate_limit_error";
+  if (
+    code === "invalid_prompt" ||
+    code?.startsWith("invalid_") ||
+    code?.startsWith("unsupported_") ||
+    code?.startsWith("empty_") ||
+    code?.startsWith("failed_to_")
+  ) {
+    return "invalid_request_error";
+  }
+  return "api_error";
+}
 
 interface ResponsesAPIOutputItem {
   type: string;
@@ -10,6 +69,7 @@ interface ResponsesAPIOutputItem {
   content?: Array<{
     type: string;
     text?: string;
+    refusal?: string;
     image_url?: string;
     mime_type?: string;
     image_base64?: string;
@@ -21,6 +81,8 @@ interface ResponsesAPIOutputItem {
     }>;
   }>;
   reasoning?: string;
+  summary?: Array<{ type?: string; text?: string }>;
+  encrypted_content?: string;
 }
 
 interface ResponsesAPIPayload {
@@ -33,6 +95,13 @@ interface ResponsesAPIPayload {
     input_tokens: number;
     output_tokens: number;
     total_tokens: number;
+    input_tokens_details?: {
+      cached_tokens?: number;
+    };
+  };
+  status?: string;
+  incomplete_details?: {
+    reason?: string;
   };
 }
 
@@ -40,6 +109,8 @@ interface ResponsesStreamEvent {
   type: string;
   item_id?: string;
   output_index?: number;
+  content_index?: number;
+  summary_index?: number;
   delta?:
     | string
     | {
@@ -52,20 +123,53 @@ interface ResponsesStreamEvent {
     type?: string;
     call_id?: string;
     name?: string;
+    arguments?: string;
     content?: Array<{
       type: string;
       text?: string;
+      refusal?: string;
       image_url?: string;
       mime_type?: string;
     }>;
     reasoning?: string; // 添加 reasoning 字段支持
+    summary?: Array<{ type?: string; text?: string }>;
+    encrypted_content?: string;
   };
+  text?: string;
+  refusal?: string;
+  arguments?: string;
   response?: {
     id?: string;
     model?: string;
+    created_at?: number;
+    status?: string;
+    incomplete_details?: {
+      reason?: string;
+    };
     output?: Array<{
       type: string;
+      encrypted_content?: string;
     }>;
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      total_tokens?: number;
+      input_tokens_details?: {
+        cached_tokens?: number;
+      };
+    };
+    error?: {
+      code?: string;
+      message?: string;
+    } | null;
+  };
+  code?: string | null;
+  message?: string;
+  param?: string | null;
+  error?: {
+    type?: string;
+    code?: string;
+    message?: string;
   };
   reasoning_summary?: string; // 添加推理摘要支持
   annotation?: {
@@ -85,48 +189,33 @@ export class OpenAIResponsesTransformer implements Transformer {
   async transformRequestIn(
     request: UnifiedChatRequest
   ): Promise<UnifiedChatRequest> {
-    delete request.temperature;
-    // max_tokens → max_output_tokens（Responses API 使用后者控制输出长度）
     if (request.max_tokens != null) {
       (request as any).max_output_tokens = request.max_tokens;
     }
     delete request.max_tokens;
+    // Responses has no direct stop-sequence request parameter.
+    delete request.stop;
 
-    // 处理 reasoning 参数
-    if (request.reasoning) {
+    const reasoningEffort =
+      request.reasoning_effort ?? request.reasoning?.effort;
+    const reasoningOutputRequested = request.reasoning?.enabled === true;
+    if (reasoningEffort || reasoningOutputRequested) {
       (request as any).reasoning = {
-        effort: request.reasoning.effort,
-        summary: "detailed",
+        ...(reasoningEffort ? { effort: reasoningEffort } : {}),
+        ...(reasoningOutputRequested ? { summary: "detailed" } : {}),
       };
+    } else {
+      delete request.reasoning;
     }
+    if (reasoningOutputRequested) {
+      (request as any).include = ["reasoning.encrypted_content"];
+    }
+    delete request.reasoning_effort;
 
     const input: any[] = [];
 
-    const systemMessages = request.messages.filter(
-      (msg) => msg.role === "system"
-    );
-    if (systemMessages.length > 0) {
-      const firstSystem = systemMessages[0];
-      if (Array.isArray(firstSystem.content)) {
-        firstSystem.content.forEach((item) => {
-          let text = "";
-          if (typeof item === "string") {
-            text = item;
-          } else if (item && typeof item === "object" && "text" in item) {
-            text = (item as { text: string }).text;
-          }
-          input.push({
-            role: "system",
-            content: text,
-          });
-        });
-      } else {
-        (request as any).instructions = firstSystem.content;
-      }
-    }
-
     request.messages.forEach((message) => {
-      if (message.role === "system") return;
+      const convertedMessage: any = { ...message };
 
       if (Array.isArray(message.content)) {
         const convertedContent = message.content
@@ -136,23 +225,49 @@ export class OpenAIResponsesTransformer implements Transformer {
           );
 
         if (convertedContent.length > 0) {
-          (message as any).content = convertedContent;
+          convertedMessage.content = convertedContent;
         } else {
-          delete (message as any).content;
+          convertedMessage.content = "";
         }
       }
 
       if (message.role === "tool") {
-        const toolMessage: any = { ...message };
-        toolMessage.type = "function_call_output";
-        toolMessage.call_id = message.tool_call_id;
-        toolMessage.output = message.content;
-        delete toolMessage.cache_control;
-        delete toolMessage.role;
-        delete toolMessage.tool_call_id;
-        delete toolMessage.content;
-        input.push(toolMessage);
+        input.push({
+          type: "function_call_output",
+          call_id: message.tool_call_id,
+          output: convertedMessage.content ?? "",
+        });
         return;
+      }
+
+      if (message.role === "assistant") {
+        const thinking = message.thinking;
+        const replayableReasoning = decodeReasoningSignature(
+          thinking?.signature,
+        );
+        if (replayableReasoning) {
+          input.push({
+            type: "reasoning",
+            id: replayableReasoning.id,
+            encrypted_content: replayableReasoning.encrypted_content,
+            summary: [],
+          });
+        }
+
+        const hasContent =
+          typeof convertedMessage.content === "string"
+            ? convertedMessage.content.length > 0
+            : Array.isArray(convertedMessage.content) &&
+              convertedMessage.content.length > 0;
+        if (hasContent || !Array.isArray(message.tool_calls)) {
+          delete convertedMessage.tool_calls;
+          delete convertedMessage.thinking;
+          delete convertedMessage.cache_control;
+          input.push(convertedMessage);
+        }
+      } else {
+        delete convertedMessage.cache_control;
+        input.push(convertedMessage);
       }
 
       if (message.role === "assistant" && Array.isArray(message.tool_calls)) {
@@ -164,56 +279,19 @@ export class OpenAIResponsesTransformer implements Transformer {
             call_id: tool.id,
           });
         });
-        return;
       }
-
-      input.push(message);
     });
 
     (request as any).input = input;
     delete (request as any).messages;
 
     if (Array.isArray(request.tools)) {
-      const webSearch = request.tools.find(
-        (tool) => tool.function.name === "web_search"
-      );
-
-      (request as any).tools = request.tools
-        .filter((tool) => tool.function.name !== "web_search")
-        .map((tool) => {
-          if (tool.function.name === "WebSearch") {
-            delete tool.function.parameters.properties.allowed_domains;
-          }
-          if (tool.function.name === "Edit") {
-            return {
-              type: tool.type,
-              name: tool.function.name,
-              description: tool.function.description,
-              parameters: {
-                ...tool.function.parameters,
-                required: [
-                  "file_path",
-                  "old_string",
-                  "new_string",
-                  "replace_all",
-                ],
-              },
-              strict: true,
-            };
-          }
-          return {
-            type: tool.type,
-            name: tool.function.name,
-            description: tool.function.description,
-            parameters: tool.function.parameters,
-          };
-        });
-
-      if (webSearch) {
-        (request as any).tools.push({
-          type: "web_search",
-        });
-      }
+      (request as any).tools = request.tools.map((tool) => ({
+        type: tool.type,
+        name: tool.function.name,
+        description: tool.function.description,
+        parameters: tool.function.parameters,
+      }));
     }
 
     // tool_choice 格式转换：unified { type: "function", function: { name } }
@@ -229,8 +307,6 @@ export class OpenAIResponsesTransformer implements Transformer {
       // "auto" / "none" / "required" 等简单值直接透传
     }
 
-    (request as any).parallel_tool_calls = false;
-
     return request;
   }
 
@@ -242,6 +318,22 @@ export class OpenAIResponsesTransformer implements Transformer {
 
       // 检查是否为responses API格式的JSON响应
       if (jsonResponse.object === "response" && jsonResponse.output) {
+        if (jsonResponse.status === "failed") {
+          return new Response(
+            JSON.stringify({
+              error: {
+                type: mapResponsesErrorType(jsonResponse.error?.code),
+                message:
+                  jsonResponse.error?.message ||
+                  "Responses request failed",
+              },
+            }),
+            {
+              status: 500,
+              headers: { "Content-Type": "application/json" },
+            },
+          );
+        }
         // 将responses格式转换为chat格式
         const chatResponse = this.convertResponseToChat(jsonResponse);
         return new Response(JSON.stringify(chatResponse), {
@@ -262,15 +354,14 @@ export class OpenAIResponsesTransformer implements Transformer {
         return response;
       }
 
-      const decoder = new TextDecoder();
       const encoder = new TextEncoder();
-      let buffer = ""; // 用于缓冲不完整的数据
       let isStreamEnded = false;
 
       const transformer = this;
       const stream = new ReadableStream({
         async start(controller) {
           const reader = response.body!.getReader();
+          const sseDecoder = new SseBlockDecoder();
 
           // 索引跟踪变量，只有在事件类型切换时才增加索引
           let currentIndex = -1;
@@ -289,63 +380,142 @@ export class OpenAIResponsesTransformer implements Transformer {
           // 支持多工具并行调用场景
           const toolCallIndexMap = new Map<string, number>();
           let nextToolCallIndex = 0;
+          let streamId = "chatcmpl-" + Date.now();
+          let streamModel = "unknown";
+          let streamCreated = Math.floor(Date.now() / 1000);
+          const textDeltaParts = new Set<string>();
+          const refusalDeltaParts = new Set<string>();
+          const argumentDeltaItems = new Set<string>();
+          const reasoningSummaryParts = new Set<string>();
+          const reasoningTextParts = new Set<string>();
+          const functionItemsAdded = new Set<string>();
+          let stopReading = false;
+          let fatalStreamError = false;
+          const getEventItemKey = (event: ResponsesStreamEvent): string =>
+            event.item_id ||
+            event.item?.id ||
+            `output:${event.output_index ?? "unknown"}`;
+          const getContentPartKey = (
+            event: ResponsesStreamEvent,
+            contentIndex = event.content_index ?? 0,
+          ): string => `${getEventItemKey(event)}:content:${contentIndex}`;
+          const getSummaryPartKey = (
+            event: ResponsesStreamEvent,
+            summaryIndex = event.summary_index ?? 0,
+          ): string => `${getEventItemKey(event)}:summary:${summaryIndex}`;
           const getToolCallIndex = (itemId: string): number => {
             if (!toolCallIndexMap.has(itemId)) {
               toolCallIndexMap.set(itemId, nextToolCallIndex++);
             }
             return toolCallIndexMap.get(itemId)!;
           };
+          const emitChatDelta = (
+            itemId: string | undefined,
+            eventType: string,
+            delta: Record<string, unknown>,
+          ) => {
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({
+                  id: itemId || streamId,
+                  object: "chat.completion.chunk",
+                  created: streamCreated,
+                  model: streamModel,
+                  choices: [
+                    {
+                      index: getCurrentIndex(eventType),
+                      delta,
+                      finish_reason: null,
+                    },
+                  ],
+                })}\n\n`,
+              ),
+            );
+          };
+          const emitFatalStreamError = (
+            message: string,
+            error: unknown,
+            data: string,
+          ) => {
+            if (fatalStreamError) return;
+            transformer.logger?.error(
+              { err: error, data },
+              message,
+            );
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({
+                  id: streamId,
+                  object: "chat.completion.chunk",
+                  created: streamCreated,
+                  model: streamModel,
+                  error: {
+                    type: "api_error",
+                    message: "malformed upstream SSE event",
+                  },
+                  choices: [],
+                })}\n\n`,
+              ),
+            );
+            fatalStreamError = true;
+            isStreamEnded = true;
+            stopReading = true;
+          };
 
           try {
             while (true) {
               const { done, value } = await reader.read();
-              if (done) {
-                if (!isStreamEnded) {
-                  // 发送结束标记
-                  const doneChunk = `data: [DONE]\n\n`;
-                  controller.enqueue(encoder.encode(doneChunk));
-                }
-                break;
-              }
+              const events = done
+                ? sseDecoder.finish()
+                : sseDecoder.push(value);
 
-              const chunk = decoder.decode(value, { stream: true });
-              buffer += chunk;
-
-              // 处理缓冲区中完整的数据行
-              let lines = buffer.split(/\r?\n/);
-              buffer = lines.pop() || ""; // 最后一行可能不完整，保留在缓冲区
-
-              for (const line of lines) {
-                if (!line.trim()) continue;
-
+              for (const event of events) {
+                const dataStr = event.data.trim();
                 try {
-                  if (line.startsWith("event: ")) {
-                    // 处理事件行，暂存以便与下一行数据配对
-                    continue;
-                  } else if (line.startsWith("data: ")) {
-                    const dataStr = line.slice(5).trim(); // 移除 "data: " 前缀
-                    if (dataStr === "[DONE]") {
-                      isStreamEnded = true;
-                      controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
-                      continue;
-                    }
+                  if (dataStr === "[DONE]") {
+                    isStreamEnded = true;
+                    controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
+                    stopReading = true;
+                    break;
+                  }
 
-                    try {
-                      const data: ResponsesStreamEvent = JSON.parse(dataStr);
+                  try {
+                    const data: ResponsesStreamEvent = JSON.parse(dataStr);
 
                       // 根据不同的事件类型转换为chat格式
-                      if (data.type === "response.output_text.delta") {
+                      if (data.type === "response.created") {
+                        streamId = data.response?.id || streamId;
+                        streamModel = data.response?.model || streamModel;
+                        streamCreated =
+                          data.response?.created_at || streamCreated;
+                        const metadataChunk = {
+                          id: streamId,
+                          object: "chat.completion.chunk",
+                          created: streamCreated,
+                          model: streamModel,
+                          choices: [],
+                        };
+                        controller.enqueue(
+                          encoder.encode(
+                            `data: ${JSON.stringify(metadataChunk)}\n\n`,
+                          ),
+                        );
+                      } else if (data.type === "response.output_text.delta") {
+                        const textDelta =
+                          typeof data.delta === "string" ? data.delta : "";
+                        if (!textDelta) continue;
+                        textDeltaParts.add(getContentPartKey(data));
                         // 将output_text.delta转换为chat格式
                         const chatChunk = {
                           id: data.item_id || "chatcmpl-" + Date.now(),
                           object: "chat.completion.chunk",
                           created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model,
+                          model: streamModel,
                           choices: [
                             {
                               index: getCurrentIndex(data.type),
                               delta: {
-                                content: data.delta || "",
+                                content: textDelta,
                               },
                               finish_reason: null,
                             },
@@ -361,6 +531,9 @@ export class OpenAIResponsesTransformer implements Transformer {
                         data.type === "response.output_item.added" &&
                         data.item?.type === "function_call"
                       ) {
+                        if (data.item?.id) {
+                          functionItemsAdded.add(data.item.id);
+                        }
                         // 处理function call开始 - 创建初始的tool call chunk
                         const functionCallChunk = {
                           id:
@@ -369,7 +542,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                             "chatcmpl-" + Date.now(),
                           object: "chat.completion.chunk",
                           created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model || "gpt-5-codex-",
+                          model: streamModel,
                           choices: [
                             {
                               index: getCurrentIndex(data.type),
@@ -411,47 +584,59 @@ export class OpenAIResponsesTransformer implements Transformer {
                         data.type === "response.output_item.added" &&
                         data.item?.type === "message"
                       ) {
-                        // 处理message item added事件
-                        const contentItems: MessageContent[] = [];
-                        (data.item.content || []).forEach((item: any) => {
-                          if (item.type === "output_text") {
-                            contentItems.push({
-                              type: "text",
-                              text: item.text || "",
-                            });
+                        const initialContent: string[] = [];
+                        (data.item.content || []).forEach((part, index) => {
+                          const partEvent = {
+                            ...data,
+                            item_id: data.item?.id || data.item_id,
+                          };
+                          if (part.type === "output_text" && part.text) {
+                            textDeltaParts.add(
+                              getContentPartKey(partEvent, index),
+                            );
+                            initialContent.push(part.text);
+                          } else if (part.type === "refusal" && part.refusal) {
+                            refusalDeltaParts.add(
+                              getContentPartKey(partEvent, index),
+                            );
+                            initialContent.push(part.refusal);
                           }
                         });
-
-                        const delta: any = { role: "assistant" };
-                        if (
-                          contentItems.length === 1 &&
-                          contentItems[0].type === "text"
-                        ) {
-                          delta.content = contentItems[0].text;
-                        } else if (contentItems.length > 0) {
-                          delta.content = contentItems;
+                        if (initialContent.length > 0) {
+                          emitChatDelta(data.item.id, data.type, {
+                            role: "assistant",
+                            content: initialContent.join(""),
+                          });
                         }
-                        if (delta.content) {
-                          const messageChunk = {
-                            id: data.item.id || "chatcmpl-" + Date.now(),
-                            object: "chat.completion.chunk",
-                            created: Math.floor(Date.now() / 1000),
-                            model: data.response?.model,
-                            choices: [
-                              {
-                                index: getCurrentIndex(data.type),
-                                delta,
-                                finish_reason: null,
-                              },
-                            ],
-                          };
-
-                          controller.enqueue(
-                            encoder.encode(
-                              `data: ${JSON.stringify(messageChunk)}\n\n`
-                            )
-                          );
+                      } else if (
+                        data.type === "response.output_text.done" &&
+                        data.text &&
+                        !textDeltaParts.has(getContentPartKey(data))
+                      ) {
+                        textDeltaParts.add(getContentPartKey(data));
+                        emitChatDelta(data.item_id, data.type, {
+                          content: data.text,
+                        });
+                      } else if (
+                        data.type === "response.refusal.delta"
+                      ) {
+                        const refusalDelta =
+                          typeof data.delta === "string" ? data.delta : "";
+                        if (refusalDelta) {
+                          refusalDeltaParts.add(getContentPartKey(data));
+                          emitChatDelta(data.item_id, data.type, {
+                            content: refusalDelta,
+                          });
                         }
+                      } else if (
+                        data.type === "response.refusal.done" &&
+                        data.refusal &&
+                        !refusalDeltaParts.has(getContentPartKey(data))
+                      ) {
+                        refusalDeltaParts.add(getContentPartKey(data));
+                        emitChatDelta(data.item_id, data.type, {
+                          content: data.refusal,
+                        });
                       } else if (
                         data.type === "response.output_text.annotation.added"
                       ) {
@@ -459,7 +644,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                           id: data.item_id || "chatcmpl-" + Date.now(),
                           object: "chat.completion.chunk",
                           created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model || "gpt-5-codex",
+                          model: streamModel,
                           choices: [
                             {
                               index: getCurrentIndex(data.type),
@@ -492,12 +677,16 @@ export class OpenAIResponsesTransformer implements Transformer {
                       } else if (
                         data.type === "response.function_call_arguments.delta"
                       ) {
+                        const argumentDelta =
+                          typeof data.delta === "string" ? data.delta : "";
+                        if (!argumentDelta) continue;
+                        if (data.item_id) argumentDeltaItems.add(data.item_id);
                         // 处理function call参数增量
                         const functionCallChunk = {
                           id: data.item_id || "chatcmpl-" + Date.now(),
                           object: "chat.completion.chunk",
                           created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model || "gpt-5-codex-",
+                          model: streamModel,
                           choices: [
                             {
                               index: getCurrentIndex(data.type),
@@ -508,7 +697,7 @@ export class OpenAIResponsesTransformer implements Transformer {
                                       data.item_id || ""
                                     ),
                                     function: {
-                                      arguments: data.delta || "",
+                                      arguments: argumentDelta,
                                     },
                                   },
                                 ],
@@ -523,19 +712,43 @@ export class OpenAIResponsesTransformer implements Transformer {
                             `data: ${JSON.stringify(functionCallChunk)}\n\n`
                           )
                         );
-                      } else if (data.type === "response.completed") {
-                        // 发送结束标记 - 检查是否是tool_calls完成
+                      } else if (
+                        data.type === "response.function_call_arguments.done" &&
+                        data.arguments &&
+                        !argumentDeltaItems.has(data.item_id || "")
+                      ) {
+                        if (data.item_id) argumentDeltaItems.add(data.item_id);
+                        emitChatDelta(data.item_id, data.type, {
+                          tool_calls: [
+                            {
+                              index: getToolCallIndex(data.item_id || ""),
+                              function: { arguments: data.arguments },
+                            },
+                          ],
+                        });
+                      } else if (
+                        data.type === "response.completed" ||
+                        data.type === "response.incomplete"
+                      ) {
                         const finishReason = data.response?.output?.some(
                           (item: any) => item.type === "function_call"
                         )
                           ? "tool_calls"
-                          : "stop";
+                          : data.type === "response.incomplete"
+                            ? data.response?.incomplete_details?.reason ===
+                              "content_filter"
+                              ? "content_filter"
+                              : "length"
+                            : "stop";
+                        const cachedTokens =
+                          data.response?.usage?.input_tokens_details
+                            ?.cached_tokens || 0;
 
                         const endChunk = {
-                          id: data.response?.id || "chatcmpl-" + Date.now(),
+                          id: data.response?.id || streamId,
                           object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model || "gpt-5-codex-",
+                          created: streamCreated,
+                          model: data.response?.model || streamModel,
                           choices: [
                             {
                               index: 0,
@@ -543,6 +756,19 @@ export class OpenAIResponsesTransformer implements Transformer {
                               finish_reason: finishReason,
                             },
                           ],
+                          usage: data.response?.usage
+                            ? {
+                                prompt_tokens:
+                                  (data.response.usage.input_tokens || 0),
+                                completion_tokens:
+                                  data.response.usage.output_tokens || 0,
+                                total_tokens:
+                                  data.response.usage.total_tokens || 0,
+                                prompt_tokens_details: {
+                                  cached_tokens: cachedTokens,
+                                },
+                              }
+                            : undefined,
                         };
 
                         controller.enqueue(
@@ -551,80 +777,234 @@ export class OpenAIResponsesTransformer implements Transformer {
                           )
                         );
                         isStreamEnded = true;
+                        stopReading = true;
+                      } else if (
+                        data.type === "error" ||
+                        data.type === "response.failed"
+                      ) {
+                        const errorChunk = {
+                          id: data.response?.id || streamId,
+                          object: "chat.completion.chunk",
+                          created: streamCreated,
+                          model: data.response?.model || streamModel,
+                          error:
+                            data.type === "error"
+                              ? {
+                                  type: data.code || "api_error",
+                                  message:
+                                    data.message || "Responses stream error",
+                                }
+                              : data.response?.error ||
+                                data.error || {
+                                  type: "api_error",
+                                  message: "Responses stream failed",
+                                },
+                          choices: [],
+                        };
+                        controller.enqueue(
+                          encoder.encode(
+                            `data: ${JSON.stringify(errorChunk)}\n\n`,
+                          ),
+                        );
+                        isStreamEnded = true;
+                        stopReading = true;
                       } else if (
                         data.type === "response.reasoning_summary_text.delta"
                       ) {
-                        // 处理推理文本，将其转换为 thinking delta 格式
-                        const thinkingChunk = {
-                          id: data.item_id || "chatcmpl-" + Date.now(),
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model,
-                          choices: [
-                            {
-                              index: getCurrentIndex(data.type),
-                              delta: {
-                                thinking: {
-                                  content: data.delta || "",
-                                },
-                              },
-                              finish_reason: null,
-                            },
-                          ],
-                        };
-
-                        controller.enqueue(
-                          encoder.encode(
-                            `data: ${JSON.stringify(thinkingChunk)}\n\n`
-                          )
-                        );
+                        const summaryDelta =
+                          typeof data.delta === "string" ? data.delta : "";
+                        if (summaryDelta) {
+                          reasoningSummaryParts.add(getSummaryPartKey(data));
+                          emitChatDelta(data.item_id, data.type, {
+                            thinking: { content: summaryDelta },
+                          });
+                        }
                       } else if (
-                        data.type === "response.reasoning_summary_part.done" &&
-                        data.part
+                        data.type === "response.reasoning_summary_text.done" &&
+                        data.text &&
+                        !reasoningSummaryParts.has(getSummaryPartKey(data))
                       ) {
-                        const thinkingChunk = {
-                          id: data.item_id || "chatcmpl-" + Date.now(),
-                          object: "chat.completion.chunk",
-                          created: Math.floor(Date.now() / 1000),
-                          model: data.response?.model,
-                          choices: [
-                            {
-                              index: currentIndex,
-                              delta: {
-                                thinking: {
-                                  signature: data.item_id,
+                        reasoningSummaryParts.add(getSummaryPartKey(data));
+                        emitChatDelta(data.item_id, data.type, {
+                          thinking: { content: data.text },
+                        });
+                      } else if (
+                        data.type === "response.reasoning_text.delta"
+                      ) {
+                        const reasoningDelta =
+                          typeof data.delta === "string" ? data.delta : "";
+                        if (reasoningDelta) {
+                          reasoningTextParts.add(getContentPartKey(data));
+                          emitChatDelta(data.item_id, data.type, {
+                            thinking: { content: reasoningDelta },
+                          });
+                        }
+                      } else if (
+                        data.type === "response.reasoning_text.done" &&
+                        data.text &&
+                        !reasoningTextParts.has(getContentPartKey(data))
+                      ) {
+                        reasoningTextParts.add(getContentPartKey(data));
+                        emitChatDelta(data.item_id, data.type, {
+                          thinking: { content: data.text },
+                        });
+                      } else if (
+                        data.type === "response.output_item.done" &&
+                        data.item?.type === "message"
+                      ) {
+                        const itemId = data.item.id || data.item_id || "";
+                        (data.item.content || []).forEach((part, index) => {
+                          const partEvent = {
+                            ...data,
+                            item_id: itemId,
+                          };
+                          const partKey = getContentPartKey(partEvent, index);
+                          if (
+                            part.type === "output_text" &&
+                            part.text &&
+                            !textDeltaParts.has(partKey)
+                          ) {
+                            textDeltaParts.add(partKey);
+                            emitChatDelta(itemId, data.type, {
+                              role: "assistant",
+                              content: part.text,
+                            });
+                          } else if (
+                            part.type === "refusal" &&
+                            part.refusal &&
+                            !refusalDeltaParts.has(partKey)
+                          ) {
+                            refusalDeltaParts.add(partKey);
+                            emitChatDelta(itemId, data.type, {
+                              role: "assistant",
+                              content: part.refusal,
+                            });
+                          }
+                        });
+                      } else if (
+                        data.type === "response.output_item.done" &&
+                        data.item?.type === "function_call"
+                      ) {
+                        const itemId = data.item.id || data.item_id || "";
+                        if (!functionItemsAdded.has(itemId)) {
+                          functionItemsAdded.add(itemId);
+                          if (data.item.arguments) {
+                            argumentDeltaItems.add(itemId);
+                          }
+                          emitChatDelta(itemId, data.type, {
+                            role: "assistant",
+                            tool_calls: [
+                              {
+                                index: getToolCallIndex(itemId),
+                                id: data.item.call_id || data.item.id,
+                                function: {
+                                  name: data.item.name || "",
+                                  arguments: data.item.arguments || "",
+                                },
+                                type: "function",
+                              },
+                            ],
+                          });
+                        } else if (
+                          data.item.arguments &&
+                          !argumentDeltaItems.has(itemId)
+                        ) {
+                          argumentDeltaItems.add(itemId);
+                          emitChatDelta(itemId, data.type, {
+                            tool_calls: [
+                              {
+                                index: getToolCallIndex(itemId),
+                                function: {
+                                  arguments: data.item.arguments,
                                 },
                               },
-                              finish_reason: null,
-                            },
-                          ],
-                        };
-
-                        controller.enqueue(
-                          encoder.encode(
-                            `data: ${JSON.stringify(thinkingChunk)}\n\n`
-                          )
+                            ],
+                          });
+                        }
+                      } else if (
+                        data.type === "response.output_item.done" &&
+                        data.item?.type === "reasoning"
+                      ) {
+                        const itemId = data.item.id || data.item_id || "";
+                        const reasoningParts = (data.item.content || [])
+                          .map((part, index) => ({ part, index }))
+                          .filter(({ part }) => part.type === "reasoning_text");
+                        if (reasoningParts.length > 0) {
+                          reasoningParts.forEach(({ part, index }) => {
+                            const partEvent = {
+                              ...data,
+                              item_id: itemId,
+                            };
+                            const partKey = getContentPartKey(partEvent, index);
+                            if (
+                              part.text &&
+                              !reasoningTextParts.has(partKey)
+                            ) {
+                              reasoningTextParts.add(partKey);
+                              emitChatDelta(itemId, data.type, {
+                                thinking: { content: part.text },
+                              });
+                            }
+                          });
+                        } else {
+                          (data.item.summary || []).forEach((part, index) => {
+                            const partEvent = {
+                              ...data,
+                              item_id: itemId,
+                            };
+                            const partKey = getSummaryPartKey(partEvent, index);
+                            if (
+                              part.text &&
+                              !reasoningSummaryParts.has(partKey)
+                            ) {
+                              reasoningSummaryParts.add(partKey);
+                              emitChatDelta(itemId, data.type, {
+                                thinking: { content: part.text },
+                              });
+                            }
+                          });
+                        }
+                        const signature = encodeReasoningSignature(
+                          data.item.id || data.item_id,
+                          data.item.encrypted_content,
                         );
+                        if (signature) {
+                          emitChatDelta(itemId, data.type, {
+                            thinking: { signature },
+                          });
+                        }
                       }
-                    } catch (e) {
-                      // 如果JSON解析失败，传递原始行
-                      controller.enqueue(encoder.encode(line + "\n"));
-                    }
-                  } else {
-                    // 传递其他行
-                    controller.enqueue(encoder.encode(line + "\n"));
+                    if (stopReading) break;
+                  } catch (error) {
+                    emitFatalStreamError(
+                      "Error parsing or transforming SSE event data",
+                      error,
+                      dataStr,
+                    );
+                    break;
                   }
                 } catch (error) {
-                  transformer.logger?.error({ err: error, line }, "Error processing SSE line");
-                  // 如果解析失败，直接传递原始行
-                  controller.enqueue(encoder.encode(line + "\n"));
+                  emitFatalStreamError(
+                    "Error processing SSE event",
+                    error,
+                    dataStr,
+                  );
+                  break;
                 }
               }
-            }
 
-            // 处理缓冲区中剩余的数据
-            if (buffer.trim()) {
-              controller.enqueue(encoder.encode(buffer + "\n"));
+              if (stopReading) {
+                try {
+                  await reader.cancel();
+                } catch (cancelError) {
+                  transformer.logger?.error(
+                    { err: cancelError },
+                    "Responses upstream stream cancel failed",
+                  );
+                }
+                break;
+              }
+              if (done) break;
             }
 
             // 确保流结束时发送结束标记
@@ -662,10 +1042,6 @@ export class OpenAIResponsesTransformer implements Transformer {
   }
 
   private normalizeRequestContent(content: any, role: string | undefined) {
-    // 克隆内容对象并删除缓存控制字段
-    const clone = { ...content };
-    delete clone.cache_control;
-
     if (content.type === "text") {
       return {
         type: role === "assistant" ? "output_text" : "input_text",
@@ -689,20 +1065,19 @@ export class OpenAIResponsesTransformer implements Transformer {
   }
 
   private convertResponseToChat(responseData: ResponsesAPIPayload): any {
-    // 从output数组中提取不同类型的输出
-    const messageOutput = responseData.output?.find(
-      (item) => item.type === "message"
+    const messageOutputs = responseData.output?.filter(
+      (item) => item.type === "message",
     );
     const functionCallOutputs = responseData.output?.filter(
-      (item) => item.type === "function_call"
+      (item) => item.type === "function_call",
     );
-    let annotations;
-    if (
-      messageOutput?.content?.length &&
-      messageOutput?.content[0].annotations
-    ) {
-      annotations = messageOutput.content[0].annotations.map((item) => {
-        return {
+    const reasoningOutputs = responseData.output?.filter(
+      (item) => item.type === "reasoning",
+    );
+    const annotations = messageOutputs
+      .flatMap((message) => message.content || [])
+      .flatMap((item) => item.annotations || [])
+      .map((item) => ({
           type: "url_citation",
           url_citation: {
             url: item.url || "",
@@ -711,68 +1086,70 @@ export class OpenAIResponsesTransformer implements Transformer {
             start_index: item.start_index || 0,
             end_index: item.end_index || 0,
           },
-        };
-      });
-    }
-
-    this.logger?.debug({
-      data: annotations,
-      type: "url_citation",
-    });
+        }));
 
     let messageContent: string | MessageContent[] | null = null;
     let toolCalls: any = null;
     let thinking: any = null;
 
-    // 处理推理内容
-    if (messageOutput && messageOutput.reasoning) {
+    const reasoningText = reasoningOutputs
+      .map((item) => {
+        const contentText = (item.content || [])
+          .filter((part) => part.type === "reasoning_text")
+          .map((part) => part.text || "")
+          .join("");
+        if (contentText) return contentText;
+        return (item.summary || [])
+          .map((part) => part.text || "")
+          .join("");
+      })
+      .filter(Boolean)
+      .join("\n");
+    const encryptedContent = reasoningOutputs.find(
+      (item) => item.encrypted_content,
+    )?.encrypted_content;
+    const reasoningItem = reasoningOutputs.find(
+      (item) => item.encrypted_content,
+    );
+    if (reasoningText || encryptedContent) {
       thinking = {
-        content: messageOutput.reasoning,
+        content: reasoningText,
+        signature: encodeReasoningSignature(
+          reasoningItem?.id,
+          encryptedContent,
+        ),
       };
     }
 
-    if (messageOutput && messageOutput.content) {
-      // 分离文本和图片内容
-      const textParts: string[] = [];
-      const imageParts: MessageContent[] = [];
-
-      messageOutput.content.forEach((item: any) => {
+    if (messageOutputs.length > 0) {
+      const contentParts: MessageContent[] = [];
+      messageOutputs.flatMap((message) => message.content || []).forEach((item: any) => {
         if (item.type === "output_text") {
-          textParts.push(item.text || "");
+          contentParts.push({ type: "text", text: item.text || "" });
+        } else if (item.type === "refusal") {
+          contentParts.push({ type: "text", text: item.refusal || "" });
         } else if (item.type === "output_image") {
           const imageContent = this.buildImageContent({
             url: item.image_url,
             mime_type: item.mime_type,
           });
-          if (imageContent) {
-            imageParts.push(imageContent);
-          }
+          if (imageContent) contentParts.push(imageContent);
         } else if (item.type === "output_image_base64") {
           const imageContent = this.buildImageContent({
             b64_json: item.image_base64,
             mime_type: item.mime_type,
           });
-          if (imageContent) {
-            imageParts.push(imageContent);
-          }
+          if (imageContent) contentParts.push(imageContent);
         }
       });
 
-      // 构建最终内容
-      if (imageParts.length > 0) {
-        // 如果有图片，将所有内容组合成数组
-        const contentArray: MessageContent[] = [];
-        if (textParts.length > 0) {
-          contentArray.push({
-            type: "text",
-            text: textParts.join(""),
-          });
-        }
-        contentArray.push(...imageParts);
-        messageContent = contentArray;
+      if (contentParts.some((part) => part.type === "image_url")) {
+        messageContent = contentParts;
       } else {
-        // 如果只有文本，返回字符串
-        messageContent = textParts.join("");
+        messageContent = contentParts
+          .filter((part) => part.type === "text")
+          .map((part) => part.text)
+          .join("");
       }
     }
 
@@ -788,7 +1165,7 @@ export class OpenAIResponsesTransformer implements Transformer {
       }));
     }
 
-    // 构建chat格式的响应
+    const incompleteReason = responseData.incomplete_details?.reason;
     const chatResponse = {
       id: responseData.id || "chatcmpl-" + Date.now(),
       object: "chat.completion",
@@ -802,10 +1179,16 @@ export class OpenAIResponsesTransformer implements Transformer {
             content: messageContent || null,
             tool_calls: toolCalls,
             thinking: thinking,
-            annotations: annotations,
+            annotations: annotations.length > 0 ? annotations : undefined,
           },
           logprobs: null,
-          finish_reason: toolCalls ? "tool_calls" : "stop",
+          finish_reason: toolCalls
+            ? "tool_calls"
+            : responseData.status === "incomplete"
+              ? incompleteReason === "content_filter"
+                ? "content_filter"
+                : "length"
+              : "stop",
         },
       ],
       usage: responseData.usage
@@ -813,6 +1196,10 @@ export class OpenAIResponsesTransformer implements Transformer {
             prompt_tokens: responseData.usage.input_tokens || 0,
             completion_tokens: responseData.usage.output_tokens || 0,
             total_tokens: responseData.usage.total_tokens || 0,
+            prompt_tokens_details: {
+              cached_tokens:
+                responseData.usage.input_tokens_details?.cached_tokens || 0,
+            },
           }
         : null,
     };
@@ -831,11 +1218,11 @@ export class OpenAIResponsesTransformer implements Transformer {
       return {
         type: "image_url",
         image_url: {
-          url: source.url || "",
-          b64_json: source.b64_json,
+          url:
+            source.url ||
+            `data:${source.mime_type || "image/png"};base64,${source.b64_json}`,
         },
-        media_type: source.mime_type,
-      } as MessageContent;
+      };
     }
 
     return null;

@@ -31,7 +31,6 @@ export interface ImageContent {
   image_url: {
     url: string;
   };
-  media_type: string;
 }
 
 export type MessageContent = TextContent | ImageContent;
@@ -73,22 +72,28 @@ export interface UnifiedTool {
 }
 
 export type ThinkLevel = "none" | "low" | "medium" | "high";
+export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
+export type ReasoningEffort = ThinkLevel | "xhigh" | "max";
 
 export interface UnifiedChatRequest {
   messages: UnifiedMessage[];
   model: string;
   max_tokens?: number;
   temperature?: number;
+  top_p?: number;
+  stop?: string | string[];
   stream?: boolean;
   tools?: UnifiedTool[];
+  parallel_tool_calls?: boolean;
   tool_choice?:
     | "auto"
     | "none"
     | "required"
     | string
     | { type: "function"; function: { name: string } };
+  reasoning_effort?: AnthropicEffort;
   reasoning?: {
-    effort?: ThinkLevel;
+    effort?: ReasoningEffort;
     max_tokens?: number;
     enabled?: boolean;
   };

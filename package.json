@@ -12,6 +12,7 @@
     "build": "esbuild src/server.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/server.js --packages=external",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
     "test:stream": "tsx scripts/verify-thinking-stream.ts"
   },
   "dependencies": {

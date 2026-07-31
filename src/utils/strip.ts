@@ -1,56 +1,90 @@
-/**
- * Recursively delete fields from an object tree. Used to scrub Anthropic-only
- * fields (cache_control, reasoning) before forwarding to OpenAI-compatible
- * upstreams that 400 on unknown keys.
- */
-export function stripFields(obj: unknown, fields: ReadonlySet<string>): void {
-  if (!obj || typeof obj !== "object") return;
-  if (Array.isArray(obj)) {
-    for (const item of obj) stripFields(item, fields);
-    return;
-  }
-  const o = obj as Record<string, unknown>;
-  for (const key of Object.keys(o)) {
-    if (fields.has(key)) {
-      delete o[key];
-    } else {
-      stripFields(o[key], fields);
+export function scrubAnthropicOnlyFields(body: Record<string, unknown>): void {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return;
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const record = message as Record<string, unknown>;
+    delete record.cache_control;
+    if (!Array.isArray(record.content)) continue;
+    for (const part of record.content) {
+      if (part && typeof part === "object") {
+        delete (part as Record<string, unknown>).cache_control;
+      }
     }
   }
-}
-
-// Always rejected by OpenAI-shape upstreams (both Chat Completions and Responses).
-const ALWAYS_STRIP = new Set(["cache_control"]);
-
-// `reasoning` is emitted by AnthropicTransformer from `request.thinking` and
-// consumed by OpenAIResponsesTransformer.transformRequestIn — strip only on
-// the Chat Completions path, where vanilla upstreams 400 on unknown keys.
-const CHAT_COMPLETIONS_REJECT = new Set(["reasoning"]);
-
-// `thinking` / `reasoning_content` are Chat-Completions-only artifacts (the
-// former synthesized by AnthropicTransformer, the latter by
-// convertThinkingToReasoningContent). The Responses API carries reasoning via
-// the top-level `reasoning` param, so these per-message fields must never leak
-// into its `input` array.
-const RESPONSES_REASONING_ARTIFACTS = new Set([
-  "thinking",
-  "reasoning_content",
-]);
-
-export function scrubAnthropicOnlyFields(body: Record<string, unknown>): void {
-  stripFields(body, ALWAYS_STRIP);
 }
 
 export function scrubChatCompletionsIncompatibleFields(
   body: Record<string, unknown>,
 ): void {
-  stripFields(body, CHAT_COMPLETIONS_REJECT);
+  delete body.reasoning;
 }
 
 export function scrubResponsesReasoningArtifacts(
   body: Record<string, unknown>,
 ): void {
-  stripFields(body, RESPONSES_REASONING_ARTIFACTS);
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return;
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    // Signed `thinking` is consumed by the Responses transformer. Only the
+    // Chat-Completions extension is incompatible with Responses input.
+    delete (message as Record<string, unknown>).reasoning_content;
+  }
+}
+
+/**
+ * Chat Completions formally permits only text in `role:"tool"` messages.
+ * Preserve nested Anthropic tool-result images by moving them to a standard
+ * multimodal user turn after the complete (possibly parallel) tool-result
+ * group. Responses can preserve images directly on function output.
+ */
+export function normalizeMultimodalToolResultsForChatCompletions(
+  body: Record<string, unknown>,
+): void {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return;
+
+  const normalized: any[] = [];
+  let pendingImages: any[] = [];
+
+  const flushImages = (next?: any) => {
+    if (pendingImages.length === 0) return;
+    if (next?.role === "user") {
+      const existing = Array.isArray(next.content)
+        ? next.content
+        : typeof next.content === "string" && next.content
+          ? [{ type: "text", text: next.content }]
+          : [];
+      next.content = [...pendingImages, ...existing];
+    } else {
+      normalized.push({ role: "user", content: pendingImages });
+    }
+    pendingImages = [];
+  };
+
+  for (const message of messages as any[]) {
+    if (message?.role !== "tool") {
+      flushImages(message);
+      normalized.push(message);
+      continue;
+    }
+
+    if (Array.isArray(message.content)) {
+      const textParts = message.content.filter(
+        (part: any) => part?.type === "text",
+      );
+      pendingImages.push(
+        ...message.content.filter((part: any) => part?.type === "image_url"),
+      );
+      message.content = textParts.length > 0 ? textParts : "";
+    } else if (message.content == null) {
+      message.content = "";
+    }
+    normalized.push(message);
+  }
+  flushImages();
+  body.messages = normalized;
 }
 
 /**

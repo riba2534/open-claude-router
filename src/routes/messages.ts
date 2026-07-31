@@ -21,6 +21,7 @@ import {
   scrubChatCompletionsIncompatibleFields,
   scrubResponsesReasoningArtifacts,
   convertThinkingToReasoningContent,
+  normalizeMultimodalToolResultsForChatCompletions,
 } from "../utils/strip.js";
 import {
   buildUpstreamSignal,
@@ -85,6 +86,9 @@ async function forwardMessages(
     convertThinkingToReasoningContent(
       unified as unknown as Record<string, unknown>,
       reasoningEnabled,
+    );
+    normalizeMultimodalToolResultsForChatCompletions(
+      unified as unknown as Record<string, unknown>,
     );
     scrubChatCompletionsIncompatibleFields(
       unified as unknown as Record<string, unknown>,

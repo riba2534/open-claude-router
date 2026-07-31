@@ -20,6 +20,7 @@ export function buildUpstreamSignal(
     () => controller.abort(new Error("upstream timeout")),
     timeoutMs,
   );
+  timeout.unref();
   req.raw.once("close", () => {
     clearTimeout(timeout);
     if (req.raw.aborted) {

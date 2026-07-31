@@ -1,5 +1,6 @@
 import type { ChatCompletion } from "openai/resources";
 import {
+  AnthropicEffort,
   LLMProvider,
   UnifiedChatRequest,
   UnifiedMessage,
@@ -14,6 +15,67 @@ import { v4 as uuidv4 } from "uuid";
 import { getThinkLevel } from "./thinking.js";
 import { createApiError } from "./errors.js";
 import { formatBase64 } from "./image.js";
+import { SseBlockDecoder } from "./sse.js";
+
+const ANTHROPIC_EFFORTS = new Set<AnthropicEffort>([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+
+function parseAnthropicEffort(value: unknown): AnthropicEffort | undefined {
+  return typeof value === "string" &&
+    ANTHROPIC_EFFORTS.has(value as AnthropicEffort)
+    ? (value as AnthropicEffort)
+    : undefined;
+}
+
+function convertAnthropicImage(part: any) {
+  const source = part?.source;
+  const url =
+    source?.type === "base64" && typeof source.data === "string"
+      ? formatBase64(source.data, source.media_type)
+      : typeof source?.url === "string"
+        ? source.url
+        : undefined;
+  if (!url) return null;
+  return {
+    type: "image_url" as const,
+    image_url: { url },
+  };
+}
+
+function jsonFallback(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value ?? "");
+  } catch {
+    return String(value ?? "");
+  }
+}
+
+function convertToolResultContent(content: unknown): any {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+
+  const blocks = Array.isArray(content) ? content : [content];
+  if (blocks.length === 0) return "";
+
+  return blocks.map((block: any) => {
+    if (typeof block === "string") {
+      return { type: "text" as const, text: block };
+    }
+    if (block?.type === "text" && typeof block.text === "string") {
+      return { type: "text" as const, text: block.text };
+    }
+    if (block?.type === "image") {
+      const image = convertAnthropicImage(block);
+      if (image) return image;
+    }
+    return { type: "text" as const, text: jsonFallback(block) };
+  });
+}
 
 export class AnthropicTransformer implements Transformer {
   name = "Anthropic";
@@ -91,13 +153,12 @@ export class AnthropicTransformer implements Transformer {
               toolParts.forEach((tool: any) => {
                 const toolMessage: UnifiedMessage = {
                   role: "tool",
-                  content:
-                    typeof tool.content === "string"
-                      ? tool.content
-                      : JSON.stringify(tool.content),
+                  content: convertToolResultContent(tool.content),
                   tool_call_id: tool.tool_use_id,
-                  cache_control: tool.cache_control,
                 };
+                if (tool.cache_control) {
+                  toolMessage.cache_control = tool.cache_control;
+                }
                 messages.push(toolMessage);
               });
             }
@@ -112,22 +173,10 @@ export class AnthropicTransformer implements Transformer {
                 role: "user",
                 content: textAndMediaParts.map((part: any) => {
                   if (part?.type === "image") {
-                    return {
-                      type: "image_url",
-                      image_url: {
-                        url:
-                          part.source?.type === "base64"
-                            ? formatBase64(
-                                part.source.data,
-                                part.source.media_type
-                              )
-                            : part.source.url,
-                      },
-                      media_type: part.source.media_type,
-                    };
+                    return convertAnthropicImage(part);
                   }
                   return part;
-                }),
+                }).filter(Boolean),
               });
             }
           } else if (msg.role === "assistant") {
@@ -182,20 +231,35 @@ export class AnthropicTransformer implements Transformer {
       model: request.model,
       max_tokens: request.max_tokens,
       temperature: request.temperature,
+      top_p: request.top_p,
+      stop: request.stop_sequences,
       stream: request.stream,
       tools: request.tools?.length
         ? this.convertAnthropicToolsToUnified(request.tools)
         : undefined,
       tool_choice: request.tool_choice,
     };
-    if (request.thinking) {
+    const explicitEffort = parseAnthropicEffort(
+      request.output_config?.effort,
+    );
+    if (explicitEffort) {
+      result.reasoning_effort = explicitEffort;
+    }
+    if (
+      request.thinking?.type === "enabled" ||
+      request.thinking?.type === "adaptive"
+    ) {
       result.reasoning = {
-        effort: getThinkLevel(request.thinking.budget_tokens),
-        // max_tokens: request.thinking.budget_tokens,
-        enabled: request.thinking.type === "enabled",
+        effort:
+          explicitEffort ?? getThinkLevel(request.thinking.budget_tokens),
+        enabled: true,
       };
     }
     if (request.tool_choice) {
+      if (typeof request.tool_choice.disable_parallel_tool_use === "boolean") {
+        result.parallel_tool_calls =
+          !request.tool_choice.disable_parallel_tool_use;
+      }
       if (request.tool_choice.type === "tool") {
         result.tool_choice = {
           type: "function",
@@ -236,6 +300,23 @@ export class AnthropicTransformer implements Transformer {
       });
     } else {
       const data = (await response.json()) as any;
+      if (data?.error) {
+        return new Response(
+          JSON.stringify({
+            type: "error",
+            error: {
+              type: data.error.type || data.error.code || "api_error",
+              message:
+                data.error.message ||
+                JSON.stringify(data.error),
+            },
+          }),
+          {
+            status: response.status >= 400 ? response.status : 500,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
       const anthropicResponse = this.convertOpenAIResponseToAnthropic(
         data,
         context!
@@ -270,8 +351,10 @@ export class AnthropicTransformer implements Transformer {
         let hasStarted = false;
         let hasTextContentStarted = false;
         let hasFinished = false;
+        let streamFailed = false;
+        let sawTerminal = false;
+        let sawDone = false;
         const toolCalls = new Map<number, any>();
-        const toolCallIndexToContentBlockIndex = new Map<number, number>();
         let totalChunks = 0;
         let contentChunks = 0;
         let toolCallChunks = 0;
@@ -359,10 +442,94 @@ export class AnthropicTransformer implements Transformer {
           currentBlockType = null;
         };
 
+        // Anthropic content blocks cannot be interleaved. OpenAI can stream
+        // deltas for several tool calls in parallel, so buffer by tool index
+        // and emit complete, sequential Anthropic blocks at a safe boundary.
+        const flushToolCalls = () => {
+          if (toolCalls.size === 0) return;
+          closeCurrentBlock();
+          for (const [, toolCall] of [...toolCalls.entries()].sort(
+            ([left], [right]) => left - right,
+          )) {
+            const blockIndex = assignContentBlockIndex();
+            safeEnqueue(
+              encoder.encode(
+                `event: content_block_start\ndata: ${JSON.stringify({
+                  type: "content_block_start",
+                  index: blockIndex,
+                  content_block: {
+                    type: "tool_use",
+                    id: toolCall.id,
+                    name: toolCall.name,
+                    input: {},
+                  },
+                })}\n\n`,
+              ),
+            );
+            if (toolCall.arguments) {
+              safeEnqueue(
+                encoder.encode(
+                  `event: content_block_delta\ndata: ${JSON.stringify({
+                    type: "content_block_delta",
+                    index: blockIndex,
+                    delta: {
+                      type: "input_json_delta",
+                      partial_json: toolCall.arguments,
+                    },
+                  })}\n\n`,
+                ),
+              );
+            }
+            safeEnqueue(
+              encoder.encode(
+                `event: content_block_stop\ndata: ${JSON.stringify({
+                  type: "content_block_stop",
+                  index: blockIndex,
+                })}\n\n`,
+              ),
+            );
+          }
+          toolCalls.clear();
+        };
+
         const safeClose = () => {
           if (!isClosed) {
             try {
-              // Close any remaining open content block
+              if (!hasStarted) {
+                safeEnqueue(
+                  encoder.encode(
+                    `event: error\ndata: ${JSON.stringify({
+                      type: "error",
+                      error: {
+                        type: "api_error",
+                        message:
+                          "upstream stream ended without response events",
+                      },
+                    })}\n\n`,
+                  ),
+                );
+                controller.close();
+                isClosed = true;
+                return;
+              }
+              if (!sawTerminal) {
+                safeEnqueue(
+                  encoder.encode(
+                    `event: error\ndata: ${JSON.stringify({
+                      type: "error",
+                      error: {
+                        type: "api_error",
+                        message:
+                          "upstream stream ended before a terminal event",
+                      },
+                    })}\n\n`,
+                  ),
+                );
+                controller.close();
+                isClosed = true;
+                return;
+              }
+              flushToolCalls();
               closeCurrentBlock();
 
               if (stopReasonMessageDelta) {
@@ -421,8 +588,7 @@ export class AnthropicTransformer implements Transformer {
 
         try {
           reader = openaiStream.getReader();
-          const decoder = new TextDecoder();
-          let buffer = "";
+          const sseDecoder = new SseBlockDecoder();
 
           while (true) {
             if (isClosed) {
@@ -430,17 +596,14 @@ export class AnthropicTransformer implements Transformer {
             }
 
             const { done, value } = await reader.read();
-            if (done) break;
+            const events = done
+              ? sseDecoder.finish()
+              : sseDecoder.push(value);
 
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
+            for (const event of events) {
+              if (isClosed || streamFailed) break;
 
-            for (const line of lines) {
-              if (isClosed || hasFinished) break;
-
-              if (!line.startsWith("data:")) continue;
-              const data = line.slice(5).trim();
+              const data = event.data.trim();
               this.logger.debug({
                 reqId: context.req.id,
                 type: "recieved data",
@@ -448,7 +611,11 @@ export class AnthropicTransformer implements Transformer {
               });
 
               if (data === "[DONE]") {
-                continue;
+                // `[DONE]` is a framing terminator, not proof of a successful
+                // completion. Stop reading now; safeClose() still requires a
+                // preceding finish_reason before it can emit message_stop.
+                sawDone = true;
+                break;
               }
 
               try {
@@ -462,7 +629,7 @@ export class AnthropicTransformer implements Transformer {
                 if (chunk.error) {
                   const errorMessage = {
                     type: "error",
-                    message: {
+                    error: {
                       type: "api_error",
                       message: JSON.stringify(chunk.error),
                     },
@@ -473,7 +640,9 @@ export class AnthropicTransformer implements Transformer {
                       `event: error\ndata: ${JSON.stringify(errorMessage)}\n\n`
                     )
                   );
-                  continue;
+                  streamFailed = true;
+                  hasFinished = true;
+                  break;
                 }
 
                 model = chunk.model || model;
@@ -542,6 +711,15 @@ export class AnthropicTransformer implements Transformer {
                 if (!choice) {
                   continue;
                 }
+                if (hasFinished) {
+                  // A terminal choice can be followed by a usage-only chunk.
+                  // Keep parsing metadata, but never accept more semantic deltas.
+                  continue;
+                }
+                const choiceText =
+                  choice?.delta?.content ||
+                  (choice?.delta as any)?.refusal ||
+                  "";
 
                 // DeepSeek/Kimi-style upstreams stream reasoning as a
                 // `reasoning_content` string rather than Anthropic's `thinking`
@@ -559,7 +737,7 @@ export class AnthropicTransformer implements Transformer {
                   reasoningThinkingActive &&
                   !reasoningSignatureSent &&
                   !(choice?.delta as any)?.thinking &&
-                  (choice?.delta?.content || choice?.delta?.tool_calls)
+                  (choiceText || choice?.delta?.tool_calls)
                 ) {
                   // First content/tool_call after a reasoning_content run: the
                   // thinking block must be sealed with a signature_delta before
@@ -575,6 +753,27 @@ export class AnthropicTransformer implements Transformer {
 
                 if (choice?.delta?.thinking && !isClosed && !hasFinished) {
                   if (choice.delta.thinking.signature) {
+                    if (
+                      currentBlockType === null &&
+                      contentChunks === 0 &&
+                      toolCallChunks === 0
+                    ) {
+                      const thinkingBlockIndex = assignContentBlockIndex();
+                      safeEnqueue(
+                        encoder.encode(
+                          `event: content_block_start\ndata: ${JSON.stringify({
+                            type: "content_block_start",
+                            index: thinkingBlockIndex,
+                            content_block: {
+                              type: "thinking",
+                              thinking: "",
+                            },
+                          })}\n\n`,
+                        ),
+                      );
+                      currentContentBlockIndex = thinkingBlockIndex;
+                      currentBlockType = "thinking";
+                    }
                     // Seal only while the thinking block is actually open. A
                     // stray signature arriving after the block was closed by a
                     // content/tool chunk must be dropped — emitting it onto the
@@ -616,6 +815,7 @@ export class AnthropicTransformer implements Transformer {
                       // Reasoning resumed after content/tool output (or first
                       // reasoning chunk): close whatever block is open and
                       // start a fresh thinking block.
+                      flushToolCalls();
                       closeCurrentBlock();
                       const thinkingBlockIndex = assignContentBlockIndex();
                       const contentBlockStart = {
@@ -652,8 +852,9 @@ export class AnthropicTransformer implements Transformer {
                   }
                 }
 
-                if (choice?.delta?.content && !isClosed && !hasFinished) {
+                if (choiceText && !isClosed && !hasFinished) {
                   contentChunks++;
+                  flushToolCalls();
 
                   // Close any previous non-text block (seals an unsigned
                   // thinking block with its synthetic signature first).
@@ -689,7 +890,7 @@ export class AnthropicTransformer implements Transformer {
                       index: currentContentBlockIndex, // Use current content block index
                       delta: {
                         type: "text_delta",
-                        text: choice.delta.content,
+                        text: choiceText,
                       },
                     };
                     safeEnqueue(
@@ -708,16 +909,45 @@ export class AnthropicTransformer implements Transformer {
                   !hasFinished
                 ) {
                   // Close the open content block (seals unsigned thinking).
+                  flushToolCalls();
                   closeCurrentBlock();
 
                   choice?.delta?.annotations.forEach((annotation: any) => {
-                    const annotationBlockIndex = assignContentBlockIndex();
-                    const contentBlockStart = {
+                    const id = `srvtoolu_${uuidv4()}`;
+                    const useBlockIndex = assignContentBlockIndex();
+                    const useBlockStart = {
                       type: "content_block_start",
-                      index: annotationBlockIndex,
+                      index: useBlockIndex,
+                      content_block: {
+                        type: "server_tool_use",
+                        id,
+                        name: "web_search",
+                        input: { query: "" },
+                      },
+                    };
+                    safeEnqueue(
+                      encoder.encode(
+                        `event: content_block_start\ndata: ${JSON.stringify(
+                          useBlockStart
+                        )}\n\n`
+                      )
+                    );
+                    safeEnqueue(
+                      encoder.encode(
+                        `event: content_block_stop\ndata: ${JSON.stringify({
+                          type: "content_block_stop",
+                          index: useBlockIndex,
+                        })}\n\n`
+                      )
+                    );
+
+                    const resultBlockIndex = assignContentBlockIndex();
+                    const resultBlockStart = {
+                      type: "content_block_start",
+                      index: resultBlockIndex,
                       content_block: {
                         type: "web_search_tool_result",
-                        tool_use_id: `srvtoolu_${uuidv4()}`,
+                        tool_use_id: id,
                         content: [
                           {
                             type: "web_search_result",
@@ -730,14 +960,14 @@ export class AnthropicTransformer implements Transformer {
                     safeEnqueue(
                       encoder.encode(
                         `event: content_block_start\ndata: ${JSON.stringify(
-                          contentBlockStart
+                          resultBlockStart
                         )}\n\n`
                       )
                     );
 
                     const contentBlockStop = {
                       type: "content_block_stop",
-                      index: annotationBlockIndex,
+                      index: resultBlockIndex,
                     };
                     safeEnqueue(
                       encoder.encode(
@@ -752,143 +982,43 @@ export class AnthropicTransformer implements Transformer {
 
                 if (choice?.delta?.tool_calls && !isClosed && !hasFinished) {
                   toolCallChunks++;
-                  const processedInThisChunk = new Set<number>();
 
                   for (const toolCall of choice.delta.tool_calls) {
                     if (isClosed) break;
                     const toolCallIndex = toolCall.index ?? 0;
-                    if (processedInThisChunk.has(toolCallIndex)) {
-                      continue;
-                    }
-                    processedInThisChunk.add(toolCallIndex);
-                    const isUnknownIndex =
-                      !toolCallIndexToContentBlockIndex.has(toolCallIndex);
-
-                    if (isUnknownIndex) {
-                      // Close any previous content block if open (seals an
-                      // unsigned thinking block first).
+                    let currentToolCall = toolCalls.get(toolCallIndex);
+                    if (!currentToolCall) {
                       closeCurrentBlock();
-
-                      const newContentBlockIndex = assignContentBlockIndex();
-                      toolCallIndexToContentBlockIndex.set(
-                        toolCallIndex,
-                        newContentBlockIndex
-                      );
-                      const toolCallId =
-                        toolCall.id || `call_${Date.now()}_${toolCallIndex}`;
-                      const toolCallName =
-                        toolCall.function?.name || `tool_${toolCallIndex}`;
-                      const contentBlockStart = {
-                        type: "content_block_start",
-                        index: newContentBlockIndex,
-                        content_block: {
-                          type: "tool_use",
-                          id: toolCallId,
-                          name: toolCallName,
-                          input: {},
-                        },
-                      };
-
-                      safeEnqueue(
-                        encoder.encode(
-                          `event: content_block_start\ndata: ${JSON.stringify(
-                            contentBlockStart
-                          )}\n\n`
-                        )
-                      );
-                      currentContentBlockIndex = newContentBlockIndex;
-                      currentBlockType = "tool";
-
-                      const toolCallInfo = {
-                        id: toolCallId,
-                        name: toolCallName,
+                      currentToolCall = {
+                        id:
+                          toolCall.id ||
+                          `call_${Date.now()}_${toolCallIndex}`,
+                        name:
+                          toolCall.function?.name || `tool_${toolCallIndex}`,
                         arguments: "",
-                        contentBlockIndex: newContentBlockIndex,
                       };
-                      toolCalls.set(toolCallIndex, toolCallInfo);
-                    } else if (toolCall.id && toolCall.function?.name) {
-                      const existingToolCall = toolCalls.get(toolCallIndex)!;
-                      const wasTemporary =
-                        existingToolCall.id.startsWith("call_") &&
-                        existingToolCall.name.startsWith("tool_");
-
-                      if (wasTemporary) {
-                        existingToolCall.id = toolCall.id;
-                        existingToolCall.name = toolCall.function.name;
-                      }
+                      toolCalls.set(toolCallIndex, currentToolCall);
                     }
-
-                    if (
-                      toolCall.function?.arguments &&
-                      !isClosed &&
-                      !hasFinished
-                    ) {
-                      const blockIndex =
-                        toolCallIndexToContentBlockIndex.get(toolCallIndex);
-                      if (blockIndex === undefined) {
-                        continue;
-                      }
-                      const currentToolCall = toolCalls.get(toolCallIndex);
-                      if (currentToolCall) {
-                        currentToolCall.arguments +=
-                          toolCall.function.arguments;
-                      }
-
-                      try {
-                        const anthropicChunk = {
-                          type: "content_block_delta",
-                          index: blockIndex,
-                          delta: {
-                            type: "input_json_delta",
-                            partial_json: toolCall.function.arguments,
-                          },
-                        };
-                        safeEnqueue(
-                          encoder.encode(
-                            `event: content_block_delta\ndata: ${JSON.stringify(
-                              anthropicChunk
-                            )}\n\n`
-                          )
-                        );
-                      } catch {
-                        try {
-                          const fixedArgument = toolCall.function.arguments
-                            .replace(/[\x00-\x1F\x7F-\x9F]/g, "")
-                            .replace(/\\/g, "\\\\")
-                            .replace(/"/g, '\\"');
-
-                          const fixedChunk = {
-                            type: "content_block_delta",
-                            index: blockIndex, // Use the correct content block index
-                            delta: {
-                              type: "input_json_delta",
-                              partial_json: fixedArgument,
-                            },
-                          };
-                          safeEnqueue(
-                            encoder.encode(
-                              `event: content_block_delta\ndata: ${JSON.stringify(
-                                fixedChunk
-                              )}\n\n`
-                            )
-                          );
-                        } catch (fixError) {
-                          this.logger?.error({ err: fixError }, "failed to fix tool arguments");
-                        }
-                      }
+                    if (toolCall.id) currentToolCall.id = toolCall.id;
+                    if (toolCall.function?.name) {
+                      currentToolCall.name = toolCall.function.name;
+                    }
+                    if (toolCall.function?.arguments) {
+                      currentToolCall.arguments += toolCall.function.arguments;
                     }
                   }
                 }
 
                 if (choice?.finish_reason && !isClosed && !hasFinished) {
+                  sawTerminal = true;
+                  hasFinished = true;
                   if (contentChunks === 0 && toolCallChunks === 0) {
                     this.logger?.error(
                       "Warning: No content in the stream response!"
                     );
                   }
 
-                  // Close any remaining open content block (seals unsigned
-                  // thinking with a synthetic signature first).
+                  flushToolCalls();
                   closeCurrentBlock();
 
                   if (!isClosed) {
@@ -896,7 +1026,7 @@ export class AnthropicTransformer implements Transformer {
                       stop: "end_turn",
                       length: "max_tokens",
                       tool_calls: "tool_use",
-                      content_filter: "stop_sequence",
+                      content_filter: "end_turn",
                     };
 
                     const anthropicStopReason =
@@ -921,16 +1051,50 @@ export class AnthropicTransformer implements Transformer {
                     };
                   }
 
-                  break;
+                  continue;
                 }
               } catch (parseError: any) {
                 this.logger?.error(
                   `parseError: ${parseError.name} message: ${parseError.message} stack: ${parseError.stack} data: ${data}`
                 );
+                safeEnqueue(
+                  encoder.encode(
+                    `event: error\ndata: ${JSON.stringify({
+                      type: "error",
+                      error: {
+                        type: "api_error",
+                        message: "malformed upstream SSE event",
+                      },
+                    })}\n\n`,
+                  ),
+                );
+                streamFailed = true;
+                hasFinished = true;
+                break;
               }
             }
+
+            if (streamFailed || sawDone) {
+              try {
+                await reader.cancel();
+              } catch (cancelError) {
+                this.logger?.error(
+                  { err: cancelError },
+                  "upstream stream cancel failed",
+                );
+              }
+              break;
+            }
+            if (done) break;
           }
-          safeClose();
+          if (streamFailed) {
+            if (!isClosed) {
+              controller.close();
+              isClosed = true;
+            }
+          } else {
+            safeClose();
+          }
         } catch (error) {
           if (!isClosed) {
             try {
@@ -979,7 +1143,7 @@ export class AnthropicTransformer implements Transformer {
         throw new Error("No choices found in OpenAI response");
       }
       const content: any[] = [];
-      if (choice.message.annotations) {
+      if (choice.message.annotations?.length) {
         const id = `srvtoolu_${uuidv4()}`;
         content.push({
           type: "server_tool_use",
@@ -1001,10 +1165,41 @@ export class AnthropicTransformer implements Transformer {
           }),
         });
       }
-      if (choice.message.content) {
+      // Thinking blocks precede text/tool blocks in Anthropic responses.
+      const upstreamThinking = (choice.message as any)?.thinking;
+      const messageThinking =
+        upstreamThinking?.content ??
+        (choice.message as any)?.reasoning_content;
+      if (
+        typeof messageThinking === "string" &&
+        (messageThinking.length > 0 || upstreamThinking?.signature)
+      ) {
+        content.unshift({
+          type: "thinking",
+          thinking: messageThinking,
+          signature:
+            upstreamThinking?.signature ||
+            `sig_${Date.now()}`,
+        });
+      }
+      if (typeof choice.message.content === "string" && choice.message.content) {
+        content.push({ type: "text", text: choice.message.content });
+      } else if (Array.isArray(choice.message.content)) {
+        for (const part of choice.message.content as any[]) {
+          if (part?.type === "text" && typeof part.text === "string") {
+            content.push({ type: "text", text: part.text });
+          } else {
+            content.push({ type: "text", text: jsonFallback(part) });
+          }
+        }
+      }
+      if (
+        typeof (choice.message as any).refusal === "string" &&
+        (choice.message as any).refusal
+      ) {
         content.push({
           type: "text",
-          text: choice.message.content,
+          text: (choice.message as any).refusal,
         });
       }
       if (choice.message.tool_calls && choice.message.tool_calls.length > 0) {
@@ -1030,19 +1225,6 @@ export class AnthropicTransformer implements Transformer {
           });
         });
       }
-      // DeepSeek/Kimi-style upstreams return reasoning as `reasoning_content`
-      // rather than Anthropic's `thinking` object; surface either as a thinking
-      // block so the reasoning isn't silently dropped.
-      const messageThinking =
-        (choice.message as any)?.thinking?.content ??
-        (choice.message as any)?.reasoning_content;
-      if (messageThinking) {
-        content.push({
-          type: "thinking",
-          thinking: messageThinking,
-          signature: (choice.message as any)?.thinking?.signature,
-        });
-      }
       const result = {
         id: openaiResponse.id,
         type: "message",
@@ -1057,7 +1239,7 @@ export class AnthropicTransformer implements Transformer {
             : choice.finish_reason === "tool_calls"
             ? "tool_use"
             : choice.finish_reason === "content_filter"
-            ? "stop_sequence"
+            ? "end_turn"
             : "end_turn",
         stop_sequence: null,
         usage: {

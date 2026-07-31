@@ -47,7 +47,7 @@ Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(Ope
 - **模型名映射**：客户端保留 `claude-*` 名称以启用 Claude Code 能力，上游收到真实模型名
 - **上游错误统一交给客户端重试**：上游返回任意非 2xx 时保留原状态码和错误内容，同时响应 `X-Should-Retry: true`，由 Claude Code 使用自身有界重试策略处理；服务端不重复请求上游
 - **两种接入方式**：上游信息可以放 HTTP header，也可以直接拼在 URL path 里
-- **轻量好部署**：esbuild 打包后单文件 ~70 KB，Docker 镜像几十 MB，开箱即用
+- **轻量好部署**：esbuild 打包为单文件，Docker 镜像几十 MB，开箱即用
 
 ## 架构
 
@@ -187,7 +187,7 @@ ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001 \
 claude"
 ```
 
-服务侧会把 OpenAI 的 `response.reasoning_summary_text.delta` 等事件转成 Anthropic 的 `thinking` 块返回给 Claude Code。**其他所有 alias（不带 `X-Upstream-Format` 或显式 `chat-completions`）行为完全不变**。
+服务侧会把 OpenAI 的 reasoning summary / `reasoning_text` 事件转成 Anthropic 的 `thinking` 块返回给 Claude Code；refusal 则保守转换成普通 assistant 文本。**其他所有 alias（不带 `X-Upstream-Format` 或显式 `chat-completions`）行为完全不变**。
 
 ### 3. 启动 Claude Code
 
@@ -201,14 +201,20 @@ myocr
 
 | 能力 | 默认（Chat Completions） | Responses API |
 |---|---|---|
-| 文本流式 SSE | ✅ 完整 | ✅ 完整 |
-| 工具调用（`tool_use` / `tool_result` 双向增量） | ✅ 完整 | ✅ 完整 |
-| 多模态图片（`image` content block） | ✅ 完整 | ✅ 完整 |
+| 文本流式 SSE | ✅ 正式处理 multi-data、LF/CRLF/CR 与跨 chunk UTF-8；兼容 EOF trailing event | 同左 |
+| 工具调用（`tool_use` / `tool_result` 双向增量） | ✅ 含现代 `tool_calls` 并行工具；流式工具增量会先按调用缓冲，再输出合法的顺序 block | ✅ 含并行工具；历史文本与调用均保留，但原 content block 的交错位置会被归一化 |
+| 顶层多模态图片（base64 / URL） | ✅ 标准 `image_url` | ✅ 标准 `input_image` |
+| `tool_result` 中的图片 | ⚠️ Chat 的 tool message 只能放文本；图片会在整组 tool message 后转成标准 user 多模态 sidecar，保留视觉输入与图片间顺序，但不保留原始跨模态顺序及图片与具体 tool 的强绑定 | ✅ `function_call_output.output` 原生保留 `input_text` / `input_image` 顺序与归属 |
+| document / file block | ⚠️ 未实现原生文件映射；工具结果中的未知 block 会降级成 JSON 文本，顶层未知 block 当前忽略 | 同左；尚未定义 file ID / URL / base64 的统一映射 |
 | `/model sonnet` / `opus` / haiku 切换 | ✅ body.model 字段透传 | 同左 |
 | 客户端中断（Ctrl+C） | ✅ AbortSignal 传到上游 | 同左 |
-| `thinking` 块 | ⚠️ 字段会被剥（绝大多数 Chat Completions 上游不识别） | ✅ 上游 reasoning summary 自动转 Anthropic `thinking` |
-| Prompt cache（`cache_control`） | ⚠️ 字段会被剥（避免严格上游 400），返回不会有 `cache_read_input_tokens` | 同左 |
+| `output_config.effort` | ✅ `low/medium/high/xhigh/max` 精确转成 `reasoning_effort`，不按模型名截断 | ✅ 精确转成 `reasoning.effort`；仅无合法显式值的既有 thinking 路径使用 budget heuristic |
+| `thinking` 块 | ⚠️ 使用兼容扩展 `reasoning_content`；没有通用的 OpenAI 标准等价物 | ✅ reasoning summary / `reasoning_text` 转 thinking；`{item id, encrypted_content}` 封装成 opaque signature，历史可回放 |
+| refusal / content filter | ✅ refusal 保留为普通 assistant 文本；stop reason 保守使用 `end_turn` | 同左 |
+| Prompt cache（`cache_control`） | ⚠️ Anthropic 显式 breakpoint 会被剥（避免严格上游 400）；若上游自行报告 cached tokens，usage 会映射返回 | 同左 |
 | `count_tokens` 端点 | ⚠️ 服务本地 `js-tiktoken` 粗略估算（非上游精确值） | 同左 |
+
+Router 只做协议转换，不根据模型名猜测视觉、推理或工具能力。标准图片结构仍被文本模型或能力不完整的兼容端点拒绝时，错误属于所选模型 / 上游；Router 会保留上游状态并按既定策略标记为可重试。完整逐字段审计、责任边界和复现证据见 [`docs/protocol-audit-2026-07-31.md`](docs/protocol-audit-2026-07-31.md)。
 
 ## API
 
@@ -274,7 +280,7 @@ Claude Code 会自动追加 `/v1/messages`，服务端识别并砍掉这个后�
 - **连不通 / `upstream_unreachable`（502）**：检查上游 URL 是否写全（path 模式要拼到 `/chat/completions` 或 `/responses` 这一级）；Docker 下不要在容器内设 `HOST=127.0.0.1`（见[自定义监听地址](#自定义监听地址)的警告）。
 - **上游报 `thinking is enabled but reasoning_content is missing in assistant tool call message`**：部分 DeepSeek / Kimi 式上游在开启 thinking 时，要求带工具调用的 assistant 消息必须携带 `reasoning_content`。服务已自动把 Anthropic `thinking` 转成 `reasoning_content`，并对缺失的历史工具调用消息兜底补全；若仍遇到，请确认运行的是最新版本。
 - **上游报未知字段 400（如 `cache_control` / `reasoning`）**：服务默认会剥掉 Anthropic 专有字段，正常不会发生；若你接的是 Responses 协议上游，确认 alias 带了 `X-Upstream-Format: responses`。
-- **返回里没有 `cache_read_input_tokens` / 看不到 thinking**：Chat Completions 路径下 `cache_control` 与 `thinking` 字段默认被剥（见[协议覆盖与边界](#协议覆盖与边界)）；需要原生 reasoning 请走方式 C。
+- **返回里没有 `cache_read_input_tokens` / 看不到 thinking**：Anthropic `cache_control` breakpoint 不会透传；只有上游 usage 自身报告 cached tokens 时才会返回。Chat 的 thinking 依赖非标准 `reasoning_content` 兼容扩展；需要原生 reasoning 请走方式 C。
 
 ## 安全
 
