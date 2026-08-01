@@ -4,6 +4,7 @@ dist
 .github
 .claude
 *.log
+logs
 .DS_Store
 .env*
 README.md

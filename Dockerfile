@@ -14,5 +14,7 @@ COPY --from=build /app/package.json ./
 COPY LICENSE ./LICENSE
 ENV NODE_ENV=production
 ENV PORT=3457
+RUN mkdir -p /app/logs
+VOLUME ["/app/logs"]
 EXPOSE 3457
 CMD ["node", "dist/server.js"]

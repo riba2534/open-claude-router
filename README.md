@@ -25,7 +25,7 @@
 Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(OpenAI Chat Completions / Responses)──▶  上游
 ```
 
-跟其他类似工具最大的差异：**服务端无状态**。所有上游信息（URL、Authorization、模型名）由客户端逐请求通过 HTTP header 或 URL path 传入——服务端不读本地配置、不存任何 API Key、不维护 provider 列表。一份部署可以同时服务任意客户端、任意上游。
+跟其他类似工具最大的差异：**路由和会话无状态**。所有上游信息（URL、Authorization、模型名）由客户端逐请求通过 HTTP header 或 URL path 传入——服务端不读 provider 配置、不存任何 API Key、不维护会话状态。一份部署可以同时服务任意客户端、任意上游。为了排查协议兼容问题，服务会把模型侧请求/响应写入本地审计日志（默认保留 7 天，可配置或关闭；Authorization 不写入日志）。
 
 典型场景：
 
@@ -39,7 +39,8 @@ Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(Ope
 
 ## 特性
 
-- **服务端无状态**：服务侧不存任何 API Key、不读本地配置、不维护 provider 列表；上游信息全部由客户端逐请求传入（配置都在客户端 alias 里）
+- **路由和会话无状态**：服务侧不存任何 API Key、不读 provider 配置、不维护会话状态；上游信息全部由客户端逐请求传入（配置都在客户端 alias 里）
+- **模型交互日志**：按请求 ID 记录转换后实际发给上游的 JSON 和上游原始 JSON/SSE，默认按 UTC 天轮转并保留 7 天；正文模式、保留期、目录和单条上限均可配置
 - **任意 Authorization 格式**：标准 `Bearer sk-...`、企业网关常见的非 Bearer 自定义协议头都能原样透传
 - **完整覆盖 Claude Code 协议**：流式 SSE、工具调用（`tool_use` / `tool_result` 双向增量）、多模态图片、`thinking` 块（覆盖范围与限制见下方["协议覆盖与边界"](#协议覆盖与边界)表）
 - **同时支持 OpenAI 两套协议**：默认走 Chat Completions（兼容 OpenAI 官方、OpenRouter、各类 OpenAI 兼容网关 / Kimi / DeepSeek 等），通过 `X-Upstream-Format: responses` opt-in 切到 Responses API（OpenAI o-series / gpt-5 原生协议，含 reasoning summary 转 Anthropic `thinking` 块）
@@ -55,7 +56,7 @@ Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(Ope
 ```mermaid
 flowchart LR
     Client["Claude Code CLI<br/>shell alias"]
-    Bridge["open-claude-router<br/>无状态服务"]
+    Bridge["open-claude-router<br/>路由/会话无状态"]
     Upstream[("OpenAI 协议上游<br/>Chat Completions 或 Responses")]
 
     Client -- "Anthropic Messages API<br/>POST /v1/messages" --> Bridge
@@ -64,7 +65,7 @@ flowchart LR
     Bridge -. "Anthropic SSE / JSON" .-> Client
 ```
 
-服务收到 Anthropic 协议的请求后，从 HTTP header 或 URL path 解析出真实上游 URL 和 Authorization，把请求体转成对应的 OpenAI 协议（默认 Chat Completions，可通过 `X-Upstream-Format: responses` 切到 Responses API）调用上游，再把上游响应（SSE 流或 JSON）转回 Anthropic 格式返回。整个过程不读本地配置、不存任何凭证、不维护 provider 表，因此**无状态、可任意水平扩展**。
+服务收到 Anthropic 协议的请求后，从 HTTP header 或 URL path 解析出真实上游 URL 和 Authorization，把请求体转成对应的 OpenAI 协议（默认 Chat Completions，可通过 `X-Upstream-Format: responses` 切到 Responses API）调用上游，再把上游响应（SSE 流或 JSON）转回 Anthropic 格式返回。路由过程不读 provider 配置、不存任何凭证、不维护会话状态，因此可任意水平扩展；模型交互日志属于独立的运维观测数据，各实例可写各自的目录或集中采集。
 
 ## 快速开始
 
@@ -74,6 +75,7 @@ flowchart LR
 
 ```bash
 docker run -d --name ocr --restart unless-stopped -p 3457:3457 \
+  -v ocr-model-logs:/app/logs \
   riba2534/open-claude-router:latest
 ```
 
@@ -319,8 +321,42 @@ Claude Code 会自动追加 `/v1/messages`，服务端识别并砍掉这个后�
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `LOG_LEVEL` | `info` | Pino 日志级别（`trace` / `debug` / `info` / `warn`） |
 | `OCR_ACCESS_TOKENS` | unset | 逗号分隔的访问 token 白名单；不设则关闭服务自身鉴权。header 模式校验 `Authorization: Bearer ...`，path 模式校验 `X-OCR-Token` header |
+| `OCR_MODEL_LOG_MODE` | `full` | 模型交互日志正文模式：`full` 记录正文、`metadata` 仅记录模型/状态/耗时/字节数、`off` 关闭 |
+| `OCR_MODEL_LOG_RETENTION_DAYS` | `7` | 模型交互日志保留的 UTC 自然日数（正整数）；如需关闭请用 `OCR_MODEL_LOG_MODE=off` |
+| `OCR_MODEL_LOG_DIR` | `./logs` | 日志目录；官方镜像工作目录下对应 `/app/logs` |
+| `OCR_MODEL_LOG_MAX_BODY_BYTES` | `1048576` | 每个请求或响应最多保留的正文 byte 数；超出后只截断日志副本，不影响实际转发 |
 
 > 上游请求默认超时 **1 小时**（`src/utils/upstream.ts`，为长补全 / 推理模型留足余量），目前硬编码、暂不可通过环境变量调整。客户端中断（Ctrl+C）会通过 AbortSignal 立即传到上游。
+
+### 模型交互日志
+
+模型交互日志用于直接核对 Router 的协议边界：`model_request` 是 Anthropic 请求完成转换后、实际发给模型方的 OpenAI JSON；`model_response` 是任何响应转换发生前的上游原始 JSON 或 SSE。二者通过 `request_id` 关联，另含上游 URL（已移除 userinfo、query、fragment）、协议格式、模型、HTTP 状态、耗时、正文 byte 数和是否读到 EOF/因上限截断。SSE transformer 读到协议终态后可以主动停止底层读取，此时会标记 `complete:false, body_cancelled:true`，不代表转换失败；连接上游失败时会写 `model_transport_error`。
+
+日志文件名为 `model-interactions-YYYY-MM-DD.ndjson`，按 UTC 日期切分。服务启动时及运行中每小时清理过期文件；默认保留当天和前 6 个 UTC 日期。修改保留期示例：
+
+```bash
+# 查看官方 Docker 示例当前日期的日志
+docker exec ocr sh -c 'tail -n 20 /app/logs/model-interactions-$(date -u +%F).ndjson'
+```
+
+```bash
+# 保留 30 天、每个方向最多记录 4 MiB 正文
+docker run -d --name ocr --restart unless-stopped -p 3457:3457 \
+  -e OCR_MODEL_LOG_RETENTION_DAYS=30 \
+  -e OCR_MODEL_LOG_MAX_BODY_BYTES=4194304 \
+  -v ocr-model-logs:/app/logs \
+  riba2534/open-claude-router:latest
+
+# 只看元数据，或完全关闭
+OCR_MODEL_LOG_MODE=metadata npm start
+OCR_MODEL_LOG_MODE=off npm start
+```
+
+`off` 只停止新增日志，不会主动删除已有文件；重新启用后，启动清理会按当时配置的保留期处理历史文件。
+
+日志写入是 fail-open 的：目录不可写或磁盘异常只会产生一条运行告警，不会改变请求/响应、流式背压、状态码或重试语义。`LOG_LEVEL` 控制的 Pino 运行日志仍写 stdout，其保留期由 Docker/宿主机日志驱动决定，不受上述变量影响。
+
+> `full` 会记录提示词、工具参数/结果以及模型输出，可能包含业务数据；服务不会把 `Authorization`、`X-Upstream-Authorization` 或额外上游 header 写入模型交互日志。多人共享部署可按需要改用 `metadata` 或 `off`。
 
 ### 自定义监听地址
 
@@ -349,6 +385,7 @@ Claude Code 会自动追加 `/v1/messages`，服务端识别并砍掉这个后�
 - 这是**透明转发**服务：上游凭证经服务转发，**务必走 HTTPS**
 - 公网部署强烈建议设置 `OCR_ACCESS_TOKENS` 防止扫描滥用
 - 日志默认脱敏 `authorization` / `x-upstream-authorization` / `x-upstream-headers` / `x-api-key`（Pino `redact`）
+- 模型交互日志不记录请求 header，但 `full` 模式会记录提示词、工具内容和模型输出；敏感场景请改用 `OCR_MODEL_LOG_MODE=metadata` 或 `off`
 - 不要把上游凭证写入版本控制的文件，用 `~/.zshrc` 或 1Password CLI 等工具按需注入
 
 ## Star History
@@ -363,7 +400,7 @@ Claude Code 会自动追加 `/v1/messages`，服务端识别并砍掉这个后�
 
 ## 致谢
 
-本项目的协议转换核心代码移植自 [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router)（MIT 协议）。我们把它的 transformer 实现包装成一个完全无状态的 HTTP 服务，配合 Claude Code 客户端的 alias 形态使用。协议审计还交叉参考了 CLIProxyAPI 与 claude-code-router 的源码和可执行 fixture；它们是证据来源，不是天然正确或需要机械对齐的实现基线。
+本项目的协议转换核心代码移植自 [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router)（MIT 协议）。我们把它的 transformer 实现包装成一个路由和会话无状态的 HTTP 服务，配合 Claude Code 客户端的 alias 形态使用。协议审计还交叉参考了 CLIProxyAPI 与 claude-code-router 的源码和可执行 fixture；它们是证据来源，不是天然正确或需要机械对齐的实现基线。
 
 ## License
 

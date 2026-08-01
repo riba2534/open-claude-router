@@ -36,6 +36,11 @@ import {
   guardAnthropicSseStream,
 } from "../utils/anthropic-sse.js";
 import { countAnthropicTokens } from "../utils/tokenizer.js";
+import {
+  ModelInteractionLogger,
+  sanitizeUpstreamUrlForLogging,
+  type ModelInteractionExchange,
+} from "../utils/model-interaction-log.js";
 
 interface MessagesBody {
   model?: string;
@@ -48,6 +53,7 @@ async function forwardMessages(
   reply: FastifyReply,
   anthropicT: AnthropicTransformer,
   responsesT: OpenAIResponsesTransformer,
+  modelInteractionLogger: ModelInteractionLogger | undefined,
   format: UpstreamFormat,
   upstream: UpstreamConfig,
 ) {
@@ -132,7 +138,7 @@ async function forwardMessages(
     {
       model: unified.model,
       stream: wantsStream,
-      upstream: upstream.url,
+      upstream: sanitizeUpstreamUrlForLogging(upstream.url),
       format,
     },
     "forwarding",
@@ -143,6 +149,23 @@ async function forwardMessages(
   // return 400 instead of being rewritten as upstream_unreachable/502.
   const upstreamHeaders = parseUpstreamHeaders(req);
   const signal = buildUpstreamSignal(req, reply);
+  // Observe the model-facing protocol boundary only after every local
+  // validation succeeds: this is the fully converted JSON that will actually
+  // be sent upstream, not the incoming Anthropic body. Authorization and
+  // forwarded headers are intentionally not part of this audit record.
+  let modelExchange: ModelInteractionExchange | undefined;
+  if (modelInteractionLogger) {
+    modelExchange = modelInteractionLogger.begin(
+      {
+        requestId: String(req.id),
+        upstreamUrl: upstream.url,
+        format,
+        model: unified.model,
+        stream: wantsStream,
+      },
+      outboundBody,
+    );
+  }
   let upstreamResponse: Response;
   try {
     upstreamResponse = await callUpstream({
@@ -153,6 +176,9 @@ async function forwardMessages(
       signal,
     });
   } catch (err: any) {
+    if (modelInteractionLogger && modelExchange) {
+      modelInteractionLogger.recordTransportError(modelExchange, err);
+    }
     const isAbort =
       err?.name === "AbortError" ||
       /aborted|disconnected|timeout/i.test(err?.message ?? "");
@@ -161,6 +187,16 @@ async function forwardMessages(
       isAbort ? 499 : 502,
       isAbort ? "client_disconnected" : "upstream_unreachable",
       isAbort ? "request_canceled" : "api_error",
+    );
+  }
+
+  // Tap the raw upstream bytes before either transformer consumes them. The
+  // wrapper preserves backpressure/cancellation and never changes status,
+  // headers, body bytes, or retry behavior.
+  if (modelInteractionLogger && modelExchange) {
+    upstreamResponse = modelInteractionLogger.captureResponse(
+      modelExchange,
+      upstreamResponse,
     );
   }
 
@@ -289,7 +325,14 @@ function handleCountTokens(req: FastifyRequest, reply: FastifyReply) {
   return { input_tokens: countAnthropicTokens(body as any) };
 }
 
-export async function registerMessagesRoute(fastify: FastifyInstance) {
+export interface MessagesRouteOptions {
+  modelInteractionLogger?: ModelInteractionLogger;
+}
+
+export async function registerMessagesRoute(
+  fastify: FastifyInstance,
+  options: MessagesRouteOptions = {},
+) {
   const accessTokens = parseAccessTokens(process.env.OCR_ACCESS_TOKENS);
   if (accessTokens.size > 0) {
     fastify.log.info(
@@ -333,6 +376,7 @@ export async function registerMessagesRoute(fastify: FastifyInstance) {
         reply,
         anthropicTransformer,
         responsesTransformer,
+        options.modelInteractionLogger,
         format,
         upstream,
       );
@@ -380,6 +424,7 @@ export async function registerMessagesRoute(fastify: FastifyInstance) {
         reply,
         anthropicTransformer,
         responsesTransformer,
+        options.modelInteractionLogger,
         format,
         upstream,
       );

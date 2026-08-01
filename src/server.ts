@@ -3,6 +3,10 @@ import { registerMessagesRoute } from "./routes/messages.js";
 import { registerCountTokensRoute } from "./routes/count_tokens.js";
 import type { ApiError } from "./transformers/errors.js";
 import { mapUpstreamStatusToAnthropicErrorType } from "./utils/upstream.js";
+import {
+  loadModelInteractionLogConfig,
+  ModelInteractionLogger,
+} from "./utils/model-interaction-log.js";
 
 const PORT = Number(process.env.PORT ?? 3457);
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -53,10 +57,19 @@ fastify.get("/healthz", async () => ({ status: "ok" }));
 fastify.get("/", async () => ({
   name: "open-claude-router",
   description:
-    "stateless Anthropic <-> OpenAI bridge — pass X-Upstream-Url + X-Upstream-Authorization (+ X-Upstream-Model) headers per request",
+    "routing-stateless Anthropic <-> OpenAI bridge — pass X-Upstream-Url + X-Upstream-Authorization (+ X-Upstream-Model) headers per request",
 }));
 
-await registerMessagesRoute(fastify);
+const modelInteractionLogger = new ModelInteractionLogger(
+  loadModelInteractionLogConfig(),
+  fastify.log,
+);
+await modelInteractionLogger.start();
+fastify.addHook("onClose", async () => {
+  await modelInteractionLogger.close();
+});
+
+await registerMessagesRoute(fastify, { modelInteractionLogger });
 await registerCountTokensRoute(fastify);
 
 try {

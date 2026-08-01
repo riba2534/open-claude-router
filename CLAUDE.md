@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目定位
 
-open-claude-router 是一个**无状态**的 Anthropic Messages API ↔ OpenAI 协议（Chat Completions / Responses）转换服务。所有上游信息（URL、Authorization、模型名）由请求方逐请求传过来，服务端不读本地配置、不存任何凭证。客户端通过 HTTP header `X-Upstream-Format` 选择上游协议变体（不传或 `chat-completions` = 默认；`responses` = OpenAI o-series / gpt-5 原生协议）。详细使用文档见 [README.md](./README.md)。
+open-claude-router 是一个**路由和会话无状态**的 Anthropic Messages API ↔ OpenAI 协议（Chat Completions / Responses）转换服务。所有上游信息（URL、Authorization、模型名）由请求方逐请求传过来，服务端不读 provider 配置、不存任何凭证。客户端通过 HTTP header `X-Upstream-Format` 选择上游协议变体（不传或 `chat-completions` = 默认；`responses` = OpenAI o-series / gpt-5 原生协议）。服务默认把模型侧请求/响应写入保留 7 天的运维审计日志，但不写 Authorization；详见 README 的“模型交互日志”。
 
 ## 常用命令
 
@@ -110,6 +110,10 @@ Claude Code 客户端会带 `anthropic-version`、`anthropic-beta`、`x-stainles
 
 服务端**不解析、不重组**上游 Authorization。Bearer 格式（OpenAI）和非 Bearer 格式（企业网关常见的自定义协议头）都要原样发给上游。仅做 CR/LF header 注入校验。
 
+### 模型交互日志不能改变协议链路
+
+`src/utils/model-interaction-log.ts` 只观察转换后的上游请求体和转换前的上游原始响应体，不接收 Authorization 或上游额外 header。流式响应必须保持逐 chunk 旁路捕获与取消传播，不能 `clone()` 后无界缓冲，也不能等待日志落盘再向客户端返回。日志写入/清理必须 fail-open，任何文件系统错误都不得改变上游请求次数、响应字节、状态码或 `X-Should-Retry` 行为。默认保留 7 个 UTC 自然日，可通过 `OCR_MODEL_LOG_*` 环境变量配置。
+
 ### transformer 的 logger 必须赋值
 
 两个 transformer 当前都使用 `this.logger?.` 防御性可选调用，不赋值不会 runtime crash。`routes/messages.ts` 的 `registerMessagesRoute` 仍必须在实例化后统一赋值 `transformer.logger = fastify.log`，保证转换异常和调试信息可观测；重新 vendor 后同时检查可选链与赋值。
@@ -134,6 +138,7 @@ Claude Code 客户端会带 `anthropic-version`、`anthropic-beta`、`x-stainles
 | 改上游解析 / 模型映射 / 额外 header | `src/utils/auth.ts` |
 | 改字段剥除规则 | `src/utils/strip.ts` |
 | 改超时 / abort / 错误映射 | `src/utils/upstream.ts` |
+| 改模型交互日志 / 保留期 | `src/utils/model-interaction-log.ts` + `src/routes/messages.ts` |
 | 改 token 估算 | `src/utils/tokenizer.ts` |
 | 改 Anthropic ↔ unified 协议转换 | `src/transformers/anthropic.ts`（vendor 自 [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router)，慎改） |
 | 改 unified ↔ Responses 协议转换 | `src/transformers/responses.ts`（vendor 自 [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router)，慎改） |
