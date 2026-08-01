@@ -231,13 +231,16 @@ npm run test:live
 
 ### 发布 Docker 镜像
 
-推送版本 tag 时，GitHub Actions 会自动执行类型检查、全部回归、流式验证和构建，通过后发布 `linux/amd64`、`linux/arm64` 多架构镜像并校验 manifest / attestations。发布前须在仓库 Actions secrets 配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`；tag 必须是 SemVer（可带 `v` 前缀），且版本必须与 `package.json` 完全一致：
+推送版本 tag 时，GitHub Actions 会自动执行类型检查、全部回归、流式验证和构建，通过后发布 `linux/amd64`、`linux/arm64` 多架构镜像并校验 manifest / attestations。发布前须在仓库 Actions secrets 配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`；候选分支应先合入并更新到最新 `main`，tag 必须是 SemVer（可带 `v` 前缀），且版本必须与 `package.json` 完全一致。使用 annotated tag，并显式推送该 tag，避免轻量 tag 被 `--follow-tags` 遗漏：
 
 ```bash
-npm version 0.5.0 --no-git-tag-version --allow-same-version
-git commit -am "chore: release 0.5.0"
-git tag v0.5.0
-git push origin HEAD --follow-tags
+git switch main
+git pull --ff-only origin main
+test "$(node -p 'require("./package.json").version')" = "0.5.0"
+test -z "$(git status --porcelain)"
+git tag -a v0.5.0 -m "release: 0.5.0"
+git push origin main
+git push origin refs/tags/v0.5.0
 ```
 
 稳定版本会发布 `0.5.0`、`0.5` 和 `latest`；预发布版本不会覆盖 `latest`。
