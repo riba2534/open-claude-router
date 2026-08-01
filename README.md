@@ -103,115 +103,78 @@ npm run dev
 ```
 </details>
 
-### 2. 配置 Claude Code alias
+### 2. 配置单行明文 alias（最推荐）
 
-三种方式的区别只在"上游凭证放哪 / 服务鉴权走哪 / 用哪套 OpenAI 协议"，按需挑一种：
+**本项目最推荐的使用方式，是把完整配置以一条明文 alias 写进个人 `~/.zshrc`。** 这样所有上游配置都跟着 alias 走：平时只需输入 alias 名称即可启动 Claude Code，切换上游时换一个 alias，不需要在 Router 服务端维护 provider 配置。
 
-| 方式 | 上游凭证位置 | `ANTHROPIC_AUTH_TOKEN` 含义 | 服务鉴权 header | 适用 |
-|---|---|---|---|---|
-| **A** path 内嵌 | URL path | **上游凭证**（剥 `Bearer ` 前缀后透传上游） | `X-OCR-Token` | 最简洁，单上游直连 |
-| **B** 自定义 header | `X-Upstream-Authorization` header（URL 走 `X-Upstream-Url`） | **服务自身鉴权 token** | `Authorization: Bearer` | 上游凭证不进 URL、或需服务鉴权 |
-| **C** Responses API | 同 A | 同 A | 同 A | 接 o-series / gpt-5 原生 reasoning（在 A 基础上加 `X-Upstream-Format: responses`） |
+下面每个 alias 从 `alias` 到最后的 `claude` 都是**同一条物理行**，可直接作为一整行放进 `~/.zshrc`，不要拆成反斜杠续行。示例没有使用任何真实服务信息；复制前只需替换：
 
-> ⚠️ `ANTHROPIC_AUTH_TOKEN` 在 path 模式（A/C）里是**上游凭证**，在 header 模式（B）里是**服务自身鉴权 token**——别填反，否则上游 401。
->
-> **多 header 写法**：`ANTHROPIC_CUSTOM_HEADERS` 以换行分隔多个 header，所以多个 header 必须用 bash/zsh 的 `$'...\n...'`（ANSI-C 引用，让 `\n` 成为真实换行）；只有一个 header 时用普通单引号 `'...'` 即可。非 bash/zsh shell（如 fish）引用语法不同，需自行转换。
+- `upstream.example.com`：你的上游域名；
+- `YOUR_UPSTREAM_API_KEY`：上游要求的鉴权值；
+- `YOUR_UPSTREAM_MODEL`：上游实际模型名。
 
-若使用 path alias，两套上游协议的最小差异只有下面两处；Claude Code 仍统一请求 Anthropic `/v1/messages`：
+> alias 会在你的个人 shell 配置中明文保存上游地址和凭证，这是本项目面向个人自部署场景的首选方式。不要把含真实凭证的 `~/.zshrc`、截图或 alias 内容提交到仓库；建议保持 `chmod 600 ~/.zshrc`。
+
+#### Chat Completions：默认格式
 
 ```bash
-# Chat Completions：默认格式，不需要 X-Upstream-Format
-ANTHROPIC_BASE_URL=http://localhost:3457/https://upstream.example.com/v1/chat/completions
-
-# Responses：上游 URL 改为 /v1/responses，并显式选择协议
-ANTHROPIC_BASE_URL=http://localhost:3457/https://upstream.example.com/v1/responses
-ANTHROPIC_CUSTOM_HEADERS='X-Upstream-Format: responses'
+alias ocr-chat="ANTHROPIC_BASE_URL=http://127.0.0.1:3457/https://upstream.example.com/v1/chat/completions ANTHROPIC_AUTH_TOKEN='Bearer YOUR_UPSTREAM_API_KEY' ANTHROPIC_CUSTOM_HEADERS='X-Upstream-Model: YOUR_UPSTREAM_MODEL' ANTHROPIC_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_OPUS_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-sonnet-4-6 claude"
 ```
 
-这不是仅按 curl 推断：发布候选已用 Claude Code 2.1.220 的完整 `env ... claude` 命令测试 Chat Completions 与 Responses 两种配置。两套独立兼容上游组成的四条链路中，三条完成普通流式对话及 `Read(PNG) → tool_result(text/image) → 后续回答` 工具往返；剩余一条 Chat 兼容端点拒绝 OpenAI 正式的 user 多模态数组并返回 409，而同一上游的 Responses 路径可正常识图。Router 不为该端点增加字符串化或模型特判；完整责任边界和 A/B 证据见下方审计报告。
+#### Responses API
 
-#### 方式 A：URL path 内嵌上游（推荐，复制一个 alias 即可）
-
-把上游完整 URL 直接拼在服务地址后面：
+Responses 与 Chat 的区别只有上游路径和 `X-Upstream-Format`。`\n` 是 alias 内两个自定义 header 的分隔符，整条 alias 仍然只占 `~/.zshrc` 一行：
 
 ```bash
-alias myocr="ANTHROPIC_BASE_URL=http://localhost:3457/https://api.openai.com/v1/chat/completions \
-ANTHROPIC_AUTH_TOKEN='Bearer sk-proj-xxxxx' \
-ANTHROPIC_CUSTOM_HEADERS='X-Upstream-Model-Map: claude-opus-4-6=gpt-5.5,claude-sonnet-4-6=gpt-5.4,claude-haiku-4-5-20251001=gpt-5.4-mini' \
-ANTHROPIC_MODEL=claude-sonnet-4-6 \
-ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 \
-ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-6 \
-ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001 \
-claude"
+alias ocr-responses="ANTHROPIC_BASE_URL=http://127.0.0.1:3457/https://upstream.example.com/v1/responses ANTHROPIC_AUTH_TOKEN='Bearer YOUR_UPSTREAM_API_KEY' ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Format: responses\nX-Upstream-Model: YOUR_UPSTREAM_MODEL' ANTHROPIC_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_OPUS_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-sonnet-4-6 claude"
 ```
 
-（这里只有一个 header，用普通单引号即可；下面方式 B/C 有多个 header，才需要 `$'...\n...'`。）
-
-Claude Code 侧仍使用 `claude-*` 名称，能力检测和 `/model opus` 等槽位切换保持正常；上游实际收到 `gpt-5.4` / `gpt-5.5` / `gpt-5.4-mini`。
-
-> **`ANTHROPIC_AUTH_TOKEN` 应填上游需要的完整 Authorization header 值。** Claude Code 客户端会自动加 `Bearer ` 前缀，服务在 path 模式下会剥掉这一层后透传给上游：
->
-> - 上游期望 Bearer 鉴权（OpenAI 等）→ 写 `'Bearer sk-...'`
-> - 上游期望非 Bearer 自定义协议头 → 写 `'custom-scheme://...?key=...'`
-
-如果服务端启用了 `OCR_ACCESS_TOKENS` 白名单（公网部署强烈建议），path 模式下 `Authorization` 已经被上游凭证占用，需要额外通过 `ANTHROPIC_CUSTOM_HEADERS` 传 `X-OCR-Token` 做服务侧鉴权：
+保存后重新加载并启动：
 
 ```bash
-alias myocr="ANTHROPIC_BASE_URL=http://your-bridge.example.com/https://api.openai.com/v1/chat/completions \
-ANTHROPIC_AUTH_TOKEN='Bearer sk-proj-xxxxx' \
-ANTHROPIC_CUSTOM_HEADERS=$'X-OCR-Token: mytoken1\nX-Upstream-Model-Map: claude-opus-4-6=gpt-5.5,claude-sonnet-4-6=gpt-5.4,claude-haiku-4-5-20251001=gpt-5.4-mini' \
-ANTHROPIC_MODEL=claude-sonnet-4-6 \
-... \
-claude"
+source ~/.zshrc
+ocr-chat       # Chat Completions
+ocr-responses  # Responses API
 ```
 
-#### 方式 B：自定义 header 传上游（更灵活，支持服务自身鉴权）
+这里使用 `X-Upstream-Model` 把 Claude Code 的所有模型槽位统一指向一个上游模型，最适合首次配置。如果希望 `/model opus`、`sonnet`、后台 haiku 分别走不同上游模型，再把它替换为：
+
+```text
+X-Upstream-Model-Map: claude-opus-4-6=YOUR_OPUS_MODEL,claude-sonnet-4-6=YOUR_SONNET_MODEL,claude-haiku-4-5-20251001=YOUR_HAIKU_MODEL
+```
+
+#### 两个独立选择：接入模式与上游协议
+
+alias 的接入模式和上游协议相互独立，不是三种互斥配置：
+
+| 配置维度 | 选项 | 如何选择 |
+|---|---|---|
+| 上游信息入口 | path 模式 / header 模式 | path 模式把上游 URL 拼进 `ANTHROPIC_BASE_URL`；header 模式使用 `X-Upstream-Url` 和 `X-Upstream-Authorization` |
+| 上游协议 | Chat Completions / Responses | Chat 是默认值；Responses 增加 `X-Upstream-Format: responses` |
+
+上面的两个首选 alias 使用 path 模式。path 中放的是**上游 URL**，上游凭证仍来自 `ANTHROPIC_AUTH_TOKEN`；Claude Code 自动添加的外层 `Bearer ` 会被 Router 剥掉，然后把剩余内容作为上游 Authorization 原样发送：
+
+- 上游需要 `Authorization: Bearer ...` → 写 `ANTHROPIC_AUTH_TOKEN='Bearer YOUR_UPSTREAM_API_KEY'`；
+- 上游需要非 Bearer 自定义值 → 把引号内内容替换为上游要求的完整值。
+
+path 模式适合不带 query 的上游 URL。如果上游地址必须包含 `?api-version=...` 等 query，或希望显式分离服务鉴权与上游鉴权，请改用 header 模式：
 
 ```bash
-alias myocr="ANTHROPIC_BASE_URL=http://localhost:3457 \
-ANTHROPIC_AUTH_TOKEN=service-access-token \
-ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Url: https://api.openai.com/v1/chat/completions\nX-Upstream-Authorization: Bearer sk-proj-xxxxx\nX-Upstream-Model-Map: claude-opus-4-6=gpt-5.5,claude-sonnet-4-6=gpt-5.4,claude-haiku-4-5-20251001=gpt-5.4-mini' \
-ANTHROPIC_MODEL=claude-sonnet-4-6 \
-ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 \
-ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-6 \
-ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001 \
-claude"
+alias ocr-header="ANTHROPIC_BASE_URL=http://127.0.0.1:3457 ANTHROPIC_AUTH_TOKEN='YOUR_ROUTER_ACCESS_TOKEN' ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Url: https://upstream.example.com/v1/chat/completions\nX-Upstream-Authorization: Bearer YOUR_UPSTREAM_API_KEY\nX-Upstream-Model: YOUR_UPSTREAM_MODEL' ANTHROPIC_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_OPUS_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-sonnet-4-6 claude"
 ```
 
-> 服务自身鉴权与上游凭证完全分离；可配合环境变量 `OCR_ACCESS_TOKENS=token1,token2,...` 启用服务侧 Bearer 白名单（header 模式校验 `Authorization: Bearer ...`，path 模式校验 `X-OCR-Token`）。
+header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`，并在同一个 `ANTHROPIC_CUSTOM_HEADERS` 值中增加 `\nX-Upstream-Format: responses`。
 
-如果上游网关需要额外 header 做租户、路由或会话粘性，也直接追加在 alias 里：
+如果服务启用了 `OCR_ACCESS_TOKENS`：
 
-```bash
-ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Url: https://api.openai.com/v1/chat/completions\nX-Upstream-Authorization: Bearer sk-proj-xxxxx\nX-Upstream-Headers: {"x-session-id":"ocr-local"}'
-```
+- header 模式的 `ANTHROPIC_AUTH_TOKEN` 填服务访问 token；未启用服务鉴权时该值不会被 Router 校验；
+- path 模式则在 `ANTHROPIC_CUSTOM_HEADERS` 中增加 `X-OCR-Token: YOUR_ROUTER_ACCESS_TOKEN`。
 
-服务只会转发 `X-Upstream-Headers` JSON object 里显式列出的 header，不会透传 Claude Code 原始请求头，也不能覆盖 `authorization`、`content-type`、`accept`、`host`、`x-ocr-token`、`x-upstream-*` 和 hop-by-hop headers。
-
-#### 方式 C：接 OpenAI Responses API（o-series / gpt-5 等原生 reasoning 模型）
-
-OpenAI 在 2025 年推出 **Responses API**（`/v1/responses`），是 o-series / gpt-5 的原生协议，含 reasoning summary。把方式 A 的 alias 多加一个 `X-Upstream-Format: responses` header 即可——其他保持不变：
-
-```bash
-alias myresponses="ANTHROPIC_BASE_URL=http://localhost:3457/https://api.openai.com/v1/responses \
-ANTHROPIC_AUTH_TOKEN='Bearer sk-proj-xxxxx' \
-ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Format: responses\nX-Upstream-Model-Map: claude-opus-4-6=gpt-5.5,claude-sonnet-4-6=gpt-5.4,claude-haiku-4-5-20251001=gpt-5.4-mini' \
-ANTHROPIC_MODEL=claude-sonnet-4-6 \
-ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 \
-ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-6 \
-ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001 \
-claude"
-```
-
-服务侧会把 OpenAI 的 reasoning summary / `reasoning_text` 事件转成 Anthropic 的 `thinking` 块返回给 Claude Code；refusal 文本会保留在普通 assistant 文本块中，并以 `stop_reason:"refusal"` 和结构化 `stop_details` 标记终态。**其他所有 alias（不带 `X-Upstream-Format` 或显式 `chat-completions`）行为完全不变**。
+`X-Upstream-Headers` 可用于显式添加上游要求的额外 header。Router 不会透传 Claude Code 原始请求头，也不允许覆盖 `authorization`、`content-type`、`accept`、`host`、`x-ocr-token`、`x-upstream-*` 或 hop-by-hop headers。
 
 ### 3. 启动 Claude Code
 
-```bash
-myocr
-```
-
-正常对话、工具调用、`/model` 切换都会被透明转换。`ANTHROPIC_DEFAULT_*_MODEL` 各自对应不同场景（默认 / `/model sonnet` / `/model opus` / 后台 haiku 任务）；如果设置了 `X-Upstream-Model-Map`，上游收到的是映射后的真实模型名，否则透传当前 body model。
+直接执行你写入 `~/.zshrc` 的 alias 即可。正常对话、工具调用和历史回放都会透明转换；若配置了 `X-Upstream-Model-Map`，`/model` 切换会按映射选择真实上游模型。
 
 ## 协议覆盖与边界
 
