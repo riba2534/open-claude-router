@@ -518,6 +518,16 @@ test("Responses logical failures map status and retain the retry contract", asyn
   assert.equal(rateLimited.status, 429);
   assert.equal((await rateLimited.json() as any).error.type, "rate_limit_error");
 
+  const overloaded = await responses.transformResponseOut(
+    jsonResponse({
+      object: "response",
+      status: "failed",
+      error: { code: "overloaded_error", message: "try again later" },
+    }),
+  );
+  assert.equal(overloaded.status, 529);
+  assert.equal((await overloaded.json() as any).error.type, "overloaded_error");
+
   const invalid = await responses.transformResponseOut(
     jsonResponse({
       object: "response",

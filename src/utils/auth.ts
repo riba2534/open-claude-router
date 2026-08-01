@@ -414,6 +414,92 @@ export function resolveMappedEffort(
 }
 
 /**
+ * Canonical effort ordering, lowest to highest. `none` and `auto` are switches
+ * rather than intensities, so they stay out of the ladder: they only ever match
+ * exactly and never become a clamp target.
+ */
+const EFFORT_LADDER = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+
+function effortRank(value: string): number {
+  return EFFORT_LADDER.indexOf(value.toLowerCase() as never);
+}
+
+/**
+ * Parse `X-Upstream-Effort-Levels` into the effort vocabulary the upstream
+ * accepts, e.g. `none,low,medium,high,xhigh`.
+ *
+ * This is the client declaring what its upstream understands — the router still
+ * never infers a vocabulary from the model name or the URL. Values are lowercased
+ * and forwarded verbatim; anything outside the canonical ladder (`none`, `auto`,
+ * or a provider-specific word) is kept for exact matching but never used as a
+ * clamp target, because there is no meaningful "distance" to a switch.
+ */
+export function parseEffortLevels(req: FastifyRequest): string[] {
+  const raw = readHeader(req, "x-upstream-effort-levels");
+  if (raw === undefined || raw.trim() === "") return [];
+
+  const levels: string[] = [];
+  for (const part of raw.split(",")) {
+    const level = part.trim().toLowerCase();
+    if (!level || HEADER_VALUE_INVALID_RE.test(level)) {
+      throw createApiError(
+        "X-Upstream-Effort-Levels contains an invalid level " +
+          "(expected format: none,low,medium,high,xhigh)",
+        400,
+        "invalid_effort_levels",
+        "invalid_request_error",
+      );
+    }
+    if (!levels.includes(level)) levels.push(level);
+  }
+  return levels;
+}
+
+/**
+ * Clamp one effort to the nearest level the upstream declared, measured on the
+ * canonical ladder; ties resolve downward so a degradation never silently costs
+ * more than the client asked for. Returns undefined when the value already fits,
+ * when nothing was declared, or when no ladder position can be compared — the
+ * caller then leaves the original value untouched.
+ *
+ * This complements `X-Upstream-Effort-Map`: the map renames individual words,
+ * this narrows an Anthropic effort into a smaller supported range without the
+ * client having to enumerate every pair.
+ */
+export function clampEffortToLevels(
+  effort: string | undefined,
+  levels: string[],
+): string | undefined {
+  if (!effort || levels.length === 0) return undefined;
+  if (levels.includes(effort.toLowerCase())) return undefined;
+
+  const from = effortRank(effort);
+  if (from === -1) return undefined;
+
+  let best: string | undefined;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  let bestRank = -1;
+  for (const level of levels) {
+    const rank = effortRank(level);
+    if (rank === -1) continue;
+    const distance = Math.abs(from - rank);
+    if (distance < bestDistance || (distance === bestDistance && rank < bestRank)) {
+      best = EFFORT_LADDER[rank];
+      bestDistance = distance;
+      bestRank = rank;
+    }
+  }
+  return best;
+}
+
+/**
  * Resolve upstream model override. Undefined means "do not override"; the
  * transformed request keeps its original body model.
  */

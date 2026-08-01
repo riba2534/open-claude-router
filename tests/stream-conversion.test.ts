@@ -189,9 +189,85 @@ test("truncated Chat stream does not fabricate a successful terminal", async () 
       },
     ]),
   );
+  // The body stopped arriving without either a finish_reason or a `[DONE]`
+  // sentinel. Keep the text already received, but report a protocol/transport
+  // failure rather than guessing that the model hit its token limit.
   assert.equal(events.at(-1)?.type, "error");
   assert.match(events.at(-1)?.error.message, /before a terminal event/);
   assert.equal(events.some((event) => event.type === "message_stop"), false);
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "content_block_delta" &&
+        event.delta?.text === "partial",
+    ),
+    "the text received before the cut must survive",
+  );
+});
+
+test("Chat stream ending at [DONE] without finish_reason completes normally", async () => {
+  const events = await toAnthropicStream(
+    new Response(
+      `data: ${JSON.stringify({
+        id: "chatcmpl-no-finish",
+        model: "test",
+        choices: [{ index: 0, delta: { content: "hello world" } }],
+      })}\n\n` + "data: [DONE]\n\n",
+      { headers: { "content-type": "text/event-stream" } },
+    ),
+  );
+  const delta = events.find((event) => event.type === "message_delta");
+  assert.equal(delta?.delta.stop_reason, "end_turn");
+  assert.equal(events.at(-1)?.type, "message_stop");
+  assert.equal(
+    events.some((event) => event.type === "error"),
+    false,
+  );
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "content_block_delta" &&
+        event.delta?.text === "hello world",
+    ),
+  );
+});
+
+test("[DONE] without finish_reason never promotes a partial tool call", async () => {
+  const events = await toAnthropicStream(
+    new Response(
+      `data: ${JSON.stringify({
+        id: "chatcmpl-partial-tool",
+        model: "test",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call_1",
+                  type: "function",
+                  function: { name: "read", arguments: '{"pa' },
+                },
+              ],
+            },
+          },
+        ],
+      })}\n\n` + "data: [DONE]\n\n",
+      { headers: { "content-type": "text/event-stream" } },
+    ),
+  );
+  const delta = events.find((event) => event.type === "message_delta");
+  assert.equal(delta?.delta.stop_reason, "max_tokens");
+  assert.equal(
+    events.some(
+      (event) =>
+        event.type === "content_block_start" &&
+        event.content_block?.type === "tool_use",
+    ),
+    false,
+    "a partial tool call must never surface as an executable tool_use",
+  );
 });
 
 test("coalesced Chat finish and usage-only chunks retain final usage", async () => {

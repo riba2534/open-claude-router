@@ -808,8 +808,8 @@ async function runReasoningCases(): Promise<void> {
         assertRetryInvariant(second);
         const message = getRemoteError(second);
         if (
-          second.status === 409 &&
-          /item with id .+ not found|different (?:Azure )?OpenAI resource/i.test(
+          (second.status === 400 || second.status === 409) &&
+          /item with id .+ not found|different (?:Azure )?OpenAI resource|encrypted content (?:could not be|cannot be) (?:decrypted|parsed|verified)/i.test(
             message,
           )
         ) {

@@ -21,6 +21,7 @@ import {
   encodeChatReasoningSignature,
   isRouterOwnedReasoningSignature,
 } from "../utils/chat-reasoning.js";
+import { mapOpenAIErrorToAnthropic } from "../utils/upstream.js";
 
 const ANTHROPIC_EFFORTS = new Set<AnthropicEffort>([
   "low",
@@ -1692,20 +1693,29 @@ export class AnthropicTransformer implements Transformer {
     } else {
       const data = (await response.json()) as any;
       if (data?.error) {
+        // Chat-shaped gateways often report failures as an `error` object inside
+        // an HTTP 200. Derive the status and the Anthropic error vocabulary from
+        // what the upstream actually said instead of collapsing everything to a
+        // 500 that clients cannot act on.
+        const { status, type } = mapOpenAIErrorToAnthropic(
+          data.error,
+          response.status,
+        );
         return new Response(
           JSON.stringify({
             type: "error",
             request_id:
               typeof data.request_id === "string" ? data.request_id : null,
             error: {
-              type: data.error.type || data.error.code || "api_error",
+              type,
               message:
-                data.error.message ||
-                JSON.stringify(data.error),
+                typeof data.error.message === "string" && data.error.message
+                  ? data.error.message
+                  : boundedJsonBlockText(data.error),
             },
           }),
           {
-            status: response.status >= 400 ? response.status : 500,
+            status,
             headers: { "Content-Type": "application/json" },
           },
         );
@@ -2028,19 +2038,77 @@ export class AnthropicTransformer implements Transformer {
                 return;
               }
               if (!sawTerminal) {
-                deferSemanticFrames = false;
-                deferredFrames = [];
-                deferredToolCalls.length = 0;
+                const truncatedToolCall =
+                  deferredToolCalls.length > 0 || toolCalls.size > 0;
+                // EOF without either a finish_reason or [DONE] is a transport /
+                // protocol cutoff, not evidence that the model hit max_tokens.
+                // Preserve bytes already received (including a non-executable
+                // diagnostic for a partial tool call), then end with an error.
+                if (!sawDone) {
+                  flushToolCalls(false);
+                  closeCurrentBlock();
+                  releaseDeferredFrames(truncatedToolCall);
+                  safeEnqueue(
+                    encoder.encode(
+                      `event: error\ndata: ${JSON.stringify({
+                        type: "error",
+                        request_id: null,
+                        error: {
+                          type: "api_error",
+                          message:
+                            "upstream stream ended before a terminal event",
+                        },
+                      })}\n\n`,
+                    ),
+                  );
+                  controller.close();
+                  isClosed = true;
+                  return;
+                }
+                // Several OpenAI-compatible gateways stream content and then
+                // close with `[DONE]` without ever sending a finish_reason.
+                // Dropping the whole answer here loses real work, so synthesize
+                // a well-formed terminal instead — Anthropic's contract wants a
+                // message_delta carrying stop_reason before message_stop, so
+                // emitting message_stop alone is not an option either.
+                //
+                // Which terminal is decided by the upstream's own framing, not
+                // by guesswork: `[DONE]` is the upstream declaring the stream
+                // complete, so the turn ends normally; a body that just stopped
+                // arriving was genuinely cut short and must not be advertised
+                // as a successful completion.
+                //
+                // A tool call still buffered at this point never got a terminal
+                // to validate it. It is treated exactly like a `length` cutoff:
+                // the received bytes survive as text, but the turn must not
+                // claim an executable tool_use.
+                const truncated = truncatedToolCall;
+                // Same order as the finish_reason path: move still-open calls
+                // into the deferred sequence without demanding complete JSON,
+                // then release them as degraded text.
+                flushToolCalls(false);
+                closeCurrentBlock();
+                releaseDeferredFrames(truncatedToolCall);
                 safeEnqueue(
                   encoder.encode(
-                    `event: error\ndata: ${JSON.stringify({
-                      type: "error",
-                      request_id: null,
-                      error: {
-                        type: "api_error",
-                        message:
-                          "upstream stream ended before a terminal event",
+                    `event: message_delta\ndata: ${JSON.stringify({
+                      type: "message_delta",
+                      delta: {
+                        container: null,
+                        stop_reason: truncated ? "max_tokens" : "end_turn",
+                        stop_sequence: null,
+                        stop_details: null,
                       },
+                      usage:
+                        stopReasonMessageDelta?.usage ??
+                        emptyAnthropicDeltaUsage(),
+                    })}\n\n`,
+                  ),
+                );
+                safeEnqueue(
+                  encoder.encode(
+                    `event: message_stop\ndata: ${JSON.stringify({
+                      type: "message_stop",
                     })}\n\n`,
                   ),
                 );

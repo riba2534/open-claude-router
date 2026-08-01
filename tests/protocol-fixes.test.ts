@@ -568,9 +568,11 @@ test("two reasoning items with two tool calls replay interleaved with both ids",
   });
   scrubResponsesReasoningArtifacts(unified as any);
   const replay: any = await responses.transformRequestIn!(unified);
+  // Encrypted state replays each item self-containedly, so it — not a
+  // server-side id — is what keeps the two reasoning items distinct.
   const shape = replay.input.map((item: any) =>
     item.type === "reasoning"
-      ? `reasoning:${item.id}`
+      ? `reasoning:${item.encrypted_content}`
       : item.type === "function_call"
         ? `function_call:${item.call_id}`
         : item.type === "function_call_output"
@@ -579,9 +581,9 @@ test("two reasoning items with two tool calls replay interleaved with both ids",
   );
   assert.deepEqual(shape, [
     "message:user",
-    "reasoning:rs_1",
+    "reasoning:E1",
     "function_call:call_1",
-    "reasoning:rs_2",
+    "reasoning:E2",
     "function_call:call_2",
     "output:call_1",
     "output:call_2",
@@ -592,6 +594,10 @@ test("two reasoning items with two tool calls replay interleaved with both ids",
   assert.deepEqual(
     reasoningItems.map((item: any) => item.encrypted_content),
     ["E1", "E2"],
+  );
+  assert.deepEqual(
+    reasoningItems.map((item: any) => item.id),
+    ["rs_1", "rs_2"],
   );
 });
 
@@ -1014,6 +1020,511 @@ test("X-Upstream-Effort-Map remaps explicit efforts; absent header stays exact",
       });
       assert.equal(response.statusCode, 400);
       assert.equal(response.json().error.type, "invalid_request_error");
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Upstream error bodies are bounded before reaching the client
+// ---------------------------------------------------------------------------
+
+test("a huge non-JSON upstream error body is truncated, not echoed whole", async () => {
+  const html = `<html><body>${"x".repeat(60_000)}</body></html>`;
+  await withRouter(
+    () =>
+      new Response(html, {
+        status: 502,
+        headers: { "content-type": "text/html" },
+      }),
+    async (app) => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/messages",
+        headers: upstreamHeaders,
+        payload: {
+          model: "claude-test",
+          max_tokens: 8,
+          messages: [{ role: "user", content: "hi" }],
+        },
+      });
+      assert.equal(response.statusCode, 502);
+      assert.equal(response.headers["x-should-retry"], "true");
+      const message = response.json().error.message;
+      assert.ok(
+        message.length < html.length,
+        "the whole document must not be inlined",
+      );
+      assert.ok(message.length <= 4096 + 100);
+      assert.match(
+        message,
+        new RegExp(`truncated, ${html.length} chars total`),
+      );
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Reasoning-related upstream rejections remain single-attempt
+// ---------------------------------------------------------------------------
+
+function effortPayload(extra: Record<string, unknown> = {}) {
+  return {
+    model: "claude-test",
+    max_tokens: 8,
+    output_config: { effort: "max" },
+    messages: [{ role: "user", content: "hi" }],
+    ...extra,
+  };
+}
+
+test("a Chat rejection naming reasoning_effort is returned without mutation or retry", async () => {
+  const sent: any[] = [];
+  await withRouter(
+    (body) => {
+      sent.push(body);
+      return new Response(
+        JSON.stringify({
+          error: {
+            message:
+              "Function tools with reasoning_effort are not supported for this model",
+          },
+        }),
+        { status: 409, headers: { "content-type": "application/json" } },
+      );
+    },
+    async (app) => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/messages",
+        headers: upstreamHeaders,
+        payload: effortPayload(),
+      });
+      assert.equal(response.statusCode, 409);
+      assert.equal(response.headers["x-should-retry"], "true");
+      assert.match(response.json().error.message, /reasoning_effort/);
+      assert.equal(sent.length, 1, "router must remain single-attempt");
+      assert.equal(sent[0].reasoning_effort, "max");
+    },
+  );
+});
+
+test("a Responses rejection naming reasoning.effort is returned without retry", async () => {
+  const sent: any[] = [];
+  await withRouter(
+    (body) => {
+      sent.push(body);
+      return new Response(
+        JSON.stringify({
+          error: { message: "Unsupported parameter: 'reasoning'" },
+        }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
+    },
+    async (app) => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/messages",
+        headers: { ...upstreamHeaders, "x-upstream-format": "responses" },
+        payload: effortPayload(),
+      });
+      assert.equal(response.statusCode, 400);
+      assert.equal(response.headers["x-should-retry"], "true");
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].reasoning.effort, "max");
+    },
+  );
+});
+
+test("an unresolvable replayed reasoning item is preserved in a single request", async () => {
+  const signature =
+    "ocr-responses-reasoning-v1:" +
+    Buffer.from(JSON.stringify({ id: "rs_1", encrypted_content: "E1" })).toString(
+      "base64url",
+    );
+  for (const message of [
+    "The encrypted content gAAA...= could not be verified. Reason: Encrypted content could not be decrypted or parsed.",
+    "The requested item was created under a different Azure OpenAI resource.",
+    "Item with id 'rs_1' not found.",
+  ]) {
+    const sent: any[] = [];
+    await withRouter(
+      (body) => {
+        sent.push(body);
+        return new Response(JSON.stringify({ error: { message } }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      async (app) => {
+        const response = await app.inject({
+          method: "POST",
+          url: "/v1/messages",
+          headers: { ...upstreamHeaders, "x-upstream-format": "responses" },
+          payload: {
+            model: "claude-test",
+            max_tokens: 8,
+            messages: [
+              { role: "user", content: "first" },
+              {
+                role: "assistant",
+                content: [
+                  { type: "thinking", thinking: "t", signature },
+                  { type: "text", text: "answer" },
+                ],
+              },
+              { role: "user", content: "second" },
+            ],
+          },
+        });
+        assert.equal(response.statusCode, 400, message);
+        assert.equal(response.headers["x-should-retry"], "true", message);
+        assert.equal(sent.length, 1, message);
+        assert.equal(
+          sent[0].input.some((i: any) => i?.type === "reasoning"),
+          true,
+          message,
+        );
+      },
+    );
+  }
+});
+
+test("rejections unrelated to reasoning effort never trigger a second call", async () => {
+  for (const message of [
+    "model not found",
+    "context length exceeded",
+    'diagnostic context: {"reasoning":"upstream trace omitted"}',
+  ]) {
+    const sent: any[] = [];
+    await withRouter(
+      (body) => {
+        sent.push(body);
+        return new Response(JSON.stringify({ error: { message } }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      async (app) => {
+        const response = await app.inject({
+          method: "POST",
+          url: "/v1/messages",
+          headers: upstreamHeaders,
+          payload: effortPayload(),
+        });
+        assert.equal(response.statusCode, 400, message);
+        assert.equal(response.headers["x-should-retry"], "true", message);
+        assert.equal(sent.length, 1, `${message}: router stays single-attempt`);
+      },
+    );
+  }
+});
+
+test("a request without an effort never triggers a second call", async () => {
+  const sent: any[] = [];
+  await withRouter(
+    (body) => {
+      sent.push(body);
+      return new Response(
+        JSON.stringify({ error: { message: "reasoning_effort is bad" } }),
+        { status: 409, headers: { "content-type": "application/json" } },
+      );
+    },
+    async (app) => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/messages",
+        headers: upstreamHeaders,
+        payload: {
+          model: "claude-test",
+          max_tokens: 8,
+          messages: [{ role: "user", content: "hi" }],
+        },
+      });
+      assert.equal(response.statusCode, 409);
+      assert.equal(sent.length, 1);
+    },
+  );
+});
+
+test("a reasoning rejection preserves its original status and body in one attempt", async () => {
+  const sent: any[] = [];
+  await withRouter(
+    (body) => {
+      sent.push(body);
+      return new Response(
+        JSON.stringify({
+          error: { message: "reasoning_effort rejected", type: "bad_request" },
+        }),
+        { status: 409, headers: { "content-type": "application/json" } },
+      );
+    },
+    async (app) => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/messages",
+        headers: upstreamHeaders,
+        payload: effortPayload(),
+      });
+      assert.equal(response.statusCode, 409, "original status is preserved");
+      assert.equal(response.headers["x-should-retry"], "true");
+      assert.match(response.json().error.message, /reasoning_effort rejected/);
+      assert.equal(sent.length, 1, "router must remain single-attempt");
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Assistant turns survive a chat-alias -> responses-alias switch
+// ---------------------------------------------------------------------------
+
+test("Responses history keeps an assistant turn whose blocks are all unreplayable", async () => {
+  let captured: any;
+  await withRouter(
+    (body) => {
+      captured = body;
+      return new Response(
+        JSON.stringify({
+          id: "resp-ok",
+          object: "response",
+          created_at: 1,
+          status: "completed",
+          output: [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "ok" }],
+            },
+          ],
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    },
+    async (app) => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/messages",
+        headers: { ...upstreamHeaders, "x-upstream-format": "responses" },
+        payload: {
+          model: "claude-test",
+          max_tokens: 8,
+          messages: [
+            { role: "user", content: "first" },
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "thinking",
+                  thinking: "",
+                  // A Chat-origin signature the Responses upstream cannot resolve.
+                  signature: "ocr-chat-reasoning-v1:eyJhIjoxfQ",
+                },
+              ],
+            },
+            { role: "user", content: "second" },
+          ],
+        },
+      });
+      assert.equal(response.statusCode, 200);
+
+      const roles = captured.input
+        .filter((item: any) => typeof item.role === "string")
+        .map((item: any) => item.role);
+      assert.deepEqual(
+        roles,
+        ["user", "assistant", "user"],
+        "the assistant turn must survive even when every block is unreplayable",
+      );
+      assert.equal(
+        roles.join(",").includes("user,user"),
+        false,
+        "two consecutive user turns mean the assistant turn was erased",
+      );
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// HTTP 200 carrying an error body keeps the upstream's own semantics
+// ---------------------------------------------------------------------------
+
+test("Chat HTTP 200 with an error body keeps status, retry ownership and Anthropic vocabulary", async () => {
+  const anthropicTypes = new Set([
+    "invalid_request_error",
+    "authentication_error",
+    "billing_error",
+    "permission_error",
+    "not_found_error",
+    "conflict_error",
+    "request_too_large",
+    "rate_limit_error",
+    "timeout_error",
+    "overloaded_error",
+    "api_error",
+  ]);
+  const cases = [
+    { error: { message: "busy", type: "rate_limit_exceeded" }, status: 429, type: "rate_limit_error" },
+    { error: { message: "overloaded", type: "overloaded_error" }, status: 529, type: "overloaded_error" },
+    { error: { message: "bad", code: "unsupported_value" }, status: 400, type: "invalid_request_error" },
+    { error: { message: "nope", type: "invalid_api_key" }, status: 401, type: "authentication_error" },
+    { error: { message: "nope", type: "invalid_request_error", code: "invalid_api_key" }, status: 401, type: "authentication_error" },
+    { error: { message: "pay", type: "billing_error" }, status: 402, type: "billing_error" },
+    { error: { message: "who knows", type: "weird_thing" }, status: 502, type: "api_error" },
+    { error: { message: "slow down", type: "rate_limit_error" }, status: 429, type: "rate_limit_error" },
+  ];
+
+  for (const { error, status, type } of cases) {
+    for (const stream of [false, true]) {
+      await withRouter(
+        () =>
+          new Response(JSON.stringify({ error }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        async (app) => {
+          const response = await app.inject({
+            method: "POST",
+            url: "/v1/messages",
+            headers: upstreamHeaders,
+            payload: {
+              model: "claude-test",
+              max_tokens: 8,
+              stream,
+              messages: [{ role: "user", content: "hi" }],
+            },
+          });
+          const label = `${error.type ?? error.code}/stream=${stream}`;
+          assert.equal(response.statusCode, status, label);
+          assert.equal(response.headers["x-should-retry"], "true", label);
+          const body = response.json();
+          assert.equal(body.type, "error", label);
+          assert.ok(
+            anthropicTypes.has(body.error.type),
+            `${label}: ${body.error.type} must be an Anthropic error type`,
+          );
+          assert.equal(body.error.type, type, label);
+          assert.equal(body.error.message, error.message, label);
+        },
+      );
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// X-Upstream-Effort-Levels: clamp to the nearest level the upstream declared
+// ---------------------------------------------------------------------------
+
+test("X-Upstream-Effort-Levels clamps to the nearest declared level", async () => {
+  let captured: any;
+  await withRouter(
+    (body) => {
+      captured = body;
+      return new Response(
+        JSON.stringify({
+          id: "chatcmpl-ok",
+          object: "chat.completion",
+          created: 1,
+          model: "m",
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: "ok" },
+              finish_reason: "stop",
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    },
+    async (app) => {
+      const send = async (effort: string, levels?: string, extra = {}) => {
+        const response = await app.inject({
+          method: "POST",
+          url: "/v1/messages",
+          headers: {
+            ...upstreamHeaders,
+            ...(levels ? { "x-upstream-effort-levels": levels } : {}),
+            ...extra,
+          },
+          payload: {
+            model: "claude-test",
+            max_tokens: 8,
+            output_config: { effort },
+            messages: [{ role: "user", content: "hi" }],
+          },
+        });
+        assert.equal(response.statusCode, 200, `${effort} via ${levels}`);
+        return captured.reasoning_effort;
+      };
+
+      // A gateway that enumerates none..xhigh: max has no home and lands on the
+      // adjacent xhigh, everything else is already supported and stays exact.
+      const upTo = "none,low,medium,high,xhigh";
+      assert.equal(await send("max", upTo), "xhigh");
+      assert.equal(await send("xhigh", upTo), "xhigh");
+      assert.equal(await send("high", upTo), "high");
+      assert.equal(await send("low", upTo), "low");
+
+      // A narrower gateway pulls max further down — the target follows the
+      // declared range instead of a hardcoded xhigh.
+      assert.equal(await send("max", "low,medium,high"), "high");
+      assert.equal(await send("xhigh", "low,medium"), "medium");
+
+      // Ties resolve downward: medium sits between low and high.
+      assert.equal(await send("medium", "low,high"), "low");
+
+      // `none` is a switch, not an intensity, so it never becomes a target.
+      assert.equal(await send("max", "none"), "max");
+
+      // Absent header keeps the router's exact passthrough.
+      assert.equal(await send("max"), "max");
+
+      // The map renames first, then the level list clamps what survived.
+      assert.equal(
+        await send("max", "low,medium,high", {
+          "x-upstream-effort-map": "max=xhigh",
+        }),
+        "high",
+      );
+
+      // `off` short-circuits the clamp entirely.
+      const stripped = await app.inject({
+        method: "POST",
+        url: "/v1/messages",
+        headers: {
+          ...upstreamHeaders,
+          "x-upstream-effort-map": "*=off",
+          "x-upstream-effort-levels": "low,medium,high",
+        },
+        payload: {
+          model: "claude-test",
+          max_tokens: 8,
+          output_config: { effort: "max" },
+          messages: [{ role: "user", content: "hi" }],
+        },
+      });
+      assert.equal(stripped.statusCode, 200);
+      assert.equal(Object.hasOwn(captured, "reasoning_effort"), false);
+
+      for (const malformed of ["low,,high", "low, ,high", ","]) {
+        const bad = await app.inject({
+          method: "POST",
+          url: "/v1/messages",
+          headers: {
+            ...upstreamHeaders,
+            "x-upstream-effort-levels": malformed,
+          },
+          payload: {
+            model: "claude-test",
+            max_tokens: 8,
+            output_config: { effort: "max" },
+            messages: [{ role: "user", content: "hi" }],
+          },
+        });
+        assert.equal(bad.statusCode, 400, malformed);
+        assert.equal(bad.json().error.type, "invalid_request_error", malformed);
+      }
     },
   );
 });

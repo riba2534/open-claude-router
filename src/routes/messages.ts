@@ -6,6 +6,8 @@ import {
   checkServiceAuth,
   checkServiceAuthFromOcrTokenHeader,
   isEmbeddedUpstreamPath,
+  clampEffortToLevels,
+  parseEffortLevels,
   parseEffortMap,
   parseModelMap,
   resolveMappedEffort,
@@ -73,17 +75,25 @@ async function forwardMessages(
   if (upstream.model) {
     unified.model = upstream.model;
   }
-  // Client-declared effort vocabulary mapping (X-Upstream-Effort-Map). The
-  // router never clamps explicit efforts on its own; this only applies what
-  // the client explicitly configured for its upstream. The reserved target
-  // `off` strips the field.
+  // Client-declared effort vocabulary (X-Upstream-Effort-Map) and supported
+  // range (X-Upstream-Effort-Levels). The router never infers either one from
+  // the model name or the upstream URL; both are the client's explicit
+  // declaration. The map renames individual words and its reserved target
+  // `off` strips the field; the level list clamps whatever survives to the
+  // nearest level the upstream actually accepts.
   const effortMap = parseEffortMap(req);
-  if (effortMap.size) {
+  const effortLevels = parseEffortLevels(req);
+  if (effortMap.size || effortLevels.length) {
     const mappedTop = resolveMappedEffort(unified.reasoning_effort, effortMap);
     if (mappedTop === "off") {
       delete unified.reasoning_effort;
-    } else if (mappedTop) {
-      (unified as any).reasoning_effort = mappedTop;
+    } else {
+      if (mappedTop) (unified as any).reasoning_effort = mappedTop;
+      const clampedTop = clampEffortToLevels(
+        unified.reasoning_effort,
+        effortLevels,
+      );
+      if (clampedTop) (unified as any).reasoning_effort = clampedTop;
     }
     const mappedReasoning = resolveMappedEffort(
       unified.reasoning?.effort,
@@ -91,8 +101,13 @@ async function forwardMessages(
     );
     if (mappedReasoning === "off") {
       delete unified.reasoning!.effort;
-    } else if (mappedReasoning) {
-      (unified.reasoning as any).effort = mappedReasoning;
+    } else {
+      if (mappedReasoning) (unified.reasoning as any).effort = mappedReasoning;
+      const clampedReasoning = clampEffortToLevels(
+        unified.reasoning?.effort,
+        effortLevels,
+      );
+      if (clampedReasoning) (unified.reasoning as any).effort = clampedReasoning;
     }
   }
   scrubAnthropicOnlyFields(unified as unknown as Record<string, unknown>);
@@ -209,7 +224,7 @@ async function forwardMessages(
       await buildAnthropicErrorFromUpstream(upstreamResponse);
     // Preserve the upstream status/body, but explicitly let Claude Code apply
     // its own bounded retry policy to every upstream HTTP error. The router
-    // remains single-attempt and stateless, so retries have exactly one owner.
+    // remains single-attempt, so retries have exactly one owner.
     reply.code(status);
     return errBody;
   }
@@ -223,12 +238,6 @@ async function forwardMessages(
         thinkingDisplay: (body as any).thinking?.display,
       },
     );
-    // Some Responses-compatible endpoints encode a failed response inside an
-    // HTTP 2xx JSON body. Once converted to its semantic 4xx/5xx status, keep
-    // the same retry contract as ordinary upstream HTTP errors.
-    if (upstreamForAnthropic.status >= 400) {
-      reply.header("x-should-retry", "true");
-    }
   }
 
   // Step 5: unified -> Anthropic SSE / JSON
@@ -236,6 +245,14 @@ async function forwardMessages(
     upstreamForAnthropic,
     { req },
   );
+
+  // Both protocol shapes have gateways that encode a failed response inside an
+  // HTTP 2xx JSON body. Whichever step recovered the real 4xx/5xx status, the
+  // retry contract is the same as for an ordinary upstream HTTP error: keep the
+  // status and hand retry ownership to the client.
+  if (finalResponse.status >= 400) {
+    reply.header("x-should-retry", "true");
+  }
 
   reply.code(finalResponse.status);
   finalResponse.headers.forEach((v, k) => {

@@ -10,6 +10,7 @@
 - 远端 0.4.0 提交是 `2683537d5097a17d57c2a1127a325c21d1b58084`，其父提交 `89cd523` 引入“所有上游非 2xx 均返回 `X-Should-Retry: true`”。
 - 同机 `codex/retry-all-upstream-errors` 的 `5fe2f69` 包含等价 retry-all 逻辑，但不是发布提交。
 - 发布镜像 `riba2534/open-claude-router:0.4.0` 的 amd64 构建产物同时包含 retry-all 和本次修复前的图片转换代码。当前工作树已先 fast-forward 到精确发布提交，再实施修复。
+- CLIProxyAPI 对照仓库固定在 `main` HEAD `bc71c77f5cc42f3fbe1bf040cf14d4f166894835`；本轮运行其完整 OpenAI/Claude 与 Codex/Claude translator 测试包，不以个别 fixture 的预期代替正式协议判断。
 - 第三个对照项目 claude-code-router 固定在 HEAD `4a152d959c016b476220339e856c9f4f94624c42`。其通用 gateway 转换不是仓库内 MCP 代码，而是 `package-lock.json` 锁定的 `@the-next-ai/ai-gateway@1.0.15`。
 - 对锁定 gateway 包同时做了 source map 源码审计和真实进程 fixture：启动其公开 HTTP gateway，以严格 mock Chat / Responses upstream 捕获实际请求体；不是只根据类型或函数名推断行为。
 - 测试使用 transformer 单元测试、Fastify inject、严格 mock upstream、实际 0.4.0 镜像代码检查，并运行 CLIProxyAPI 对应 Go translator 测试和 claude-code-router 锁定 gateway fixture。
@@ -76,6 +77,13 @@ claude-code-router HEAD `4a152d959c016b476220339e856c9f4f94624c42` 通过 `@the-
 fixture 还确认并行 `tool_use` 的 call ID、结果顺序和后续历史 assistant text 可以保留，但 `tool_result.is_error` 最终仍丢失。source map 与运行结果一致：内部 tool-result 形态是 string-only，遇到任何 text 就提前返回拼接文本；因此图片、document 和 unknown block 无法抵达 Responses 正式支持的结构化 output。
 
 claude-code-router 的 Fusion Vision 是显式注册的独立 MCP server，由工具参数自行取图并另发视觉模型请求；它不是 `/v1/messages` 的通用协议转换路径。Router 不得复制这种工具名、业务流程或模型能力判断来掩盖协议转换缺陷。
+
+### 最新参考实现的取舍结论（2026-08-02）
+
+- **保留并扩展 CLIProxyAPI 的正确方向**：顶层 base64 / URL 图片应保持 typed image；Responses `function_call_output.output` 应在可表示时保持 typed 多 block；`tool_choice:any` 应转 `required`，多函数调用不能只保留第一个。当前实现已经覆盖这些方向，并额外保留 URL image、document、unknown block、完整 tool ID 与多 reasoning item 身份。
+- **不复制 CLIProxyAPI 的兼容扩展**：其 Chat translator 把 `image_url` part 直接放进 `role:"tool"` content；其 Codex translator 默认注入 reasoning effort、会按 provider/model 签名分支并缩短 tool ID/name。前者超出 Chat tool message 的正式 content 类型，后者属于 provider adapter 策略，不适合无状态通用 Router。
+- **不复制 claude-code-router 锁定 gateway 的有损归一化**：顶层图片会被忽略，mixed tool result 遇到文本时会丢图片/unknown block，无文本时才 JSON 字符串化；Responses 同轮 tool result 与 follow-up text 反序，多 reasoning item 会合并并重新生成身份。这些行为不能作为对齐基线。
+- **继续以协议能力而非模型名裁决**：Chat 无法原生表达带图片的 tool result，当前使用合法 text-only tool message + user multimodal sidecar，并明确记录其有损边界；Responses 使用正式 typed output 原生保真。Router 不按模型名或网关身份删除图片、修改 effort 或选择业务工具。
 
 ## 逐项差异矩阵
 
@@ -239,32 +247,27 @@ npm run test:stream
 npm run build
 ```
 
-CLIProxyAPI 对照测试也已运行：
+CLIProxyAPI 对照测试也已运行（完整 translator 包）：
 
 ```bash
 go test ./internal/translator/openai/claude \
-  -run 'TestConvertClaudeRequestToOpenAI_(ToolResultOrderAndContent|ToolResultObjectContent|ToolResultTextAndImageContent|ToolResultURLImageOnly)$' \
-  -count=1
-
-go test ./internal/translator/codex/claude \
-  -run 'TestConvertClaudeRequestToCodex_PreservesContentOrderAcrossToolAndReasoningItems$' \
-  -count=1
+  ./internal/translator/codex/claude
 ```
 
-当前候选的仓库自动化回归为 174/174 通过。另以 `scripts/verify-live-upstream.ts` 对两套独立兼容上游运行脱敏真实用例，最新完整矩阵合计 45 passed / 1 classified skip / 0 failed：
+当前候选的仓库自动化回归为 200/200 通过。另以 `scripts/verify-live-upstream.ts` 对三套独立兼容上游运行脱敏真实用例，最新完整矩阵合计 67 passed / 2 classified skips / 0 failed：
 
 - Chat Completions 与 Responses 的普通文本，各覆盖 stream false/true（4）；
 - 两协议 required tool call，各覆盖 stream false/true（4），以及两协议并行工具流（2）；所有成功工具块同时断言正式 `caller:{type:"direct"}`；
 - 两协议顶层 base64 / URL 图片（4），两协议嵌套 tool-result text + image（2）；
 - 两协议 document file/input_file（2）与 Responses reasoning usage 的 stream false/true（2）；
-- Responses reasoning 历史跨轮回放（每套上游各 1）：一套成功完成签名回放；另一套返回 409 `item not found / different resource`，Router 保留状态与 retry header；直接绕过 Router 的两轮正式 Responses 回放也得到同类 409，因此只对该上游归类为跨资源状态限制并 skip；
-- 两协议无效模型探针（每套上游各 2）分别返回 HTTP 404/502，Anthropic error envelope 和 `X-Should-Retry:true` 均保留。
+- Responses reasoning 历史跨轮回放（每套上游各 1）：首跳都发送正式的 `id + encrypted_content` reasoning item；一套接受，另外两套分别明确返回 HTTP 409 / 400 的跨资源或不可解析状态错误，归类为上游能力限制。Router 每项只调用上游一次，保留原状态与 `X-Should-Retry:true`，不删除历史换取 200；
+- 两协议无效模型探针（每套上游各 2）分别返回 HTTP 404/502/400，Anthropic error envelope 和 `X-Should-Retry:true` 均保留。
 
 另外使用本机 Claude Code 2.1.220 直接验证 shell 环境变量接入，而不是绕过客户端调用 Router：
 
 - Chat Completions：embedded-path `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`，普通 `claude -p` 成功；
 - Responses：embedded-path `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_CUSTOM_HEADERS='X-Upstream-Format: responses'`，普通 `claude -p` 成功；
-- 两套上游 × 两种格式共四个 TUI 完成文本、并行 Read、Bash 与工具错误恢复；三条兼容链路完成 `Read(PNG) → tool_result(text/image) → assistant → history replay`，一条 Chat 端点按上文责任边界返回 409；
+- 三套上游 × 两种格式共六个 TUI 完成流式文本、单/并行 Read、PNG 识别和工具往返；最新 build 上六路均在同一轮并行读取文本与 PNG 并正确识图，紧接着在禁止工具的下一轮准确完成历史回放。两条 Chat 上游会拒绝客户端的 `max` effort，测试命令因此显式加 `X-Upstream-Effort-Map: *=off` 后通过；这是客户端声明的上游能力，不是 Router 按端点猜测或错误后重发；
 - Router 日志分别确认 `format=chat-completions` / `format=responses`，没有按端点、模型或工具名的运行时分支。
 
 报告不记录真实 endpoint、模型名或凭证。使用自有上游复跑：
@@ -282,8 +285,8 @@ npm run test:live
 
 - Chat tool-result 图片 sidecar 遵守正式 Chat schema，严格端点兼容性优于把 image 直接塞进 tool content；依赖非标准 tool-image 扩展的端点会看到结构变化。需要精确 tool/image 归属时使用 Responses。
 - 当前依赖树保留 Node 20 兼容的 OpenAI 4.x / Anthropic 0.32.x 声明；最新 SDK 类型在隔离目录完成审计与 typecheck，但不升级运行依赖。旧 Responses-compatible 网关可能拒绝正式 function output 数组，应在发布说明中明确。
-- Responses encrypted reasoning 与产生它的 provider / model 绑定；无状态 Router 会在自描述 envelope 中保留其 item ID 与密文并保真回放，切换到无法解密该历史的模型时，上游可能返回 `invalid_encrypted_content`。Router 不按模型名猜测并静默删历史。
+- Responses encrypted reasoning 与产生它的 provider / model 绑定；无状态 Router 会在自描述 envelope 中保留其 item ID 与密文，并按正式 schema 保真回放。若上游返回跨资源、item 失效或密文不可解析错误，Router 保留原始非 2xx 响应与历史，不猜测删除状态；客户端可自行决定是否重试或开启新会话。
 - document/file 的 base64/text/URL/content 主路径已经 typed 化或按 metadata + ordered parts 保真展开；citations.enabled 因无 OpenAI 请求同构明确 400。未来 unknown block/event 仍走有界安全降级；原生生成图片/音频只输出短占位，不应为特定模型或工具做特判。
 - Responses queued/in_progress/未知非终态现在明确返回 502，cancelled 返回 409，不再伪装成功。剩余限制是 Responses web-search citation 没有指向具体 `web_search_call` 的归属字段，且 Chat-only annotation 没有可逆 Anthropic 同构；当前分别按有界 typed JSON 文本降级，不伪造配对或工具结果。原生生成图片输出也仍是占位符。
 - 当前 0.5.0 候选从 0.4.0 发布提交 `2683537` 的独立修复分支演进；建议按上述完整命令和真实 Chat / Responses canary 验收后发布 0.5.0。不要从旧的 `9c00b8f`、同机非发布 retry 分支或仅 cherry-pick 图片补丁发布，否则容易遗漏 0.4.0 已有的 retry-all 与本轮流式/文件/工具配套修复。
-- 本次没有部署、推镜像或替换线上版本。所有 upstream 非 2xx 可重试行为保持不变。
+- 本次没有部署、推镜像或替换线上版本。所有 upstream 非 2xx 的 `X-Should-Retry:true` 行为保持不变；服务端不读取错误文本后修改请求体重发，单个客户端请求只对应一次上游调用。

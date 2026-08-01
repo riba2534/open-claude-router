@@ -101,15 +101,27 @@ export function normalizeMultimodalToolResultsForChatCompletions(
 
   const flushSidecars = (next?: any) => {
     if (pendingSidecars.length === 0) return;
+    // The provenance marker exists to say which tool result owns which bytes.
+    // With a single contributing tool result there is nothing to disambiguate,
+    // and the marker measurably degrades how vision models read the image it
+    // sits next to — so it is emitted only when the sidecar actually merges
+    // several parallel multimodal tool results.
+    const parts =
+      pendingSidecars.length === 1
+        ? pendingSidecars[0].parts
+        : pendingSidecars.flatMap((group) => [
+            ...group.parts,
+            { type: "text", text: group.marker },
+          ]);
     if (next?.role === "user") {
       const existing = Array.isArray(next.content)
         ? next.content
         : typeof next.content === "string" && next.content
           ? [{ type: "text", text: next.content }]
           : [];
-      next.content = [...pendingSidecars, ...existing];
+      next.content = [...parts, ...existing];
     } else {
-      normalized.push({ role: "user", content: pendingSidecars });
+      normalized.push({ role: "user", content: parts });
     }
     pendingSidecars = [];
   };
@@ -149,20 +161,27 @@ export function normalizeMultimodalToolResultsForChatCompletions(
               }
             : {}),
         };
-        // Chat Completions only permits text in role:"tool" content. The
-        // multimodal user sidecar therefore carries a deterministic provenance
-        // marker before the original image/file bytes. This preserves which
-        // parallel tool result owned each part and avoids an ambiguous
-        // image-only turn without guessing anything about its business meaning.
-        pendingSidecars.push(
-          {
-            type: "text",
-            text: `[tool_result multimodal content ${JSON.stringify(provenance)}]`,
-          },
-          ...multimodalParts,
-        );
+        // Chat Completions only permits text in role:"tool" content, so the
+        // bytes move to a user sidecar. Each contributing tool result is kept
+        // as its own group with a deterministic provenance marker; flushSidecars
+        // decides whether the marker is actually needed. The marker trails its
+        // bytes rather than leading them — a machine-readable envelope directly
+        // in front of an image measurably degrades how vision models read it.
+        pendingSidecars.push({
+          parts: multimodalParts,
+          marker: `[tool_result multimodal content ${JSON.stringify(provenance)}]`,
+        });
       }
-      message.content = textParts.length > 0 ? textParts : "";
+      // A tool result that carried nothing but images/files would otherwise be
+      // left with an empty string here, which several OpenAI-compatible gateways
+      // reject outright ("Invalid value for 'content'"). Point at the sidecar
+      // instead so the turn stays well-formed and self-explanatory.
+      message.content =
+        textParts.length > 0
+          ? collapseToolText(textParts)
+          : multimodalParts.length > 0
+            ? TOOL_RESULT_MOVED_TEXT
+            : "";
     } else if (message.content == null) {
       message.content = "";
     }
@@ -170,6 +189,30 @@ export function normalizeMultimodalToolResultsForChatCompletions(
   }
   flushSidecars();
   body.messages = normalized;
+}
+
+/**
+ * Placeholder left in a `role:"tool"` message whose entire payload was images or
+ * files. The bytes themselves live in the user sidecar that follows.
+ */
+const TOOL_RESULT_MOVED_TEXT =
+  "[tool_result multimodal content moved to the following user message]";
+
+/**
+ * Chat Completions accepts either a string or an array of text parts as tool
+ * content, but a plain string is what every implementation agrees on. Collapse
+ * the common single-text-part case back to a string — losslessly — and keep the
+ * array only when a tool genuinely returned several text blocks.
+ */
+function collapseToolText(textParts: any[]): any {
+  if (
+    textParts.length === 1 &&
+    textParts[0]?.type === "text" &&
+    typeof textParts[0].text === "string"
+  ) {
+    return textParts[0].text;
+  }
+  return textParts;
 }
 
 function encodeUtf16CodeUnitsBase64Url(value: string): string {

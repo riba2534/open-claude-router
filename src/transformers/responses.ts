@@ -2,6 +2,7 @@ import { UnifiedChatRequest, MessageContent } from "../types/llm.js";
 import { Transformer, TransformerContext } from "../types/transformer.js";
 import { SseBlockDecoder } from "./sse.js";
 import { createApiError } from "./errors.js";
+import { mapOpenAIErrorToAnthropic } from "../utils/upstream.js";
 
 const REASONING_SIGNATURE_PREFIX = "ocr-responses-reasoning-v1:";
 
@@ -46,6 +47,29 @@ function encodeReasoningSignature(
   );
 }
 
+/**
+ * Rebuild a reasoning item for replay in a later request.
+ *
+ * The Responses schema requires `id`, `summary`, and `type` on a reasoning
+ * item. `encrypted_content` supplements that identity for stateless replay; it
+ * does not replace the required id. Some compatible gateways are more lenient,
+ * but the Router emits the formal shape and preserves any rejection for the
+ * client instead of deleting history and issuing a second upstream request.
+ */
+function replayedReasoningItem(
+  replayable: RouterReasoningEnvelope,
+): Record<string, any> {
+  return {
+    type: "reasoning",
+    id: replayable.id,
+    ...(replayable.encrypted_content
+      ? { encrypted_content: replayable.encrypted_content }
+      : {}),
+    summary: replayable.summary ?? [],
+    ...(replayable.content ? { content: replayable.content } : {}),
+  };
+}
+
 function reasoningText(item: ResponsesAPIOutputItem): string {
   const contentText = (item.content || [])
     .filter((part) => part.type === "reasoning_text")
@@ -83,37 +107,11 @@ function decodeReasoningSignature(
 }
 
 function mapResponsesErrorType(code: string | undefined): string {
-  if (
-    code === "rate_limit_exceeded" ||
-    code === "rate_limit_error" ||
-    code === "quota_exceeded" ||
-    code === "insufficient_quota"
-  ) {
-    return "rate_limit_error";
-  }
-  if (
-    code === "invalid_prompt" ||
-    code?.startsWith("invalid_") ||
-    code?.startsWith("unsupported_") ||
-    code?.startsWith("empty_") ||
-    code?.startsWith("failed_to_")
-  ) {
-    return "invalid_request_error";
-  }
-  return "api_error";
+  return mapOpenAIErrorToAnthropic({ code }, 200).type;
 }
 
 function mapResponsesErrorStatus(code: string | undefined): number {
-  if (
-    code === "rate_limit_exceeded" ||
-    code === "rate_limit_error" ||
-    code === "quota_exceeded" ||
-    code === "insufficient_quota"
-  ) {
-    return 429;
-  }
-  if (mapResponsesErrorType(code) === "invalid_request_error") return 400;
-  return 500;
+  return mapOpenAIErrorToAnthropic({ code }, 200).status;
 }
 
 function parseResponsesToolArguments(raw: unknown): Record<string, any> {
@@ -455,23 +453,14 @@ export class OpenAIResponsesTransformer implements Transformer {
         // only the flattened Chat `content` + `tool_calls` fields moves text
         // ahead of reasoning/tool items. Consume the Router-internal ordered
         // representation when present so history remains lossless.
+        const inputLengthBeforeBlocks = input.length;
         for (const block of message.output_blocks) {
           if (block?.type === "thinking") {
             const replayableReasoning = decodeReasoningSignature(
               block.signature,
             );
             if (!replayableReasoning) continue;
-            input.push({
-              type: "reasoning",
-              id: replayableReasoning.id,
-              ...(replayableReasoning.encrypted_content
-                ? { encrypted_content: replayableReasoning.encrypted_content }
-                : {}),
-              summary: replayableReasoning.summary ?? [],
-              ...(replayableReasoning.content
-                ? { content: replayableReasoning.content }
-                : {}),
-            });
+            input.push(replayedReasoningItem(replayableReasoning));
           } else if (block?.type === "tool_use") {
             input.push({
               type: "function_call",
@@ -486,7 +475,12 @@ export class OpenAIResponsesTransformer implements Transformer {
             });
           }
         }
-        if (message.output_blocks.length === 0) {
+        if (input.length === inputLengthBeforeBlocks) {
+          // Every block was dropped — e.g. a turn holding nothing but a thinking
+          // block whose signature this upstream cannot replay, which happens on
+          // any chat-alias -> responses-alias switch mid-session. Counting blocks
+          // instead of emitted items would erase the assistant turn entirely and
+          // leave two consecutive user turns in the history.
           input.push({ role: "assistant", content: "" });
         }
         return;
@@ -522,20 +516,7 @@ export class OpenAIResponsesTransformer implements Transformer {
             (block as any)?.signature,
           );
           if (!replayableReasoning) continue;
-          const reasoningItem = {
-            type: "reasoning",
-            id: replayableReasoning.id,
-            ...(replayableReasoning.encrypted_content
-              ? {
-                  encrypted_content:
-                    replayableReasoning.encrypted_content,
-                }
-              : {}),
-            summary: replayableReasoning.summary ?? [],
-            ...(replayableReasoning.content
-              ? { content: replayableReasoning.content }
-              : {}),
-          };
+          const reasoningItem = replayedReasoningItem(replayableReasoning);
           const pairedToolCallId = (block as any)?.tool_call_id;
           if (pairedToolCallId) {
             const group = reasoningByToolCall.get(pairedToolCallId) ?? [];

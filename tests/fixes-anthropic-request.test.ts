@@ -851,18 +851,11 @@ test("documents retain a typed unified file envelope and Chat degrades only URL 
     },
   ]);
   assert.deepEqual(chat.messages.slice(2), [
-    {
-      role: "tool",
-      tool_call_id: "call_1",
-      content: [{ type: "text", text: "read result" }],
-    },
+    { role: "tool", tool_call_id: "call_1", content: "read result" },
     {
       role: "user",
+      // A single contributing tool result needs no provenance marker.
       content: [
-        {
-          type: "text",
-          text: '[tool_result multimodal content {"tool_index":1,"tool_call_id_utf16be_base64url":"AGMAYQBsAGwAXwAx"}]',
-        },
         {
           type: "file",
           file: {

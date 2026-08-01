@@ -84,10 +84,16 @@ test("model log configuration defaults to full bodies retained for seven days", 
     },
   );
 
+  // 0 means "keep nothing" and turns logging off rather than killing startup.
+  assert.equal(
+    loadModelInteractionLogConfig({ OCR_MODEL_LOG_RETENTION_DAYS: "0" })
+      .retentionDays,
+    0,
+  );
   assert.throws(
     () =>
-      loadModelInteractionLogConfig({ OCR_MODEL_LOG_RETENTION_DAYS: "0" }),
-    /integer >= 1/,
+      loadModelInteractionLogConfig({ OCR_MODEL_LOG_RETENTION_DAYS: "-1" }),
+    /integer >= 0/,
   );
   assert.throws(
     () => loadModelInteractionLogConfig({ OCR_MODEL_LOG_MODE: "verbose" }),

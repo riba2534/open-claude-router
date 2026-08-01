@@ -9,7 +9,7 @@ const body = {
   messages: [{ role: "user", content: "hello" }],
 };
 
-test("every upstream non-2xx is single-attempt and marked retryable", async () => {
+test("ordinary upstream non-2xx statuses are single-attempt and marked retryable", async () => {
   const previousTokens = process.env.OCR_ACCESS_TOKENS;
   delete process.env.OCR_ACCESS_TOKENS;
   const app = Fastify({ logger: false });

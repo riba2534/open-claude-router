@@ -75,11 +75,14 @@ export function loadModelInteractionLogConfig(
   return {
     mode: rawMode,
     directory: path.resolve(cwd, env.OCR_MODEL_LOG_DIR?.trim() || "logs"),
+    // 0 is the obvious way to ask for "keep nothing", and `enabled` already
+    // treats it as off. Rejecting it would kill the process at startup over a
+    // value whose intent is unambiguous.
     retentionDays: parseInteger(
       env.OCR_MODEL_LOG_RETENTION_DAYS,
       DEFAULT_RETENTION_DAYS,
       "OCR_MODEL_LOG_RETENTION_DAYS",
-      1,
+      0,
     ),
     maxBodyBytes: parseInteger(
       env.OCR_MODEL_LOG_MAX_BODY_BYTES,

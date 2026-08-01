@@ -106,6 +106,79 @@ export function mapUpstreamStatusToAnthropicErrorType(status: number): string {
   return "api_error";
 }
 
+function inferStatusFromOpenAIErrorCode(code: string): number | undefined {
+  if (!code) return undefined;
+  if (code === "overloaded" || code === "overloaded_error") return 529;
+  if (code.includes("rate_limit") || code.includes("quota")) return 429;
+  if (code.includes("billing")) return 402;
+  if (
+    code.includes("authentication") ||
+    code.includes("invalid_api_key") ||
+    code === "unauthorized"
+  ) {
+    return 401;
+  }
+  if (code.includes("permission") || code === "forbidden") return 403;
+  if (code.includes("not_found")) return 404;
+  if (code.includes("conflict")) return 409;
+  if (code.includes("request_too_large")) return 413;
+  if (code.includes("timeout")) return 504;
+  if (code === "server_error" || code.includes("internal_error")) return 500;
+  if (
+    code.includes("invalid_request") ||
+    code.includes("unsupported") ||
+    code.includes("invalid_value") ||
+    code.startsWith("invalid_") ||
+    code.startsWith("empty_") ||
+    code.startsWith("failed_to_") ||
+    code === "bad_request"
+  ) {
+    return 400;
+  }
+  return undefined;
+}
+
+/**
+ * Give an OpenAI-shaped error object an Anthropic status and error type.
+ *
+ * OpenAI-compatible gateways routinely answer HTTP 200 with an `error` object
+ * in the body instead of a real status code. Reporting that as a blanket 500
+ * throws away what the upstream actually said — a rate limit becomes
+ * indistinguishable from a broken gateway — so the error's own `type`/`code`
+ * decides the status when the transport did not.
+ *
+ * `httpStatus` wins whenever the upstream did use a real error status.
+ */
+export function mapOpenAIErrorToAnthropic(
+  error: any,
+  httpStatus: number,
+): { status: number; type: string } {
+  const detailCode =
+    typeof error?.code === "string" ? error.code.toLowerCase() : "";
+  const typeCode =
+    typeof error?.type === "string" ? error.type.toLowerCase() : "";
+
+  let status = httpStatus >= 400 ? httpStatus : 0;
+  if (!status) {
+    // OpenAI `type` is often generic while `code` carries the actionable cause
+    // (for example type=invalid_request_error + code=invalid_api_key). Prefer
+    // that specific code, but fall back to type when code is absent/unknown.
+    status =
+      inferStatusFromOpenAIErrorCode(detailCode) ??
+      inferStatusFromOpenAIErrorCode(typeCode) ??
+      // An unclassifiable error inside a 2xx means the upstream broke its own
+      // contract; 502 says that without pretending the router failed.
+      502;
+  }
+
+  // Normalize from the final status so a generic OpenAI type cannot contradict
+  // a more specific code (401 must be authentication_error, not the shared but
+  // semantically different string invalid_request_error).
+  const type = mapUpstreamStatusToAnthropicErrorType(status);
+
+  return { status, type };
+}
+
 export interface AnthropicError {
   type: "error";
   request_id: string | null;
@@ -150,8 +223,22 @@ export async function buildAnthropicErrorFromUpstream(
       request_id: requestId,
       error: {
         type: mapUpstreamStatusToAnthropicErrorType(res.status),
-        message,
+        // An edge proxy or WAF in front of the upstream answers with a full
+        // HTML page rather than a JSON error. That whole document would
+        // otherwise be inlined verbatim into the message the client renders.
+        message: boundUpstreamErrorMessage(message, res.status),
       },
     },
   };
+}
+
+/** Upper bound on upstream error text echoed back to the client. */
+const MAX_UPSTREAM_ERROR_MESSAGE_CHARS = 4096;
+
+function boundUpstreamErrorMessage(message: string, status: number): string {
+  if (message.length <= MAX_UPSTREAM_ERROR_MESSAGE_CHARS) return message;
+  return (
+    `${message.slice(0, MAX_UPSTREAM_ERROR_MESSAGE_CHARS)}` +
+    ` […upstream HTTP ${status} body truncated, ${message.length} chars total]`
+  );
 }

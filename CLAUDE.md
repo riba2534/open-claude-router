@@ -90,7 +90,11 @@ client SSE / JSON
 
 ### 错误格式
 
-服务端所有错误都包装成 Anthropic 标准 `{ "type": "error", "error": { "type": "...", "message": "..." } }`，状态码映射在 `src/utils/upstream.ts` 的 `mapUpstreamStatusToAnthropicErrorType`，全局错误兜底在 `src/server.ts` 的 `setErrorHandler`。模型上游返回任意非 2xx 时，`forwardMessages()` 必须保留原状态码和错误体，并增加 `X-Should-Retry: true`，让 Claude Code 使用自身有界重试策略；router 自身不能再次请求上游，避免两层重试相乘。
+服务端所有错误都包装成 Anthropic 标准 `{ "type": "error", "error": { "type": "...", "message": "..." } }`，状态码映射在 `src/utils/upstream.ts` 的 `mapUpstreamStatusToAnthropicErrorType`，全局错误兜底在 `src/server.ts` 的 `setErrorHandler`。上游把失败塞进 HTTP 2xx body（`{"error":{...}}`）时，用 `mapOpenAIErrorToAnthropic` 按上游自己的错误码还原真实状态，两种协议共用同一条契约。
+
+模型上游返回任意非 2xx 时，`forwardMessages()` 必须保留原状态码和错误体，并增加 `X-Should-Retry: true`，让 Claude Code 使用自身有界重试策略。**400/401/404 这类确定性错误同样标 retryable，这是刻意设计，不要改成按状态码分类**——正因为如此，router 自身零重试放大就成了这条契约的必要配套：`tests/retry-all.test.ts` 对 15 个状态码逐个断言 `fetchCount` 恰好 +1。
+
+Router 不读取错误文本后修改请求体重发。客户端若已知上游不接受某些 reasoning effort，可用 `X-Upstream-Effort-Map: *=off` 或 `X-Upstream-Effort-Levels` 显式声明；Responses reasoning state 若因跨资源或失效被上游拒绝，也必须保留原始非 2xx 响应并交由 Claude Code 决定后续行为，不能静默删除历史换取成功。
 
 ## 重要约束（违反会出问题）
 
@@ -128,6 +132,10 @@ Claude Code 客户端会带 `anthropic-version`、`anthropic-beta`、`x-stainles
 - 已接收的截断 function call 名称/参数字节可以保留，但 response 或任一 function item incomplete 时终态必须是 `max_tokens`，不得宣传为可执行 `tool_use`；refusal 优先级更高。
 - `thinking.display:"omitted"` 只在客户端显式请求时生效：JSON 返回空 `thinking` 并保留上游已有签名，SSE 不发 `thinking_delta` 但仍发 `signature_delta`；Responses 不请求 detailed summary，但必须继续请求 encrypted state 以便历史回放。Chat 上游不提供签名时只能沿用现有兼容占位。不得按模型名猜 display 默认。
 - 客户端取消必须 cancel 当前上游 reader/fetch；未知内容安全、有界降级，不能整体 `JSON.stringify` 后丢失 typed 语义。
+- Chat 的 `role:"tool"` content 永不为空字符串：只有图片/文件的 tool_result 把字节移入 user sidecar 后，必须留有界占位文本（多个网关直接 400/409 拒收空 content）。单个 text part 折回字符串，多 block 才保留数组。
+- 多模态 sidecar 的 provenance marker **只在同一批合并了多个并行 tool_result 时才发**，且必须排在字节**之后**。机读 envelope 紧贴图片之前会实质降低视觉识别率（实测 1/3 → 3/3）。
+- 流结束但从未出现 finish_reason 时，不得丢弃已收到的内容：只有见过 `[DONE]` 才能按上游自己的完成声明兼容封口为 `end_turn`；body 直接断掉属于传输/协议截断，必须在保留已收文本或残缺工具诊断后发 `error`，不得猜成 `max_tokens` 成功终态。有残缺 tool call 时绝不能生成可执行 `tool_use`。
+- Responses 历史回放：assistant 轮次是否补空壳取决于**实际产出的 item 数**，不是 `output_blocks.length`，否则全部 block 不可回放时会留下连续两条 user。reasoning item 必须按正式 Responses schema 同时保留必填的 `id` / `summary` / `type`；`encrypted_content` 是无状态回放的补充，不能替代必填 `id`。兼容网关明确拒绝跨资源/过期状态时，保留原始非 2xx 响应并交给客户端，不得删除历史后二次请求上游。
 
 ## 改动指引
 

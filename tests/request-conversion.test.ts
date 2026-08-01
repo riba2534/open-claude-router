@@ -224,27 +224,89 @@ test("Chat tool results keep legal text messages and expose images in a user sid
 
   normalizeMultimodalToolResultsForChatCompletions(body);
   assert.deepEqual(body.messages, [
+    // A single text part collapses back to the plain string every
+    // OpenAI-compatible server accepts.
+    { role: "tool", tool_call_id: "call_1", content: "one" },
+    // An image-only tool result keeps a non-empty, self-describing body —
+    // an empty string is rejected outright by some gateways.
     {
       role: "tool",
-      tool_call_id: "call_1",
-      content: [{ type: "text", text: "one" }],
+      tool_call_id: "call_2",
+      content:
+        "[tool_result multimodal content moved to the following user message]",
     },
-    { role: "tool", tool_call_id: "call_2", content: "" },
     {
       role: "user",
       content: [
-        {
-          type: "text",
-          text: '[tool_result multimodal content {"tool_index":1,"tool_call_id_utf16be_base64url":"AGMAYQBsAGwAXwAx"}]',
-        },
+        // Bytes first, provenance marker after: an envelope directly in front of
+        // an image measurably degrades how vision models read it.
         { type: "image_url", image_url: { url: "data:image/png;base64,AA==" } },
         { type: "file", file: { file_id: "file_image_tool" } },
         {
           type: "text",
-          text: '[tool_result multimodal content {"tool_index":2,"tool_call_id_utf16be_base64url":"AGMAYQBsAGwAXwAy"}]',
+          text: '[tool_result multimodal content {"tool_index":1,"tool_call_id_utf16be_base64url":"AGMAYQBsAGwAXwAx"}]',
         },
         { type: "image_url", image_url: { url: "https://example.com/b.png" } },
+        {
+          type: "text",
+          text: '[tool_result multimodal content {"tool_index":2,"tool_call_id_utf16be_base64url":"AGMAYQBsAGwAXwAy"}]',
+        },
         { type: "text", text: "continue" },
+      ],
+    },
+  ]);
+});
+
+test("a lone multimodal tool result carries no provenance marker", () => {
+  const body: Record<string, unknown> = {
+    messages: [
+      {
+        role: "tool",
+        tool_call_id: "call_1",
+        content: [
+          { type: "text", text: "shot" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,AA==" } },
+        ],
+      },
+      { role: "user", content: "and?" },
+    ],
+  };
+
+  normalizeMultimodalToolResultsForChatCompletions(body);
+  assert.deepEqual(body.messages, [
+    { role: "tool", tool_call_id: "call_1", content: "shot" },
+    {
+      role: "user",
+      content: [
+        { type: "image_url", image_url: { url: "data:image/png;base64,AA==" } },
+        { type: "text", text: "and?" },
+      ],
+    },
+  ]);
+});
+
+test("Chat tool results with several text blocks stay an array", () => {
+  const body: Record<string, unknown> = {
+    messages: [
+      {
+        role: "tool",
+        tool_call_id: "call_1",
+        content: [
+          { type: "text", text: "one" },
+          { type: "text", text: "two" },
+        ],
+      },
+    ],
+  };
+
+  normalizeMultimodalToolResultsForChatCompletions(body);
+  assert.deepEqual(body.messages, [
+    {
+      role: "tool",
+      tool_call_id: "call_1",
+      content: [
+        { type: "text", text: "one" },
+        { type: "text", text: "two" },
       ],
     },
   ]);
@@ -423,7 +485,7 @@ test("Responses treats tool names generically and rejects native signatures", as
   });
 });
 
-test("Responses replays only Router-wrapped reasoning with its required ID", async () => {
+test("Responses replays Router-wrapped reasoning with its required ID", async () => {
   const signature =
     "ocr-responses-reasoning-v1:" +
     Buffer.from(
@@ -446,6 +508,27 @@ test("Responses replays only Router-wrapped reasoning with its required ID", asy
     type: "reasoning",
     id: "rs_1",
     encrypted_content: "encrypted-state",
+    summary: [],
+  });
+});
+
+test("Responses keeps the required reasoning id when there is no encrypted state", async () => {
+  const signature =
+    "ocr-responses-reasoning-v1:" +
+    Buffer.from(JSON.stringify({ id: "rs_1" })).toString("base64url");
+  const result: any = await responses.transformRequestIn!({
+    model: "gpt-test",
+    messages: [
+      {
+        role: "assistant",
+        content: "",
+        thinking: { content: "", signature },
+      },
+    ],
+  });
+  assert.deepEqual(result.input[0], {
+    type: "reasoning",
+    id: "rs_1",
     summary: [],
   });
 });

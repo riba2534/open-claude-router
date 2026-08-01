@@ -161,15 +161,14 @@ test("Chat tool image reaches a visual user sidecar instead of a JSON string", a
           Array.isArray(message.content) &&
           message.content.some((part: any) => part.type === "image_url"),
       );
-      assert.deepEqual(tool.content, [
-        { type: "text", text: "screenshot" },
+      // The tool turn keeps the human-readable text verbatim — never a JSON
+      // dump of the image blocks.
+      assert.equal(tool.content, "screenshot");
+      // Exactly one tool result contributed, so the image stands alone with no
+      // provenance marker to disambiguate against.
+      assert.deepEqual(sidecar.content, [
+        { type: "image_url", image_url: { url: "data:image/png;base64,AA==" } },
       ]);
-      assert.deepEqual(sidecar.content[0], {
-        type: "text",
-        text: '[tool_result multimodal content {"tool_index":1,"tool_call_id_utf16be_base64url":"AGMAYQBsAGwAXwAx"}]',
-      });
-      assert.equal(sidecar.content[1].type, "image_url");
-      assert.equal(typeof tool.content, "object");
       return okChatResponse();
     },
     async (app) => {
