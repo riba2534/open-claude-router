@@ -44,8 +44,8 @@ Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(Ope
 - **任意 Authorization 格式**：标准 `Bearer sk-...`、企业网关常见的非 Bearer 自定义协议头都能原样透传
 - **完整覆盖 Claude Code 协议**：流式 SSE、工具调用（`tool_use` / `tool_result` 双向增量）、多模态图片、`thinking` 块（覆盖范围与限制见下方["协议覆盖与边界"](#协议覆盖与边界)表）
 - **同时支持 OpenAI 两套协议**：默认走 Chat Completions（兼容 OpenAI 官方、OpenRouter、各类 OpenAI 兼容网关 / Kimi / DeepSeek 等），通过 `X-Upstream-Format: responses` opt-in 切到 Responses API（OpenAI o-series / gpt-5 原生协议，含 reasoning summary 转 Anthropic `thinking` 块）
-- **alias 里完成全部配置**：模型映射、上游 URL、上游凭证、服务鉴权、额外网关 header 都能通过 Claude Code alias 注入
-- **模型名映射**：客户端保留 `claude-*` 名称以启用 Claude Code 能力，上游收到真实模型名
+- **alias 里完成全部配置**：Claude Code 标准模型环境变量、上游 URL、上游凭证、服务鉴权和额外网关 header 都能随 alias 注入
+- **遵循 Claude Code 模型配置**：通过 `ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_OPUS_MODEL`、`ANTHROPIC_DEFAULT_SONNET_MODEL`、`ANTHROPIC_DEFAULT_HAIKU_MODEL` 直接填写真实上游模型；Router 默认原样转发请求体中的 `model`
 - **结构化输出与严格工具**：Anthropic `output_config.format` 和 `tools[].strict` 分别映射到 Chat Completions / Responses 的正式结构，不按模型名猜测支持能力
 - **上游错误统一交给客户端重试**：上游返回任意非 2xx 时保留原状态码和错误内容，同时响应 `X-Should-Retry: true`，由 Claude Code 使用自身有界重试策略处理；服务端不读取错误文本后修改请求体重发
 - **两种接入方式**：上游信息可以放 HTTP header，也可以直接拼在 URL path 里
@@ -118,15 +118,15 @@ npm run dev
 #### Chat Completions：默认格式
 
 ```bash
-alias ocr-chat="ANTHROPIC_BASE_URL=http://127.0.0.1:3457/https://upstream.example.com/v1/chat/completions ANTHROPIC_AUTH_TOKEN='Bearer YOUR_UPSTREAM_API_KEY' ANTHROPIC_CUSTOM_HEADERS='X-Upstream-Model: YOUR_UPSTREAM_MODEL' ANTHROPIC_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_OPUS_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-sonnet-4-6 claude"
+alias ocr-chat="ANTHROPIC_BASE_URL=http://127.0.0.1:3457/https://upstream.example.com/v1/chat/completions ANTHROPIC_AUTH_TOKEN='Bearer YOUR_UPSTREAM_API_KEY' ANTHROPIC_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL=YOUR_UPSTREAM_MODEL claude"
 ```
 
 #### Responses API
 
-Responses 与 Chat 的区别只有上游路径和 `X-Upstream-Format`。`\n` 是 alias 内两个自定义 header 的分隔符，整条 alias 仍然只占 `~/.zshrc` 一行：
+Responses 与 Chat 的区别只有上游路径和 `X-Upstream-Format`，整条 alias 仍然只占 `~/.zshrc` 一行：
 
 ```bash
-alias ocr-responses="ANTHROPIC_BASE_URL=http://127.0.0.1:3457/https://upstream.example.com/v1/responses ANTHROPIC_AUTH_TOKEN='Bearer YOUR_UPSTREAM_API_KEY' ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Format: responses\nX-Upstream-Model: YOUR_UPSTREAM_MODEL' ANTHROPIC_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_OPUS_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-sonnet-4-6 claude"
+alias ocr-responses="ANTHROPIC_BASE_URL=http://127.0.0.1:3457/https://upstream.example.com/v1/responses ANTHROPIC_AUTH_TOKEN='Bearer YOUR_UPSTREAM_API_KEY' ANTHROPIC_CUSTOM_HEADERS='X-Upstream-Format: responses' ANTHROPIC_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL=YOUR_UPSTREAM_MODEL claude"
 ```
 
 保存后重新加载并启动：
@@ -137,10 +137,10 @@ ocr-chat       # Chat Completions
 ocr-responses  # Responses API
 ```
 
-这里使用 `X-Upstream-Model` 把 Claude Code 的所有模型槽位统一指向一个上游模型，最适合首次配置。如果希望 `/model opus`、`sonnet`、后台 haiku 分别走不同上游模型，再把它替换为：
+模型名使用 Claude Code 的四个标准环境变量配置，Router 不需要额外做模型映射。上面的单模型示例把四个槽位都指向同一个真实上游模型；如果上游为不同槽位提供不同模型，直接分别填写：
 
-```text
-X-Upstream-Model-Map: claude-opus-4-6=YOUR_OPUS_MODEL,claude-sonnet-4-6=YOUR_SONNET_MODEL,claude-haiku-4-5-20251001=YOUR_HAIKU_MODEL
+```bash
+ANTHROPIC_MODEL=YOUR_DEFAULT_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL=YOUR_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL=YOUR_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL=YOUR_HAIKU_MODEL
 ```
 
 #### 两个独立选择：接入模式与上游协议
@@ -160,7 +160,7 @@ alias 的接入模式和上游协议相互独立，不是三种互斥配置：
 path 模式适合不带 query 的上游 URL。如果上游地址必须包含 `?api-version=...` 等 query，或希望显式分离服务鉴权与上游鉴权，请改用 header 模式：
 
 ```bash
-alias ocr-header="ANTHROPIC_BASE_URL=http://127.0.0.1:3457 ANTHROPIC_AUTH_TOKEN='YOUR_ROUTER_ACCESS_TOKEN' ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Url: https://upstream.example.com/v1/chat/completions\nX-Upstream-Authorization: Bearer YOUR_UPSTREAM_API_KEY\nX-Upstream-Model: YOUR_UPSTREAM_MODEL' ANTHROPIC_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_OPUS_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6 ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-sonnet-4-6 claude"
+alias ocr-header="ANTHROPIC_BASE_URL=http://127.0.0.1:3457 ANTHROPIC_AUTH_TOKEN='YOUR_ROUTER_ACCESS_TOKEN' ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Url: https://upstream.example.com/v1/chat/completions\nX-Upstream-Authorization: Bearer YOUR_UPSTREAM_API_KEY' ANTHROPIC_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL=YOUR_UPSTREAM_MODEL claude"
 ```
 
 header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`，并在同一个 `ANTHROPIC_CUSTOM_HEADERS` 值中增加 `\nX-Upstream-Format: responses`。
@@ -174,7 +174,7 @@ header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`�
 
 ### 3. 启动 Claude Code
 
-直接执行你写入 `~/.zshrc` 的 alias 即可。正常对话、工具调用和历史回放都会透明转换；若配置了 `X-Upstream-Model-Map`，`/model` 切换会按映射选择真实上游模型。
+直接执行你写入 `~/.zshrc` 的 alias 即可。正常对话、工具调用和历史回放都会透明转换；模型选择由 Claude Code 的 `ANTHROPIC_MODEL` 和三个 `ANTHROPIC_DEFAULT_*_MODEL` 标准环境变量决定，Router 原样转发。
 
 ## 协议覆盖与边界
 
@@ -261,8 +261,8 @@ git push origin refs/tags/v0.5.0
 |---|---|---|---|
 | `X-Upstream-Url` | header | ✅ 必需 | 完整上游 URL（含 `/chat/completions` 或 `/responses` 路径） |
 | `X-Upstream-Authorization` | header | ✅ 必需 | 上游 Authorization 原值（原样透传、**不剥 Bearer**，请填上游需要的完整值；只有 path 模式的 `Authorization` 才会剥 `Bearer ` 前缀） |
-| `X-Upstream-Model` | 两种模式都可用 | 可选 | 真实上游模型名；提供则覆盖 body 里的 `model` |
-| `X-Upstream-Model-Map` | 两种模式都可用 | 可选 | 模型名映射表，格式 `from1=to1,from2=to2`；优先级高于 `X-Upstream-Model` |
+| `X-Upstream-Model` | 两种模式都可用 | 高级兼容、可选 | 固定覆盖 body 里的 `model`。标准 Claude Code 接入应优先使用四个模型环境变量，推荐 alias 不需要配置此 Header |
+| `X-Upstream-Model-Map` | 两种模式都可用 | 高级兼容、可选 | 按 body 模型名精确映射，格式 `from1=to1,from2=to2`，优先级高于 `X-Upstream-Model`。仅为已有客户端兼容保留，不是推荐的 Claude Code 模型配置方式 |
 | `X-Upstream-Effort-Map` | 两种模式都可用 | 可选 | effort 词汇映射表，格式 `max=xhigh,low=minimal`；左侧必须是 Anthropic effort（`low/medium/high/xhigh/max`）或通配 `*`，右侧为上游词汇原样转发，保留字 `off` 表示整个剥除该字段（例：`*=off` 适配"tools 与 reasoning_effort 不能同时出现"的网关）。不配置时显式 effort 永远精确透传，Router 自身绝不 clamp |
 | `X-Upstream-Effort-Levels` | 两种模式都可用 | 可选 | 上游支持的 effort 等级集合，格式 `none,low,medium,high,xhigh`；不在集合内的 effort 按规范等级序 `minimal < low < medium < high < xhigh < max` 就近 clamp，平局取低（例：上游只到 `xhigh` 时 `max` → `xhigh`，上游只到 `high` 时 `max` → `high`）。`none`/`auto` 是开关不是强度，只做精确匹配、永不作为 clamp 目标。与 `X-Upstream-Effort-Map` 同时出现时先按 Map 改写词汇、再按本表 clamp；Map 命中 `off` 则直接剥除、不再 clamp。不配置时显式 effort 永远精确透传 |
 | `X-Upstream-Headers` | 两种模式都可用 | 可选 | JSON object，显式声明要额外转发给上游的 header；不能覆盖受保护 header |
