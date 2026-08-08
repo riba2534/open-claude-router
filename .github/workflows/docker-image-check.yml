@@ -1,0 +1,104 @@
+name: Verify Docker image build
+
+on:
+  push:
+    paths:
+      - ".github/workflows/docker-image-check.yml"
+      - ".github/workflows/docker-release.yml"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "rust/**"
+  pull_request:
+    paths:
+      - ".github/workflows/docker-image-check.yml"
+      - ".github/workflows/docker-release.yml"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "rust/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-image-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    name: Build and smoke ${{ matrix.platform }} natively
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            artifact: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            artifact: arm64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Confirm native runner architecture
+        shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.artifact }}
+        run: |
+          actual_arch="$(uname -m)"
+          case "${EXPECTED_ARCH}" in
+            amd64) test "${actual_arch}" = "x86_64" ;;
+            arm64) test "${actual_arch}" = "aarch64" || test "${actual_arch}" = "arm64" ;;
+            *) echo "Unexpected matrix architecture ${EXPECTED_ARCH}." >&2; exit 1 ;;
+          esac
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Build native image into the runner daemon
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          pull: true
+          tags: open-claude-router:image-check-${{ matrix.artifact }}
+          cache-from: type=gha,scope=image-check-${{ matrix.artifact }}
+          cache-to: type=gha,mode=max,scope=image-check-${{ matrix.artifact }}
+          provenance: false
+          sbom: false
+
+      - name: Run container smoke test
+        shell: bash
+        env:
+          IMAGE_TAG: open-claude-router:image-check-${{ matrix.artifact }}
+        run: |
+          container_id="$(docker run --detach --rm \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --tmpfs /app/logs:rw,noexec,nosuid,size=16m \
+            --publish 127.0.0.1::3457 \
+            --env OCR_MODEL_LOG_MODE=off \
+            "${IMAGE_TAG}")"
+          cleanup() {
+            docker rm --force "${container_id}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          host_port="$(docker inspect --format '{{(index (index .NetworkSettings.Ports "3457/tcp") 0).HostPort}}' "${container_id}")"
+          for attempt in $(seq 1 30); do
+            if response="$(curl --fail --silent --show-error "http://127.0.0.1:${host_port}/healthz")"; then
+              test "${response}" = '{"status":"ok"}'
+              docker inspect --format '{{.Config.User}}' "${container_id}" | grep -Fxq '65532:65532'
+              exit 0
+            fi
+            sleep 1
+          done
+
+          docker logs "${container_id}" >&2
+          exit 1
