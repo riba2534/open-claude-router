@@ -1,14 +1,12 @@
-node_modules
-dist
+/rust/target/
 *.log
 logs/
-rust/target/
 .DS_Store
 .env
 .env.*
 !.env.example
 
-# Local IDE / agent config
+# Local editor and agent state
 .claude/settings.local.json
 .idea/
 .vscode/

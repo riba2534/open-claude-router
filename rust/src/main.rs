@@ -37,16 +37,18 @@ async fn main() {
         .expect("build upstream HTTP client");
     let state = Arc::new(AppState::from_env(client));
     state.model_logger.start().await;
+    let model_logger = state.model_logger.clone();
     let app = build_app(state);
     let listener = TcpListener::bind(addr)
         .await
         .unwrap_or_else(|error| panic!("bind {addr}: {error}"));
     info!(%addr, "open-claude-router Rust server listening");
 
-    if let Err(error) = axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await
-    {
+        .await;
+    model_logger.flush().await;
+    if let Err(error) = result {
         error!(%error, "server stopped with error");
         std::process::exit(1);
     }

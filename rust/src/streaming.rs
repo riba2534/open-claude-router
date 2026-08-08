@@ -54,12 +54,13 @@ pub fn convert_chat_sse_stream(
                     }
                 }
                 Err(error) => {
+                    capture.mark_read_error(&error.to_string());
                     yield Ok(Bytes::from(error_frame(&protocol_error(format!("upstream stream read failed: {error}")))));
                     return;
                 }
             }
         }
-        if !stopped_at_done {
+        if should_mark_capture_complete(stopped_at_done) {
             match decoder.finish() {
                 Ok(decoded) => {
                     for raw in decoded.events {
@@ -83,8 +84,17 @@ pub fn convert_chat_sse_stream(
             Ok(frames) => for frame in frames { yield Ok(Bytes::from(frame)); },
             Err(error) => yield Ok(Bytes::from(error_frame(&error))),
         }
-        capture.finish();
+        // `[DONE]` is a protocol terminal, not proof that the HTTP body was
+        // drained. Dropping the still-live reader must remain observable as a
+        // cancelled body in the audit log.
+        if should_mark_capture_complete(stopped_at_done) {
+            capture.finish();
+        }
     }
+}
+
+fn should_mark_capture_complete(stopped_at_protocol_terminal: bool) -> bool {
+    !stopped_at_protocol_terminal
 }
 
 /// Consumes Responses SSE incrementally so the router never buffers the raw
@@ -108,6 +118,7 @@ pub fn convert_responses_sse_stream(
             let chunk = match next {
                 Ok(chunk) => chunk,
                 Err(error) => {
+                    capture.mark_read_error(&error.to_string());
                     yield Ok(Bytes::from(error_frame(&protocol_error(format!("upstream stream read failed: {error}")))));
                     return;
                 }
@@ -168,7 +179,11 @@ pub fn convert_responses_sse_stream(
             .finish()
             .and_then(|payload| transform_responses_json(&payload, omit_thinking))
             .and_then(|message| progressive.finish(&message));
-        capture.finish();
+        // A protocol `[DONE]` can precede unread HTTP bytes. Only mark the raw
+        // body complete when the reqwest stream itself reached EOF.
+        if should_mark_capture_complete(stopped_at_done) {
+            capture.finish();
+        }
         match result {
             Ok(frames) => yield Ok(Bytes::from(frames)),
             Err(error) => yield Ok(Bytes::from(error_frame(&error))),
@@ -184,6 +199,8 @@ struct ResponsesProgressiveState {
     model: Option<String>,
     service_tier: Option<String>,
     emitted_text: String,
+    emitted_audio_omission: bool,
+    terminal: bool,
 }
 
 impl ResponsesProgressiveState {
@@ -194,6 +211,20 @@ impl ResponsesProgressiveState {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if self.terminal {
+            return Ok(Vec::new());
+        }
+        if matches!(
+            kind,
+            "response.completed"
+                | "response.incomplete"
+                | "response.failed"
+                | "response.cancelled"
+                | "error"
+        ) {
+            self.terminal = true;
+            return Ok(Vec::new());
+        }
         if matches!(kind, "response.created" | "response.in_progress")
             && let Some(response) = event.get("response")
         {
@@ -231,8 +262,17 @@ impl ResponsesProgressiveState {
             }
         }
         let text = match kind {
-            "response.output_text.delta" | "response.refusal.delta" => {
+            "response.output_text.delta"
+            | "response.refusal.delta"
+            | "response.audio.transcript.delta"
+            | "response.output_audio_transcript.delta" => {
                 event.get("delta").and_then(Value::as_str)
+            }
+            "response.audio.delta" | "response.output_audio.delta"
+                if !self.emitted_audio_omission =>
+            {
+                self.emitted_audio_omission = true;
+                Some("[generated audio omitted]")
             }
             _ => None,
         };
@@ -356,6 +396,15 @@ struct ToolBuffer {
     arguments: String,
 }
 
+enum DeferredSemantic {
+    Tool(u64),
+    Text(String),
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
+}
+
 struct ChatStreamState {
     omit_thinking: bool,
     started: bool,
@@ -367,6 +416,8 @@ struct ChatStreamState {
     reasoning_replay: String,
     reasoning_signature: Option<String>,
     tools: BTreeMap<u64, ToolBuffer>,
+    deferred: Vec<DeferredSemantic>,
+    defer_semantic: bool,
     finish_reason: Option<String>,
     usage: Option<Value>,
     refusal: String,
@@ -387,6 +438,8 @@ impl ChatStreamState {
             reasoning_replay: String::new(),
             reasoning_signature: None,
             tools: BTreeMap::new(),
+            deferred: Vec::new(),
+            defer_semantic: false,
             finish_reason: None,
             usage: None,
             refusal: String::new(),
@@ -420,6 +473,9 @@ impl ChatStreamState {
             self.usage = event.get("usage").cloned();
         }
         let mut frames = self.ensure_started();
+        if self.finish_reason.is_some() {
+            return Ok(frames);
+        }
         let Some(choice) = event
             .get("choices")
             .and_then(Value::as_array)
@@ -427,12 +483,14 @@ impl ChatStreamState {
         else {
             return Ok(frames);
         };
-        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-            self.finish_reason = Some(reason.to_owned());
-        }
+        let event_finish_reason = choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
         let delta = choice.get("delta").unwrap_or(&Value::Null);
         if let Some(text) = delta
             .get("reasoning_content")
+            .or_else(|| delta.pointer("/thinking/content"))
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
@@ -444,7 +502,24 @@ impl ChatStreamState {
             .or_else(|| delta.pointer("/thinking/signature"))
             .and_then(Value::as_str)
         {
-            self.reasoning_signature = Some(signature.to_owned());
+            if self.defer_semantic {
+                if let Some(DeferredSemantic::Thinking {
+                    signature: pending, ..
+                }) = self.deferred.last_mut()
+                {
+                    *pending = Some(signature.to_owned());
+                } else {
+                    self.deferred.push(DeferredSemantic::Thinking {
+                        text: String::new(),
+                        signature: Some(signature.to_owned()),
+                    });
+                }
+            } else {
+                if self.open.is_none() {
+                    frames.extend(self.emit_thinking(""));
+                }
+                self.reasoning_signature = Some(signature.to_owned());
+            }
         }
         match delta.get("content") {
             Some(Value::String(text)) if !text.is_empty() => {
@@ -453,16 +528,21 @@ impl ChatStreamState {
             }
             Some(Value::Array(parts)) => {
                 for part in parts {
-                    let text = if part.get("type").and_then(Value::as_str) == Some("text") {
-                        part.get("text").and_then(Value::as_str).unwrap_or_default()
-                    } else if part.get("type").and_then(Value::as_str) == Some("image_url") {
-                        "[generated image omitted]"
-                    } else {
-                        ""
+                    let text = match part {
+                        Value::String(text) => text.clone(),
+                        _ if part.get("type").and_then(Value::as_str) == Some("text") => part
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        _ if part.get("type").and_then(Value::as_str) == Some("image_url") => {
+                            "[generated image omitted]".to_owned()
+                        }
+                        _ => bounded_stream_json(part),
                     };
                     if !text.is_empty() {
                         self.saw_semantic_content = true;
-                        frames.extend(self.emit_text(text));
+                        frames.extend(self.emit_text(&text));
                     }
                 }
             }
@@ -480,12 +560,16 @@ impl ChatStreamState {
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
                 let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                if !self.tools.contains_key(&index) {
+                    self.deferred.push(DeferredSemantic::Tool(index));
+                }
+                self.defer_semantic = true;
                 let tool = self.tools.entry(index).or_default();
                 if let Some(id) = call.get("id").and_then(Value::as_str) {
-                    tool.id.push_str(id);
+                    tool.id = id.to_owned();
                 }
                 if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
-                    tool.name.push_str(name);
+                    tool.name = name.to_owned();
                 }
                 if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
                 {
@@ -494,16 +578,47 @@ impl ChatStreamState {
             }
         }
         if let Some(function) = delta.get("function_call") {
+            if !self.tools.contains_key(&0) {
+                self.deferred.push(DeferredSemantic::Tool(0));
+            }
+            self.defer_semantic = true;
             let tool = self.tools.entry(0).or_default();
             if tool.id.is_empty() {
                 tool.id = format!("call_{}", uuid::Uuid::new_v4());
             }
             if let Some(name) = function.get("name").and_then(Value::as_str) {
-                tool.name.push_str(name);
+                tool.name = name.to_owned();
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                 tool.arguments.push_str(arguments);
             }
+        }
+        if let Some(annotations) = delta.get("annotations").and_then(Value::as_array) {
+            let citations = annotations
+                .iter()
+                .filter(|annotation| {
+                    annotation.get("type").and_then(Value::as_str) == Some("url_citation")
+                        && annotation
+                            .pointer("/url_citation/url")
+                            .and_then(Value::as_str)
+                            .is_some_and(|url| !url.is_empty())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !citations.is_empty() {
+                frames.extend(self.emit_text(&bounded_stream_json(&json!({
+                    "type":"openai_url_citations","annotations":citations
+                }))));
+            }
+        }
+        if let Some(block) = delta
+            .get("response_output_block")
+            .filter(|block| block.is_object())
+        {
+            frames.extend(self.emit_text(&bounded_stream_json(block)));
+        }
+        if let Some(reason) = event_finish_reason {
+            self.finish_reason = Some(reason);
         }
         Ok(frames)
     }
@@ -533,74 +648,101 @@ impl ChatStreamState {
         }
         let reason = reason.unwrap();
         let is_refusal = reason == "content_filter" || !self.refusal.is_empty();
+        if !matches!(
+            reason.as_str(),
+            "stop" | "length" | "tool_calls" | "function_call" | "content_filter"
+        ) {
+            return Err(protocol_error(format!(
+                "unsupported upstream finish_reason: {}",
+                serde_json::to_string(&reason).unwrap()
+            )));
+        }
         let complete_tools =
             matches!(reason.as_str(), "tool_calls" | "function_call") && !is_refusal;
-        let tools = std::mem::take(&mut self.tools);
-        for (_, tool) in tools {
-            if complete_tools {
-                if tool.id.is_empty() || tool.name.is_empty() {
-                    return Err(protocol_error(
-                        "upstream tool call is missing id or function name",
-                    ));
-                }
-                let input: Value = serde_json::from_str(if tool.arguments.is_empty() {
+        let mut tools = std::mem::take(&mut self.tools);
+        let deferred = std::mem::take(&mut self.deferred);
+        self.defer_semantic = false;
+        if complete_tools
+            && tools
+                .values()
+                .any(|tool| tool.id.is_empty() || tool.name.is_empty())
+        {
+            return Err(protocol_error(
+                "upstream tool call is missing id or function name",
+            ));
+        }
+        let malformed_call = complete_tools
+            && tools.values().any(|tool| {
+                match serde_json::from_str::<Value>(if tool.arguments.is_empty() {
                     "{}"
                 } else {
                     &tool.arguments
-                })
-                .map_err(|_| {
-                    protocol_error("upstream tool arguments must be a valid JSON object")
-                })?;
-                if !input.is_object() {
-                    return Err(protocol_error(
-                        "upstream tool arguments must decode to a JSON object",
-                    ));
+                }) {
+                    Ok(input) => !input.is_object(),
+                    Err(_) => true,
                 }
-                let index = self.next_index;
-                self.next_index += 1;
-                frames.push(format_sse_event(
-                    "content_block_start",
-                    &json!({
-                        "type":"content_block_start","index":index,
-                        "content_block":{"type":"tool_use","id":tool.id,"name":tool.name,"input":{},"caller":{"type":"direct"}}
-                    }),
-                ));
-                frames.push(format_sse_event(
-                    "content_block_delta",
-                    &json!({
-                        "type":"content_block_delta","index":index,
-                        "delta":{"type":"input_json_delta","partial_json":serde_json::to_string(&input).unwrap()}
-                    }),
-                ));
-                frames.push(format_sse_event(
-                    "content_block_stop",
-                    &json!({"type":"content_block_stop","index":index}),
-                ));
-            } else {
-                frames.extend(self.emit_complete_text(&format!(
-                    "[incomplete tool_use {}: {}]",
-                    if tool.name.is_empty() {
+            });
+        for item in deferred {
+            match item {
+                DeferredSemantic::Text(text) => frames.extend(self.emit_text(&text)),
+                DeferredSemantic::Thinking { text, signature } => {
+                    frames.extend(self.emit_thinking(&text));
+                    self.reasoning_signature = signature;
+                }
+                DeferredSemantic::Tool(tool_index) => {
+                    frames.extend(self.close_open());
+                    let Some(tool) = tools.remove(&tool_index) else {
+                        continue;
+                    };
+                    let name = if tool.name.is_empty() {
                         "unknown"
                     } else {
                         &tool.name
-                    },
-                    tool.arguments.chars().take(4096).collect::<String>()
-                )));
+                    };
+                    if !complete_tools || malformed_call {
+                        frames.extend(self.emit_text(&incomplete_tool_text(name, &tool.arguments)));
+                        continue;
+                    }
+                    let input = serde_json::from_str::<Value>(if tool.arguments.is_empty() {
+                        "{}"
+                    } else {
+                        &tool.arguments
+                    });
+                    let input = input.expect("tool inputs prevalidated");
+                    let index = self.next_index;
+                    self.next_index += 1;
+                    frames.push(format_sse_event(
+                        "content_block_start",
+                        &json!({
+                            "type":"content_block_start","index":index,
+                            "content_block":{"type":"tool_use","id":tool.id,"name":tool.name,"input":{},"caller":{"type":"direct"}}
+                        }),
+                    ));
+                    frames.push(format_sse_event(
+                        "content_block_delta",
+                        &json!({
+                            "type":"content_block_delta","index":index,
+                            "delta":{"type":"input_json_delta","partial_json":serde_json::to_string(&input).unwrap()}
+                        }),
+                    ));
+                    frames.push(format_sse_event(
+                        "content_block_stop",
+                        &json!({"type":"content_block_stop","index":index}),
+                    ));
+                }
             }
         }
+        frames.extend(self.close_open());
         let stop_reason = if is_refusal {
             "refusal"
+        } else if malformed_call {
+            "max_tokens"
         } else {
             match reason.as_str() {
                 "stop" => "end_turn",
                 "length" => "max_tokens",
                 "tool_calls" | "function_call" => "tool_use",
-                other => {
-                    return Err(protocol_error(format!(
-                        "unsupported upstream finish_reason: {}",
-                        serde_json::to_string(other).unwrap()
-                    )));
-                }
+                _ => unreachable!("validated finish_reason"),
             }
         };
         let usage = delta_usage(self.usage.as_ref());
@@ -642,6 +784,15 @@ impl ChatStreamState {
     }
 
     fn emit_text(&mut self, text: &str) -> Vec<String> {
+        if self.defer_semantic {
+            let frames = self.close_open();
+            if let Some(DeferredSemantic::Text(current)) = self.deferred.last_mut() {
+                current.push_str(text);
+            } else {
+                self.deferred.push(DeferredSemantic::Text(text.to_owned()));
+            }
+            return frames;
+        }
         let mut frames = self.ensure_block(BlockKind::Text);
         if !text.is_empty() {
             let index = self.open.unwrap().1;
@@ -654,6 +805,19 @@ impl ChatStreamState {
     }
 
     fn emit_thinking(&mut self, text: &str) -> Vec<String> {
+        if self.defer_semantic {
+            let frames = self.close_open();
+            if let Some(DeferredSemantic::Thinking { text: current, .. }) = self.deferred.last_mut()
+            {
+                current.push_str(text);
+            } else {
+                self.deferred.push(DeferredSemantic::Thinking {
+                    text: text.to_owned(),
+                    signature: None,
+                });
+            }
+            return frames;
+        }
         let mut frames = self.ensure_block(BlockKind::Thinking);
         self.reasoning_replay.push_str(text);
         if !self.omit_thinking && !text.is_empty() {
@@ -691,10 +855,17 @@ impl ChatStreamState {
         };
         let mut frames = Vec::new();
         if kind == BlockKind::Thinking {
-            let signature = self
-                .reasoning_signature
-                .take()
-                .unwrap_or_else(|| encode_chat_signature(&self.reasoning_replay));
+            let upstream_signature = self.reasoning_signature.take();
+            let signature = if self.omit_thinking
+                && !self.reasoning_replay.is_empty()
+                && upstream_signature
+                    .as_deref()
+                    .is_none_or(|signature| !is_router_signature(signature))
+            {
+                encode_chat_signature(&self.reasoning_replay)
+            } else {
+                upstream_signature.unwrap_or_else(|| encode_chat_signature(&self.reasoning_replay))
+            };
             frames.push(format_sse_event(
                 "content_block_delta",
                 &json!({"type":"content_block_delta","index":index,"delta":{"type":"signature_delta","signature":signature}}),
@@ -707,11 +878,29 @@ impl ChatStreamState {
         ));
         frames
     }
+}
 
-    fn emit_complete_text(&mut self, text: &str) -> Vec<String> {
-        let mut frames = self.emit_text(text);
-        frames.extend(self.close_open());
-        frames
+fn is_router_signature(signature: &str) -> bool {
+    signature.starts_with("ocr-chat-reasoning-v1:")
+        || signature.starts_with("ocr-responses-reasoning-v1:")
+}
+
+fn incomplete_tool_text(name: &str, raw: &str) -> String {
+    let length = raw.chars().count();
+    let mut bounded = raw.chars().take(4096).collect::<String>();
+    if length > 4096 {
+        bounded.push('…');
+    }
+    format!("[incomplete tool_use {name}: {bounded}]")
+}
+
+fn bounded_stream_json(value: &Value) -> String {
+    let serialized = serde_json::to_string(value).unwrap_or_default();
+    let length = serialized.chars().count();
+    if length <= 4096 {
+        serialized
+    } else {
+        format!("[unsupported upstream content omitted: {length} chars]")
     }
 }
 
@@ -772,6 +961,25 @@ fn error_frame(error: &ApiError) -> String {
 mod tests {
     use super::*;
 
+    fn payloads(frames: &[String]) -> Vec<Value> {
+        frames
+            .iter()
+            .map(|frame| {
+                frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .map(|payload| serde_json::from_str::<Value>(payload).unwrap())
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn protocol_terminal_is_not_raw_body_eof() {
+        assert!(!should_mark_capture_complete(true));
+        assert!(should_mark_capture_complete(false));
+    }
+
     #[test]
     fn empty_parallel_chat_fields_do_not_split_semantic_blocks() {
         let mut state = ChatStreamState::new(false);
@@ -796,16 +1004,7 @@ mod tests {
         }
         frames.extend(state.finish(false).unwrap());
 
-        let payloads = frames
-            .iter()
-            .map(|frame| {
-                frame
-                    .lines()
-                    .find_map(|line| line.strip_prefix("data: "))
-                    .map(|payload| serde_json::from_str::<Value>(payload).unwrap())
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
+        let payloads = payloads(&frames);
         let starts = payloads
             .iter()
             .filter(|payload| {
@@ -829,5 +1028,140 @@ mod tests {
             .filter_map(|payload| payload.pointer("/delta/thinking").and_then(Value::as_str))
             .collect::<String>();
         assert_eq!(thinking, "think");
+    }
+
+    #[test]
+    fn chat_stream_preserves_text_tool_text_order_and_snapshot_identity() {
+        let mut state = ChatStreamState::new(false);
+        let events = [
+            json!({"choices":[{"delta":{"content":"before"},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"q\":"}}]},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"1}"}}]},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"content":"after"},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ];
+        let mut frames = Vec::new();
+        for event in events {
+            frames.extend(state.on_raw_event(&event.to_string()).unwrap());
+        }
+        frames.extend(state.finish(false).unwrap());
+        let payloads = payloads(&frames);
+        let starts = payloads
+            .iter()
+            .filter(|payload| payload["type"] == "content_block_start")
+            .map(|payload| payload.pointer("/content_block/type").unwrap().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            starts,
+            vec![json!("text"), json!("tool_use"), json!("text")]
+        );
+        let tool = payloads
+            .iter()
+            .find(|payload| payload.pointer("/content_block/type") == Some(&json!("tool_use")))
+            .unwrap();
+        assert_eq!(tool.pointer("/content_block/id"), Some(&json!("call_1")));
+        assert_eq!(tool.pointer("/content_block/name"), Some(&json!("lookup")));
+    }
+
+    #[test]
+    fn chat_stream_supports_structured_thinking_and_omitted_replay() {
+        let mut state = ChatStreamState::new(true);
+        let events = [
+            json!({"choices":[{"delta":{"thinking":{"content":"secret","signature":"native"}},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ];
+        let mut frames = Vec::new();
+        for event in events {
+            frames.extend(state.on_raw_event(&event.to_string()).unwrap());
+        }
+        frames.extend(state.finish(false).unwrap());
+        let payloads = payloads(&frames);
+        assert!(
+            payloads.iter().all(|payload| {
+                payload.pointer("/delta/type") != Some(&json!("thinking_delta"))
+            })
+        );
+        assert!(payloads.iter().any(|payload| {
+            payload
+                .pointer("/delta/signature")
+                .and_then(Value::as_str)
+                .is_some_and(|signature| signature.starts_with("ocr-chat-reasoning-v1:"))
+        }));
+    }
+
+    #[test]
+    fn chat_stream_degrades_array_annotations_and_output_blocks_to_text() {
+        let mut state = ChatStreamState::new(false);
+        let events = [
+            json!({"choices":[{"delta":{"content":["plain",{"type":"custom","value":1}]},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"annotations":[{"type":"url_citation","url_citation":{"url":"https://example.com"}}]},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"response_output_block":{"type":"custom_block","value":2}},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ];
+        let mut frames = Vec::new();
+        for event in events {
+            frames.extend(state.on_raw_event(&event.to_string()).unwrap());
+        }
+        frames.extend(state.finish(false).unwrap());
+        let text = payloads(&frames)
+            .iter()
+            .filter_map(|payload| payload.pointer("/delta/text").and_then(Value::as_str))
+            .collect::<String>();
+        assert!(text.contains("plain"));
+        assert!(text.contains("custom"));
+        assert!(text.contains("openai_url_citations"));
+        assert!(text.contains("custom_block"));
+    }
+
+    #[test]
+    fn malformed_completed_stream_tool_is_diagnostic_max_tokens() {
+        let mut state = ChatStreamState::new(false);
+        for event in [
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call","function":{"name":"lookup","arguments":"{broken"}}]},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ] {
+            state.on_raw_event(&event.to_string()).unwrap();
+        }
+        let frames = state.finish(false).unwrap();
+        let payloads = payloads(&frames);
+        assert!(payloads.iter().any(|payload| {
+            payload
+                .pointer("/delta/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text == "[incomplete tool_use lookup: {broken]")
+        }));
+        assert!(payloads.iter().any(|payload| {
+            payload.pointer("/delta/stop_reason") == Some(&json!("max_tokens"))
+        }));
+        assert!(
+            payloads.iter().all(|payload| {
+                payload.pointer("/content_block/type") != Some(&json!("tool_use"))
+            })
+        );
+    }
+
+    #[test]
+    fn chat_stream_ignores_semantics_after_terminal() {
+        let mut state = ChatStreamState::new(false);
+        let mut frames = state
+            .on_raw_event(
+                &json!({"choices":[{"delta":{"content":"before"},"finish_reason":"stop"}]})
+                    .to_string(),
+            )
+            .unwrap();
+        frames.extend(
+            state
+                .on_raw_event(
+                    &json!({"choices":[{"delta":{"content":"after"},"finish_reason":null}]})
+                        .to_string(),
+                )
+                .unwrap(),
+        );
+        frames.extend(state.finish(false).unwrap());
+        let text = payloads(&frames)
+            .iter()
+            .filter_map(|payload| payload.pointer("/delta/text").and_then(Value::as_str))
+            .collect::<String>();
+        assert_eq!(text, "before");
     }
 }

@@ -17,32 +17,21 @@ env:
 
 jobs:
   validate:
-    name: Validate release
+    name: Validate Rust release
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 20.18.1
-          cache: npm
-
-      - name: Validate tag and package version
+      - name: Validate tag and Cargo version
         shell: bash
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
-          package_version="$(node -p 'require("./package.json").version')"
           cargo_version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' rust/Cargo.toml | head -n 1)"
           semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
           if [[ ! "${tag_version}" =~ ${semver_re} ]]; then
-            echo "Release tag must be a SemVer tag (optionally prefixed with v)." >&2
-            exit 1
-          fi
-          if [[ "${tag_version}" != "${package_version}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${package_version}." >&2
+            echo "Release tag must be SemVer, optionally prefixed with v." >&2
             exit 1
           fi
           if [[ "${tag_version}" != "${cargo_version}" ]]; then
@@ -50,40 +39,22 @@ jobs:
             exit 1
           fi
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Type-check
-        run: npm run typecheck
-
-      - name: Run unit and regression tests
-        run: npm test
-
-      - name: Run streaming verification
-        run: npm run test:stream
-
-      - name: Build application
-        run: npm run build
-
       - name: Install Rust toolchain
         shell: bash
         run: |
           rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
           rustup default 1.97.1
 
-      - name: Check Rust formatting
+      - name: Check formatting
         run: cargo fmt --manifest-path rust/Cargo.toml -- --check
 
-      - name: Lint Rust
-        run: cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+      - name: Lint
+        run: cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets --all-features -- -D warnings
 
-      - name: Run Rust unit and integration tests
+      - name: Run unit and integration tests
         run: cargo test --locked --manifest-path rust/Cargo.toml --all-targets
 
-      - name: Verify Rust and TypeScript protocol parity fixtures
-        run: npm run test:rust-parity
-
-      - name: Build Rust release binary
+      - name: Build release binary
         run: cargo build --locked --release --manifest-path rust/Cargo.toml
 
   publish:
@@ -129,7 +100,7 @@ jobs:
             type=raw,value=latest,enable=${{ steps.release.outputs.stable == 'true' }}
           labels: |
             org.opencontainers.image.title=open-claude-router
-            org.opencontainers.image.description=Stateless Anthropic Messages to OpenAI protocol router
+            org.opencontainers.image.description=Stateless Rust Anthropic Messages to OpenAI protocol router
 
       - name: Build and push image
         id: build
@@ -162,24 +133,17 @@ jobs:
             fi
           done <<< "${PUBLISHED_TAGS}"
 
-          RAW_MANIFEST="$(docker buildx imagetools inspect "${DOCKER_IMAGE}@${EXPECTED_DIGEST}" --raw)" node <<'NODE'
-          const manifest = JSON.parse(process.env.RAW_MANIFEST || "{}");
-          const entries = Array.isArray(manifest.manifests) ? manifest.manifests : [];
-          const runnable = new Set(
-            entries
-              .filter((entry) => entry.platform?.os === "linux" && entry.platform?.architecture)
-              .filter((entry) => entry.annotations?.["vnd.docker.reference.type"] !== "attestation-manifest")
-              .map((entry) => `${entry.platform.os}/${entry.platform.architecture}`),
-          );
-          for (const expected of ["linux/amd64", "linux/arm64"]) {
-            if (!runnable.has(expected)) {
-              throw new Error(`published manifest is missing ${expected}`);
-            }
-          }
-          const attestations = entries.filter(
-            (entry) => entry.annotations?.["vnd.docker.reference.type"] === "attestation-manifest",
-          );
-          if (attestations.length < 2) {
-            throw new Error("published manifest is missing per-platform attestations");
-          }
-          NODE
+          raw_manifest="$(docker buildx imagetools inspect "${DOCKER_IMAGE}@${EXPECTED_DIGEST}" --raw)"
+          runnable="$(jq -r '.manifests[] | select(.platform.os == "linux") | select(.platform.architecture != null) | select(.annotations["vnd.docker.reference.type"] != "attestation-manifest") | "\(.platform.os)/\(.platform.architecture)"' <<< "${raw_manifest}")"
+          for expected in linux/amd64 linux/arm64; do
+            if ! grep -Fxq "${expected}" <<< "${runnable}"; then
+              echo "Published manifest is missing ${expected}." >&2
+              exit 1
+            fi
+          done
+
+          attestations="$(jq '[.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")] | length' <<< "${raw_manifest}")"
+          if (( attestations < 2 )); then
+            echo "Published manifest is missing per-platform attestations." >&2
+            exit 1
+          fi

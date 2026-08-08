@@ -75,16 +75,22 @@ pub fn check_header_mode_auth(
     if allowed.is_empty() {
         return Ok(());
     }
-    let raw = header(headers, "authorization").ok_or_else(|| {
+    let malformed = || {
         ApiError::new(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             "unauthorized",
             "missing or malformed Authorization header",
         )
-    })?;
-    let (scheme, value) = raw.split_at(raw.len().min(7));
-    if !scheme.eq_ignore_ascii_case("bearer ") || !allowed.contains(value.trim()) {
+    };
+    let raw = header(headers, "authorization").ok_or_else(malformed)?;
+    let Some((scheme, value)) = raw.get(..7).zip(raw.get(7..)) else {
+        return Err(malformed());
+    };
+    if !scheme.eq_ignore_ascii_case("bearer ") {
+        return Err(malformed());
+    }
+    if !allowed.contains(value.trim()) {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
@@ -335,6 +341,55 @@ pub fn parse_upstream_headers(headers: &HeaderMap) -> Result<HeaderMap, ApiError
     Ok(result)
 }
 
+pub fn parse_upstream_file_map(headers: &HeaderMap) -> Result<HashMap<String, String>, ApiError> {
+    let Some(raw) = header(headers, "x-upstream-file-map") else {
+        return Ok(HashMap::new());
+    };
+    let parsed: Value = serde_json::from_str(raw).map_err(|_| {
+        invalid(
+            "invalid_file_map",
+            "X-Upstream-File-Map must be a non-empty JSON object",
+        )
+    })?;
+    let object = parsed
+        .as_object()
+        .filter(|object| !object.is_empty())
+        .ok_or_else(|| {
+            invalid(
+                "invalid_file_map",
+                "X-Upstream-File-Map must be a non-empty JSON object",
+            )
+        })?;
+    let mut result = HashMap::with_capacity(object.len());
+    for (client_file_id, upstream_file_id) in object {
+        let invalid_key = client_file_id.trim().is_empty()
+            || contains_invalid_header_value(client_file_id)
+            || client_file_id.chars().any(char::is_control)
+            || matches!(
+                client_file_id.to_ascii_lowercase().as_str(),
+                "__proto__" | "constructor" | "prototype"
+            );
+        let Some(upstream_file_id) = upstream_file_id.as_str() else {
+            return Err(invalid(
+                "invalid_file_map",
+                "X-Upstream-File-Map keys and values must be non-empty strings without control characters",
+            ));
+        };
+        if invalid_key
+            || upstream_file_id.trim().is_empty()
+            || contains_invalid_header_value(upstream_file_id)
+            || upstream_file_id.chars().any(char::is_control)
+        {
+            return Err(invalid(
+                "invalid_file_map",
+                "X-Upstream-File-Map keys and values must be non-empty strings without control characters",
+            ));
+        }
+        result.insert(client_file_id.clone(), upstream_file_id.to_owned());
+    }
+    Ok(result)
+}
+
 fn parse_assignments(
     raw: Option<&str>,
     code: &'static str,
@@ -521,5 +576,56 @@ mod tests {
             "https://upstream.example.com/v1/chat/completions"
         );
         assert_eq!(upstream.authorization, "Custom abc");
+    }
+
+    #[test]
+    fn file_map_requires_safe_non_empty_string_entries() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-upstream-file-map",
+            r#"{"file-client":"file-upstream"}"#.parse().unwrap(),
+        );
+        assert_eq!(
+            parse_upstream_file_map(&headers).unwrap()["file-client"],
+            "file-upstream"
+        );
+
+        for raw in [
+            "",
+            "{}",
+            "[]",
+            r#"{"file-client":1}"#,
+            r#"{"": "x"}"#,
+            r#"{"file\tclient":"file-upstream"}"#,
+            r#"{"file-client":"file\tupstream"}"#,
+            r#"{"file-client":"file\u0001upstream"}"#,
+        ] {
+            if raw.is_empty() {
+                headers.insert("x-upstream-file-map", " ".parse().unwrap());
+            } else {
+                headers.insert("x-upstream-file-map", raw.parse().unwrap());
+            }
+            assert_eq!(
+                parse_upstream_file_map(&headers).unwrap_err().code,
+                "invalid_file_map"
+            );
+        }
+    }
+
+    #[test]
+    fn service_auth_distinguishes_malformed_bearer_from_invalid_token() {
+        let allowed = HashSet::from(["valid".to_owned()]);
+        for raw in ["Basic valid", "Bearer", "éééé"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", raw.parse().unwrap());
+            let error = check_header_mode_auth(&headers, &allowed).unwrap_err();
+            assert_eq!(error.error_type, "authentication_error");
+            assert_eq!(error.message, "missing or malformed Authorization header");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong".parse().unwrap());
+        let error = check_header_mode_auth(&headers, &allowed).unwrap_err();
+        assert_eq!(error.message, "invalid access token");
     }
 }

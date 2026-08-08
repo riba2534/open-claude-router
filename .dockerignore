@@ -1,10 +1,12 @@
-node_modules
-dist
 .git
 .github
 .claude
-*.log
+.idea
+.vscode
+.worktrees
+rust/target
 logs
+*.log
 .DS_Store
 .env*
 README.md

@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Map, Value, json};
 
-use super::protocol_error;
+use super::{ensure_text_block_citations, protocol_error};
 use crate::{
     error::{ApiError, error_type_for_status, status_from_openai_error},
     transform::request::scrub_cache_control,
@@ -15,6 +15,17 @@ pub fn transform_responses_request(body: &mut Value) -> Result<(), ApiError> {
     let object = body.as_object_mut().expect("unified request is object");
     if let Some(max_tokens) = object.remove("max_tokens") {
         object.insert("max_output_tokens".into(), max_tokens);
+    }
+    if object
+        .get("stop")
+        .is_some_and(|stop| !stop.is_null() && !stop.as_array().is_some_and(Vec::is_empty))
+    {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "unsupported_stop_sequences",
+            "Anthropic stop_sequences are not supported by the OpenAI Responses API",
+        ));
     }
     object.remove("stop");
     let explicit_effort = object
@@ -229,9 +240,20 @@ pub fn transform_responses_request(body: &mut Value) -> Result<(), ApiError> {
 }
 
 pub fn transform_responses_json(payload: &Value, omit_reasoning: bool) -> Result<Value, ApiError> {
-    if let Some(status) = responses_status_error(payload) {
-        return Err(status);
+    if let Some(error) = payload.get("error").filter(|error| !error.is_null()) {
+        let status = status_from_openai_error(error, axum::http::StatusCode::OK);
+        return Err(ApiError::new(
+            status,
+            error_type_for_status(status),
+            "upstream_logical_error",
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Responses request failed"),
+        )
+        .retryable());
     }
+    validate_responses_status(payload)?;
     let output = payload
         .get("output")
         .and_then(Value::as_array)
@@ -241,6 +263,7 @@ pub fn transform_responses_json(payload: &Value, omit_reasoning: bool) -> Result
     let mut has_tool = false;
     let mut incomplete_call = false;
     let mut refusal = String::new();
+    let mut emitted_audio_omission = false;
     for item in output {
         let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
         if let Some(reason) = unsupported_responses_item_reason(item) {
@@ -310,19 +333,24 @@ pub fn transform_responses_json(payload: &Value, omit_reasoning: bool) -> Result
                     .unwrap_or_else(|| Value::String("{}".into()));
                 if is_incomplete {
                     incomplete_call = true;
-                    content.push(json!({"type":"text","text":format!(
-                        "[incomplete function_call {name}: {}]",
-                        arguments.as_str().map(ToOwned::to_owned).unwrap_or_else(|| serde_json::to_string(&arguments).unwrap_or_default())
-                    )}));
+                    content.push(incomplete_tool_diagnostic(name, &arguments));
                 } else {
-                    content.push(json!({
-                        "type":"tool_use",
-                        "id":call_id,
-                        "name":name,
-                        "input":parse_tool_arguments(&arguments)?,
-                        "caller":{"type":"direct"}
-                    }));
-                    has_tool = true;
+                    match parse_tool_arguments(&arguments) {
+                        Ok(input) => {
+                            content.push(json!({
+                                "type":"tool_use",
+                                "id":call_id,
+                                "name":name,
+                                "input":input,
+                                "caller":{"type":"direct"}
+                            }));
+                            has_tool = true;
+                        }
+                        Err(_) => {
+                            incomplete_call = true;
+                            content.push(incomplete_tool_diagnostic(name, &arguments));
+                        }
+                    }
                 }
             }
             "message" => {
@@ -345,6 +373,19 @@ pub fn transform_responses_json(payload: &Value, omit_reasoning: bool) -> Result
                         }
                         Some("output_image" | "output_image_base64") => {
                             content.push(json!({"type":"text","text":"[generated image omitted]"}));
+                        }
+                        Some("output_audio") => {
+                            if !emitted_audio_omission {
+                                emitted_audio_omission = true;
+                                content.push(json!({"type":"text","text":"[generated audio omitted]"}));
+                            }
+                            if let Some(transcript) = part
+                                .get("transcript")
+                                .and_then(Value::as_str)
+                                .filter(|transcript| !transcript.is_empty())
+                            {
+                                content.push(json!({"type":"text","text":transcript}));
+                            }
                         }
                         _ => content.push(json!({"type":"text","text":bounded_responses("message content", part)})),
                     }
@@ -369,6 +410,21 @@ pub fn transform_responses_json(payload: &Value, omit_reasoning: bool) -> Result
         }
     }
     content.append(&mut pending_reasoning);
+    if incomplete_call {
+        for block in &mut content {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let name = block
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            let raw = block.get("input").cloned().unwrap_or_else(|| json!({}));
+            *block = incomplete_tool_diagnostic(&name, &raw);
+        }
+        has_tool = false;
+    }
     if payload
         .get("__ocr_stream_aggregated")
         .and_then(Value::as_bool)
@@ -383,6 +439,7 @@ pub fn transform_responses_json(payload: &Value, omit_reasoning: bool) -> Result
         .and_then(Value::as_str)
         == Some("content_filter");
     let is_refusal = !refusal.is_empty() || (response_incomplete && content_filter);
+    ensure_text_block_citations(&mut content);
     let stop_reason = if is_refusal {
         "refusal"
     } else if response_incomplete {
@@ -572,6 +629,19 @@ fn parse_tool_arguments(raw: &Value) -> Result<Value, ApiError> {
     Ok(parsed)
 }
 
+fn incomplete_tool_diagnostic(name: &str, raw: &Value) -> Value {
+    let raw = raw
+        .as_str()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| serde_json::to_string(raw).unwrap_or_default());
+    let length = raw.chars().count();
+    let mut bounded = raw.chars().take(4096).collect::<String>();
+    if length > 4096 {
+        bounded.push('…');
+    }
+    json!({"type":"text","text":format!("[incomplete tool_use {name}: {bounded}]")})
+}
+
 fn reasoning_text(item: &Value) -> String {
     let content = item
         .get("content")
@@ -592,48 +662,45 @@ fn reasoning_text(item: &Value) -> String {
         .collect()
 }
 
-fn responses_status_error(payload: &Value) -> Option<ApiError> {
-    let status = payload.get("status").and_then(Value::as_str)?;
+fn validate_responses_status(payload: &Value) -> Result<(), ApiError> {
+    let status = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| protocol_error("upstream Responses payload status must be a string"))?;
     if matches!(status, "completed" | "incomplete") {
-        return None;
+        return Ok(());
     }
     if status == "failed" {
         let error = payload.get("error").cloned().unwrap_or(Value::Null);
         let http_status = status_from_openai_error(&error, axum::http::StatusCode::OK);
-        return Some(
-            ApiError::new(
-                http_status,
-                error_type_for_status(http_status),
-                "upstream_responses_error",
-                error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Responses request failed"),
-            )
-            .retryable(),
-        );
+        return Err(ApiError::new(
+            http_status,
+            error_type_for_status(http_status),
+            "upstream_responses_error",
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Responses request failed"),
+        )
+        .retryable());
     }
     if status == "cancelled" {
-        return Some(
-            ApiError::new(
-                axum::http::StatusCode::CONFLICT,
-                "conflict_error",
-                "response_cancelled",
-                payload
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Responses request was cancelled"),
-            )
-            .retryable(),
-        );
+        return Err(ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "conflict_error",
+            "response_cancelled",
+            payload
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("Responses request was cancelled"),
+        )
+        .retryable());
     }
-    Some(
-        protocol_error(format!(
-            "upstream Responses returned non-terminal status {}",
-            serde_json::to_string(status).unwrap()
-        ))
-        .retryable(),
-    )
+    Err(protocol_error(format!(
+        "upstream Responses returned non-terminal status {}",
+        serde_json::to_string(status).unwrap()
+    ))
+    .retryable())
 }
 
 fn bounded_responses(kind: &str, value: &Value) -> String {
@@ -698,6 +765,149 @@ mod tests {
             body.pointer("/input/0/content/0/type"),
             Some(&json!("input_text"))
         );
+    }
+
+    #[test]
+    fn request_rejects_non_empty_stop_sequences() {
+        let mut body = json!({"messages":[],"stop":["END"]});
+        let error = transform_responses_request(&mut body).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(error.code, "unsupported_stop_sequences");
+        assert_eq!(
+            error.message,
+            "Anthropic stop_sequences are not supported by the OpenAI Responses API"
+        );
+
+        let mut empty = json!({"messages":[],"stop":[]});
+        transform_responses_request(&mut empty).unwrap();
+        assert!(empty.get("stop").is_none());
+    }
+
+    #[test]
+    fn json_response_rejects_null_or_non_string_status() {
+        for status in [Value::Null, json!(7)] {
+            let error =
+                transform_responses_json(&json!({"status":status,"output":[]}), false).unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                error.message,
+                "upstream Responses payload status must be a string"
+            );
+        }
+    }
+
+    #[test]
+    fn json_response_maps_top_level_logical_error() {
+        let error = transform_responses_json(
+            &json!({"error":{"type":"invalid_request_error","message":"bad model"}}),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(error.message, "bad model");
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn malformed_completed_function_is_diagnostic_and_max_tokens() {
+        let result = transform_responses_json(
+            &json!({
+                "id":"r","status":"completed","output":[{
+                    "type":"function_call","call_id":"call_1","name":"lookup",
+                    "arguments":"{broken","status":"completed"
+                }]
+            }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(result["stop_reason"], "max_tokens");
+        assert_eq!(
+            result.pointer("/content/0/text"),
+            Some(&json!("[incomplete tool_use lookup: {broken]"))
+        );
+        assert!(
+            result["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block["type"] != "tool_use")
+        );
+    }
+
+    #[test]
+    fn one_malformed_parallel_function_makes_every_call_non_executable() {
+        let result = transform_responses_json(
+            &json!({
+                "status":"completed","output":[
+                    {"type":"function_call","call_id":"good","name":"good","arguments":"{}"},
+                    {"type":"function_call","call_id":"bad","name":"bad","arguments":"{"}
+                ]
+            }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(result["stop_reason"], "max_tokens");
+        assert!(
+            result["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block["type"] != "tool_use")
+        );
+    }
+
+    #[test]
+    fn reasoning_signature_replays_required_id_and_hidden_state() {
+        let response = transform_responses_json(
+            &json!({
+                "status":"completed","output":[{
+                    "type":"reasoning","id":"reason_1","encrypted_content":"opaque",
+                    "summary":[{"type":"summary_text","text":"summary"}]
+                }]
+            }),
+            true,
+        )
+        .unwrap();
+        let signature = response
+            .pointer("/content/0/signature")
+            .and_then(Value::as_str)
+            .unwrap();
+        let mut request = json!({
+            "messages":[{"role":"assistant","output_blocks":[{
+                "type":"thinking","thinking":"","signature":signature
+            }]}]
+        });
+        transform_responses_request(&mut request).unwrap();
+        assert_eq!(request.pointer("/input/0/type"), Some(&json!("reasoning")));
+        assert_eq!(request.pointer("/input/0/id"), Some(&json!("reason_1")));
+        assert_eq!(
+            request.pointer("/input/0/encrypted_content"),
+            Some(&json!("opaque"))
+        );
+        assert_eq!(request.pointer("/input/0/summary"), Some(&json!([])));
+    }
+
+    #[test]
+    fn output_audio_omits_bytes_once_and_preserves_transcript() {
+        let result = transform_responses_json(
+            &json!({
+                "status":"completed","output":[{"type":"message","content":[
+                    {"type":"output_audio","data":"AAAA","transcript":"one"},
+                    {"type":"output_audio","data":"BBBB","transcript":"two"}
+                ]}]
+            }),
+            false,
+        )
+        .unwrap();
+        let text = result["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        assert_eq!(text, "[generated audio omitted]onetwo");
+        assert!(!result.to_string().contains("AAAA"));
+        assert!(!result.to_string().contains("BBBB"));
     }
 
     #[test]

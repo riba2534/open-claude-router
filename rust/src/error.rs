@@ -87,35 +87,48 @@ pub fn status_from_openai_error(error: &Value, http_status: StatusCode) -> Statu
     if http_status.is_client_error() || http_status.is_server_error() {
         return http_status;
     }
-    let code = error
+    let detail_code = error
         .get("code")
         .and_then(Value::as_str)
-        .or_else(|| error.get("type").and_then(Value::as_str))
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let raw = if code == "overloaded" || code == "overloaded_error" {
-        529
+    let type_code = error
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let raw = infer_status_from_openai_error_code(&detail_code)
+        .or_else(|| infer_status_from_openai_error_code(&type_code))
+        .unwrap_or(502);
+    StatusCode::from_u16(raw).unwrap_or(StatusCode::BAD_GATEWAY)
+}
+
+fn infer_status_from_openai_error_code(code: &str) -> Option<u16> {
+    if code.is_empty() {
+        None
+    } else if code == "overloaded" || code == "overloaded_error" {
+        Some(529)
     } else if code.contains("rate_limit") || code.contains("quota") {
-        429
+        Some(429)
     } else if code.contains("billing") {
-        402
+        Some(402)
     } else if code.contains("authentication")
         || code.contains("invalid_api_key")
         || code == "unauthorized"
     {
-        401
+        Some(401)
     } else if code.contains("permission") || code == "forbidden" {
-        403
+        Some(403)
     } else if code.contains("not_found") {
-        404
+        Some(404)
     } else if code.contains("conflict") {
-        409
+        Some(409)
     } else if code.contains("request_too_large") {
-        413
+        Some(413)
     } else if code.contains("timeout") {
-        504
+        Some(504)
     } else if code == "server_error" || code.contains("internal_error") {
-        500
+        Some(500)
     } else if code.contains("invalid_request")
         || code.contains("unsupported")
         || code.contains("invalid_value")
@@ -124,9 +137,32 @@ pub fn status_from_openai_error(error: &Value, http_status: StatusCode) -> Statu
         || code.starts_with("failed_to_")
         || code == "bad_request"
     {
-        400
+        Some(400)
     } else {
-        502
-    };
-    StatusCode::from_u16(raw).unwrap_or(StatusCode::BAD_GATEWAY)
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn logical_error_uses_known_code_before_type() {
+        let status = status_from_openai_error(
+            &json!({"code":"invalid_api_key","type":"invalid_request_error"}),
+            StatusCode::OK,
+        );
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn logical_error_falls_back_from_unknown_code_to_known_type() {
+        let status = status_from_openai_error(
+            &json!({"code":"vendor_model_error","type":"invalid_request_error"}),
+            StatusCode::OK,
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 }

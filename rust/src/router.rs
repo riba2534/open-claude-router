@@ -17,19 +17,19 @@ use crate::{
         Endpoint, UpstreamConfig, UpstreamFormat, apply_effort_controls, check_embedded_mode_auth,
         check_header_mode_auth, is_embedded_upstream_path, parse_access_tokens,
         parse_effort_levels, parse_effort_map, parse_embedded_upstream, parse_model_map,
-        parse_upstream_config, parse_upstream_format, parse_upstream_headers,
-        resolve_upstream_model,
+        parse_upstream_config, parse_upstream_file_map, parse_upstream_format,
+        parse_upstream_headers, resolve_upstream_model,
     },
     error::ApiError,
     model_log::{ModelInteractionLogger, selected_headers},
     sse::{aggregate_chat_sse, aggregate_responses_sse},
     streaming::{convert_chat_sse_stream, convert_responses_sse_stream},
-    tokenizer::count_anthropic_tokens,
+    tokenizer::{count_anthropic_tokens, validate_count_tokens_request},
     transform::{
-        anthropic_json_to_sse, prepare_chat_request, transform_anthropic_request,
+        anthropic_json_to_sse, prepare_chat_request, transform_anthropic_request_with_file_map,
         transform_chat_json_response, transform_responses_json, transform_responses_request,
     },
-    upstream::{call_upstream, upstream_http_error},
+    upstream::{call_upstream, read_upstream_body, upstream_http_error},
 };
 
 #[derive(Clone)]
@@ -68,7 +68,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             get(|| async {
                 Json(json!({
                     "name":"open-claude-router",
-                    "description":"routing-stateless Anthropic <-> OpenAI bridge — Rust high-concurrency implementation"
+                    "description":"routing-stateless Anthropic <-> OpenAI bridge — pass X-Upstream-Url + X-Upstream-Authorization (+ X-Upstream-Model) headers per request"
                 }))
             }),
         )
@@ -87,6 +87,7 @@ async fn header_messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    ensure_json_content_type(&headers)?;
     check_header_mode_auth(&headers, &state.access_tokens)?;
     let format = parse_upstream_format(&headers)?;
     let mut upstream = parse_upstream_config(&headers)?;
@@ -105,8 +106,10 @@ async fn header_count_tokens(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    ensure_json_content_type(&headers)?;
     check_header_mode_auth(&headers, &state.access_tokens)?;
     let payload = parse_json_body(&body)?;
+    validate_count_tokens_request(&payload)?;
     Ok(Json(json!({"input_tokens":count_anthropic_tokens(&payload)})).into_response())
 }
 
@@ -125,11 +128,13 @@ async fn fallback(
             format!("unknown path: {}", uri.path()),
         ));
     }
+    ensure_json_content_type(&headers)?;
     check_embedded_mode_auth(&headers, &state.access_tokens)?;
     let format = parse_upstream_format(&headers)?;
     let (mut upstream, endpoint) = parse_embedded_upstream(&uri, &headers)?;
     let payload = parse_json_body(&body)?;
     if endpoint == Endpoint::CountTokens {
+        validate_count_tokens_request(&payload)?;
         return Ok(Json(json!({"input_tokens":count_anthropic_tokens(&payload)})).into_response());
     }
     let model_map = parse_model_map(&headers)?;
@@ -139,6 +144,34 @@ async fn fallback(
         &model_map,
     );
     forward(state, headers, payload, format, upstream).await
+}
+
+fn ensure_json_content_type(headers: &HeaderMap) -> Result<(), ApiError> {
+    let raw = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let media_type = raw
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let is_json = media_type == "application/json"
+        || (media_type.starts_with("application/") && media_type.ends_with("+json"));
+    if is_json {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "invalid_request_error",
+        "unsupported_media_type",
+        if raw.is_empty() {
+            "Content-Type must be application/json".to_owned()
+        } else {
+            format!("unsupported Content-Type: {raw} (expected application/json)")
+        },
+    ))
 }
 
 fn parse_json_body(bytes: &[u8]) -> Result<Value, ApiError> {
@@ -171,7 +204,8 @@ async fn forward(
     let wants_stream = payload.get("stream").and_then(Value::as_bool) == Some(true);
     let omit_thinking =
         payload.pointer("/thinking/display").and_then(Value::as_str) == Some("omitted");
-    let mut outbound = transform_anthropic_request(&payload)?;
+    let file_map = parse_upstream_file_map(&headers)?;
+    let mut outbound = transform_anthropic_request_with_file_map(&payload, &file_map)?;
     if let Some(model) = upstream.model.as_ref() {
         outbound["model"] = Value::String(model.clone());
     }
@@ -252,18 +286,26 @@ async fn forward(
             .insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
         return Ok(response);
     }
-    let response_bytes = upstream_response.bytes().await.map_err(|error| {
-        let api_error = ApiError::new(
+    let (response_bytes, read_error) = read_upstream_body(upstream_response).await;
+    if let Some(error) = read_error {
+        state.model_logger.response(
+            &exchange,
+            response_status.as_u16(),
+            response_headers,
+            &response_bytes,
+            false,
+        );
+        if !response_status.is_success() {
+            return Err(upstream_http_error(response_status, &response_bytes));
+        }
+        return Err(ApiError::new(
             StatusCode::BAD_GATEWAY,
             "api_error",
             "upstream_stream_error",
             format!("upstream response read failed: {error}"),
-        );
-        state
-            .model_logger
-            .transport_error(&exchange, &api_error.message);
-        api_error
-    })?;
+        )
+        .retryable());
+    }
     state.model_logger.response(
         &exchange,
         response_status.as_u16(),
@@ -287,6 +329,7 @@ async fn forward(
                 "upstream_protocol_error",
                 format!("upstream response is not valid JSON: {error}"),
             )
+            .retryable()
         })?
     };
     let anthropic = match format {
@@ -339,6 +382,21 @@ mod tests {
         assert_eq!(
             to_bytes(response.into_body(), 1024).await.unwrap(),
             Bytes::from_static(b"{\"status\":\"ok\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn root_metadata_is_stable() {
+        let response = build_app(state())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(
+            body["description"],
+            "routing-stateless Anthropic <-> OpenAI bridge — pass X-Upstream-Url + X-Upstream-Authorization (+ X-Upstream-Model) headers per request"
         );
     }
 

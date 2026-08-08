@@ -12,7 +12,14 @@ const TOOL_RESULT_MOVED_TEXT: &str =
     "[tool_result multimodal content moved to the following user message]";
 
 pub fn transform_anthropic_request(request: &Value) -> Result<Value, ApiError> {
-    validate_request(request)?;
+    transform_anthropic_request_with_file_map(request, &HashMap::new())
+}
+
+pub fn transform_anthropic_request_with_file_map(
+    request: &Value,
+    file_map: &HashMap<String, String>,
+) -> Result<Value, ApiError> {
+    validate_request(request, file_map)?;
     let object = request.as_object().expect("validated object");
     let mut messages = Vec::<Value>::new();
 
@@ -75,6 +82,7 @@ pub fn transform_anthropic_request(request: &Value) -> Result<Value, ApiError> {
                             "content":convert_tool_result_content(
                                 part.get("content"),
                                 part.get("is_error").and_then(Value::as_bool) == Some(true),
+                                file_map,
                             ),
                             "tool_call_id":part.get("tool_use_id").and_then(Value::as_str).unwrap_or_default(),
                             "cache_control":part.get("cache_control").cloned()
@@ -97,11 +105,11 @@ pub fn transform_anthropic_request(request: &Value) -> Result<Value, ApiError> {
                                 visible.push(converted);
                             }
                         }
-                        Some("image") => match convert_image(part) {
+                        Some("image") => match convert_image(part, file_map) {
                             Some(image) => visible.push(image),
                             None => visible.push(json!({"type":"text","text":bounded_json(part)})),
                         },
-                        Some("document") => visible.extend(convert_document_blocks(part)),
+                        Some("document") => visible.extend(convert_document_blocks(part, file_map)),
                         Some("search_result") => visible.extend(convert_search_result(part)),
                         _ => visible.push(json!({"type":"text","text":bounded_json(part)})),
                     }
@@ -214,6 +222,29 @@ pub fn transform_anthropic_request(request: &Value) -> Result<Value, ApiError> {
     copy_if_present(object, &mut result, "top_p", "top_p");
     copy_if_present(object, &mut result, "stop_sequences", "stop");
     copy_if_present(object, &mut result, "stream", "stream");
+    if let Some(user_id) = object
+        .get("metadata")
+        .and_then(|metadata| metadata.get("user_id"))
+        .and_then(Value::as_str)
+    {
+        result.insert(
+            "safety_identifier".into(),
+            Value::String(user_id.to_owned()),
+        );
+    }
+    if let Some(service_tier) = object.get("service_tier").and_then(Value::as_str) {
+        result.insert(
+            "service_tier".into(),
+            Value::String(
+                if service_tier == "standard_only" {
+                    "default"
+                } else {
+                    "auto"
+                }
+                .into(),
+            ),
+        );
+    }
     if !active_tools.is_empty() {
         result.insert(
             "tools".into(),
@@ -352,10 +383,63 @@ pub(crate) fn scrub_cache_control(body: &mut Value) {
     }
 }
 
-fn validate_request(request: &Value) -> Result<(), ApiError> {
+fn validate_request(request: &Value, file_map: &HashMap<String, String>) -> Result<(), ApiError> {
     let object = request
         .as_object()
         .ok_or_else(|| invalid("request body must be a JSON object"))?;
+    if !object
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| !model.trim().is_empty())
+    {
+        return Err(invalid("model must be a non-empty string"));
+    }
+    if !object.get("max_tokens").is_some_and(is_safe_token_count) {
+        return Err(invalid("max_tokens must be a non-negative safe integer"));
+    }
+    for field in ["top_k", "cache_control", "inference_geo"] {
+        if object.get(field).is_some_and(|value| !value.is_null()) {
+            return Err(invalid(format!(
+                "{field} has no OpenAI protocol equivalent"
+            )));
+        }
+    }
+    if let Some(metadata) = object.get("metadata").filter(|value| !value.is_null()) {
+        let metadata = metadata
+            .as_object()
+            .ok_or_else(|| invalid("metadata must be an object or null"))?;
+        if metadata.keys().any(|key| key != "user_id") {
+            return Err(invalid("metadata supports only the user_id field"));
+        }
+        if metadata
+            .get("user_id")
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return Err(invalid("metadata.user_id must be a string or null"));
+        }
+        if metadata
+            .get("user_id")
+            .and_then(Value::as_str)
+            .is_some_and(|user_id| user_id.encode_utf16().count() > 512)
+        {
+            return Err(invalid("metadata.user_id must be at most 512 characters"));
+        }
+    }
+    if let Some(service_tier) = object.get("service_tier").filter(|value| !value.is_null())
+        && !matches!(service_tier.as_str(), Some("auto" | "standard_only"))
+    {
+        return Err(invalid(
+            "service_tier must be \"auto\", \"standard_only\", or null",
+        ));
+    }
+    if let Some(stop_sequences) = object.get("stop_sequences")
+        && (!stop_sequences.is_array()
+            || stop_sequences
+                .as_array()
+                .is_some_and(|stops| stops.iter().any(|stop| !stop.is_string())))
+    {
+        return Err(invalid("stop_sequences must be an array of strings"));
+    }
     if let Some(system) = object.get("system") {
         if !system.is_string() && !system.is_array() {
             return Err(invalid(
@@ -363,10 +447,19 @@ fn validate_request(request: &Value) -> Result<(), ApiError> {
             ));
         }
         if let Some(blocks) = system.as_array() {
-            for block in blocks {
+            for (block_index, block) in blocks.iter().enumerate() {
                 let block = block
                     .as_object()
                     .ok_or_else(|| invalid("system content blocks must be objects"))?;
+                if !block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| !kind.is_empty())
+                {
+                    return Err(invalid(format!(
+                        "system[{block_index}].type must be a non-empty string"
+                    )));
+                }
                 if block.get("type").and_then(Value::as_str) == Some("text") {
                     if !block.get("text").is_some_and(Value::is_string) {
                         return Err(invalid("system text blocks require a string text field"));
@@ -392,20 +485,35 @@ fn validate_request(request: &Value) -> Result<(), ApiError> {
     for (index, message) in messages.iter().enumerate() {
         let message = message
             .as_object()
-            .ok_or_else(|| invalid("each message must be an object"))?;
+            .ok_or_else(|| {
+                invalid(format!(
+                    "messages[{index}] must be an object with role \"user\", \"assistant\", or \"system\"; received undefined"
+                ))
+            })?;
+        let received_role = message
+            .get("role")
+            .map(|role| serde_json::to_string(role).unwrap_or_else(|_| "undefined".into()))
+            .unwrap_or_else(|| "undefined".into());
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .filter(|role| matches!(*role, "user" | "assistant" | "system"))
-            .ok_or_else(|| invalid("message role must be user, assistant, or system"))?;
+            .ok_or_else(|| {
+                invalid(format!(
+                    "messages[{index}] must be an object with role \"user\", \"assistant\", or \"system\"; received {}",
+                    received_role
+                ))
+            })?;
         let content = message
             .get("content")
             .ok_or_else(|| invalid("each message must include content"))?;
         if !content.is_string() && !content.is_array() {
-            return Err(invalid("message content must be a string or an array"));
+            return Err(invalid(
+                "message content must be a string or an array of blocks",
+            ));
         }
         if let Some(parts) = content.as_array() {
-            for part in parts {
+            for (part_index, part) in parts.iter().enumerate() {
                 let part_object = part
                     .as_object()
                     .ok_or_else(|| invalid("message content blocks must be objects"))?;
@@ -413,7 +521,11 @@ fn validate_request(request: &Value) -> Result<(), ApiError> {
                     .get("type")
                     .and_then(Value::as_str)
                     .filter(|kind| !kind.is_empty())
-                    .ok_or_else(|| invalid("content block type must be a non-empty string"))?;
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "messages[{index}].content[{part_index}].type must be a non-empty string"
+                        ))
+                    })?;
                 if is_server_history_block(kind) {
                     return Err(invalid(
                         "Anthropic server-tool history has no OpenAI function-tool equivalent",
@@ -430,7 +542,7 @@ fn validate_request(request: &Value) -> Result<(), ApiError> {
                         if role != "user" {
                             return Err(invalid("image blocks are only valid in user messages"));
                         }
-                        validate_image(part, index)?;
+                        validate_image(part, index, file_map)?;
                     }
                     "document" => {
                         if role != "user" {
@@ -439,6 +551,7 @@ fn validate_request(request: &Value) -> Result<(), ApiError> {
                         has_citations_enabled_content |= validate_document(
                             part,
                             &format!("messages[{index}].content document"),
+                            file_map,
                         )?;
                     }
                     "search_result" => {
@@ -528,14 +641,19 @@ fn validate_request(request: &Value) -> Result<(), ApiError> {
                         has_citations_enabled_content |= validate_tool_result_content(
                             part_object.get("content"),
                             &format!("messages[{index}].tool_result.content"),
+                            file_map,
                         )?;
                     }
                     "thinking" => {
-                        if role != "assistant"
-                            || !part_object
-                                .get("signature")
-                                .and_then(Value::as_str)
-                                .is_some_and(|v| !v.is_empty())
+                        if role != "assistant" {
+                            return Err(invalid(
+                                "thinking blocks are only valid in assistant messages",
+                            ));
+                        }
+                        if !part_object
+                            .get("signature")
+                            .and_then(Value::as_str)
+                            .is_some_and(|v| !v.is_empty())
                         {
                             return Err(invalid(
                                 "assistant thinking blocks must include a non-empty signature",
@@ -544,7 +662,7 @@ fn validate_request(request: &Value) -> Result<(), ApiError> {
                     }
                     "redacted_thinking" => {
                         return Err(invalid(
-                            "redacted thinking has no replay-safe OpenAI equivalent",
+                            "redacted_thinking history has no replay-safe OpenAI equivalent",
                         ));
                     }
                     "compaction" | "fallback" | "container_upload" => {
@@ -558,6 +676,17 @@ fn validate_request(request: &Value) -> Result<(), ApiError> {
         }
     }
     validate_mid_conversation_system_placement(messages)?;
+    let references_dynamic_tools = messages.iter().any(message_references_dynamic_tools);
+    if references_dynamic_tools
+        && object
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    {
+        return Err(invalid(
+            "tool changes and tool references require declared tools",
+        ));
+    }
     if let Some(tools) = object.get("tools") {
         let tools = tools
             .as_array()
@@ -775,20 +904,76 @@ fn validate_request(request: &Value) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_image(part: &Value, index: usize) -> Result<(), ApiError> {
+fn is_safe_token_count(value: &Value) -> bool {
+    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+    let Some(number) = value.as_number() else {
+        return false;
+    };
+    if let Some(value) = number.as_u64() {
+        return value <= MAX_SAFE_INTEGER;
+    }
+    number.as_f64().is_some_and(|value| {
+        value.is_finite()
+            && value >= 0.0
+            && value <= MAX_SAFE_INTEGER as f64
+            && value.fract() == 0.0
+    })
+}
+
+fn message_references_dynamic_tools(message: &Value) -> bool {
+    let Some(parts) = message.get("content").and_then(Value::as_array) else {
+        return false;
+    };
+    parts.iter().any(|part| {
+        let kind = part.get("type").and_then(Value::as_str);
+        if matches!(
+            kind,
+            Some("tool_reference" | "tool_addition" | "tool_removal")
+        ) {
+            return true;
+        }
+        if kind == Some("mid_conv_system") {
+            return part
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|content| {
+                    content.iter().any(|nested| {
+                        matches!(
+                            nested.get("type").and_then(Value::as_str),
+                            Some("tool_reference" | "tool_addition" | "tool_removal")
+                        )
+                    })
+                });
+        }
+        if kind == Some("tool_result") {
+            return part
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|content| {
+                    content.iter().any(|nested| {
+                        nested.get("type").and_then(Value::as_str) == Some("tool_reference")
+                    })
+                });
+        }
+        false
+    })
+}
+
+fn validate_image(
+    part: &Value,
+    index: usize,
+    file_map: &HashMap<String, String>,
+) -> Result<(), ApiError> {
     let label = format!("messages[{index}].content image");
     let source = part
         .get("source")
         .and_then(Value::as_object)
         .ok_or_else(|| invalid(format!("{label}.source must be an object")))?;
     match source.get("type").and_then(Value::as_str) {
-        Some("file") => Err(invalid(format!(
-            "{label}.source.type \"file\" is provider-owned and cannot be translated to an OpenAI file id",
-        ))),
+        Some("file") => validate_mapped_file_source(source, &label, file_map),
         Some("base64") => {
             let data = source.get("data").and_then(Value::as_str);
-            let self_describing =
-                data.is_some_and(|data| data.starts_with("data:") && data.contains(";base64,"));
+            let self_describing = data.is_some_and(is_base64_data_url);
             let media = source
                 .get("media_type")
                 .and_then(Value::as_str)
@@ -816,6 +1001,45 @@ fn validate_image(part: &Value, index: usize) -> Result<(), ApiError> {
             "{label}.source.type must be a non-empty string"
         ))),
     }
+}
+
+fn validate_mapped_file_source(
+    source: &Map<String, Value>,
+    label: &str,
+    file_map: &HashMap<String, String>,
+) -> Result<(), ApiError> {
+    let file_id = source
+        .get("file_id")
+        .and_then(Value::as_str)
+        .filter(|file_id| !file_id.is_empty())
+        .ok_or_else(|| invalid(format!("{label}.source.file_id must be a non-empty string")))?;
+    if !file_map
+        .get(file_id)
+        .is_some_and(|mapped| !mapped.is_empty())
+    {
+        return Err(invalid(format!(
+            "{label}.source.file_id has no X-Upstream-File-Map entry"
+        )));
+    }
+    Ok(())
+}
+
+fn is_base64_data_url(value: &str) -> bool {
+    if !is_data_url(value) {
+        return false;
+    }
+    let Some(comma) = value.as_bytes().iter().position(|byte| *byte == b',') else {
+        return false;
+    };
+    let header = &value.as_bytes()[..comma];
+    header.len() >= b";base64".len()
+        && header[header.len() - b";base64".len()..].eq_ignore_ascii_case(b";base64")
+}
+
+fn is_data_url(value: &str) -> bool {
+    value
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
 }
 
 fn validate_text_citations(part: &Value, label: &str) -> Result<(), ApiError> {
@@ -860,22 +1084,21 @@ fn validate_optional_document_metadata(part: &Value, label: &str) -> Result<(), 
     Ok(())
 }
 
-fn validate_document(part: &Value, label: &str) -> Result<bool, ApiError> {
+fn validate_document(
+    part: &Value,
+    label: &str,
+    file_map: &HashMap<String, String>,
+) -> Result<bool, ApiError> {
     validate_optional_document_metadata(part, label)?;
     let source = part
         .get("source")
         .and_then(Value::as_object)
         .ok_or_else(|| invalid(format!("{label}.source must be an object")))?;
     match source.get("type").and_then(Value::as_str) {
-        Some("file") => {
-            return Err(invalid(format!(
-                "{label}.source.type \"file\" is provider-owned and cannot be translated to an OpenAI file id"
-            )));
-        }
+        Some("file") => validate_mapped_file_source(source, label, file_map)?,
         Some("base64") => {
             let data = source.get("data").and_then(Value::as_str);
-            let self_describing =
-                data.is_some_and(|data| data.starts_with("data:") && data.contains(";base64,"));
+            let self_describing = data.is_some_and(is_base64_data_url);
             let has_media = source
                 .get("media_type")
                 .and_then(Value::as_str)
@@ -926,6 +1149,7 @@ fn validate_document(part: &Value, label: &str) -> Result<bool, ApiError> {
                         Some("image") => validate_image_with_label(
                             block,
                             &format!("{label}.source.content[{index}]"),
+                            file_map,
                         )?,
                         Some(kind) if !kind.is_empty() => {}
                         _ => {
@@ -952,19 +1176,20 @@ fn validate_document(part: &Value, label: &str) -> Result<bool, ApiError> {
     Ok(part.pointer("/citations/enabled").and_then(Value::as_bool) == Some(true))
 }
 
-fn validate_image_with_label(part: &Value, label: &str) -> Result<(), ApiError> {
+fn validate_image_with_label(
+    part: &Value,
+    label: &str,
+    file_map: &HashMap<String, String>,
+) -> Result<(), ApiError> {
     let source = part
         .get("source")
         .and_then(Value::as_object)
         .ok_or_else(|| invalid(format!("{label}.source must be an object")))?;
     match source.get("type").and_then(Value::as_str) {
-        Some("file") => Err(invalid(format!(
-            "{label}.source.type \"file\" is provider-owned and cannot be translated to an OpenAI file id"
-        ))),
+        Some("file") => validate_mapped_file_source(source, label, file_map),
         Some("base64") => {
             let data = source.get("data").and_then(Value::as_str);
-            let self_describing =
-                data.is_some_and(|data| data.starts_with("data:") && data.contains(";base64,"));
+            let self_describing = data.is_some_and(is_base64_data_url);
             let has_media = source
                 .get("media_type")
                 .and_then(Value::as_str)
@@ -1045,7 +1270,11 @@ fn validate_search_result(part: &Value, label: &str) -> Result<bool, ApiError> {
     Ok(part.pointer("/citations/enabled").and_then(Value::as_bool) == Some(true))
 }
 
-fn validate_tool_result_content(content: Option<&Value>, label: &str) -> Result<bool, ApiError> {
+fn validate_tool_result_content(
+    content: Option<&Value>,
+    label: &str,
+    file_map: &HashMap<String, String>,
+) -> Result<bool, ApiError> {
     let Some(content) = content else {
         return Ok(false);
     };
@@ -1075,11 +1304,11 @@ fn validate_tool_result_content(content: Option<&Value>, label: &str) -> Result<
             }
             Some("image") => {
                 has_other_visible_content = true;
-                validate_image_with_label(block, &block_label)?;
+                validate_image_with_label(block, &block_label, file_map)?;
             }
             Some("document") => {
                 has_other_visible_content = true;
-                has_citations |= validate_document(block, &block_label)?;
+                has_citations |= validate_document(block, &block_label, file_map)?;
             }
             Some("search_result") => {
                 has_search_result = true;
@@ -1241,14 +1470,21 @@ fn expand_system_blocks(parts: &[Value]) -> Vec<&Value> {
     expanded
 }
 
-fn convert_image(part: &Value) -> Option<Value> {
+fn convert_image(part: &Value, file_map: &HashMap<String, String>) -> Option<Value> {
     let source = part.get("source")?;
     let source_type = source.get("type")?.as_str()?;
+    if source_type == "file" {
+        let mapped = source
+            .get("file_id")
+            .and_then(Value::as_str)
+            .and_then(|file_id| file_map.get(file_id))?;
+        return Some(json!({"type":"image_file","image_file":{"file_id":mapped}}));
+    }
     let url = match source_type {
         "url" => source.get("url")?.as_str()?.to_owned(),
         "base64" => {
             let data = source.get("data")?.as_str()?;
-            if data.starts_with("data:") && data.contains(";base64,") {
+            if is_base64_data_url(data) {
                 data.to_owned()
             } else {
                 format!(
@@ -1265,7 +1501,7 @@ fn convert_image(part: &Value) -> Option<Value> {
     Some(json!({"type":"image_url","image_url":{"url":url}}))
 }
 
-fn convert_document_blocks(part: &Value) -> Vec<Value> {
+fn convert_document_blocks(part: &Value, file_map: &HashMap<String, String>) -> Vec<Value> {
     let Some(source) = part.get("source") else {
         return vec![json!({"type":"text","text":bounded_json(part)})];
     };
@@ -1278,7 +1514,7 @@ fn convert_document_blocks(part: &Value) -> Vec<Value> {
                     if content.get("type").and_then(Value::as_str) == Some("text") {
                         result.push(json!({"type":"text","text":content.get("text").and_then(Value::as_str).unwrap_or_default()}));
                     } else if content.get("type").and_then(Value::as_str) == Some("image") {
-                        result.push(convert_image(content).unwrap_or_else(
+                        result.push(convert_image(content, file_map).unwrap_or_else(
                             || json!({"type":"text","text":bounded_json(content)}),
                         ));
                     } else {
@@ -1303,12 +1539,22 @@ fn convert_document_blocks(part: &Value) -> Vec<Value> {
         });
     let mut file = json!({"filename":filename});
     match source.get("type").and_then(Value::as_str) {
+        Some("file") => {
+            let Some(mapped) = source
+                .get("file_id")
+                .and_then(Value::as_str)
+                .and_then(|file_id| file_map.get(file_id))
+            else {
+                return vec![json!({"type":"text","text":bounded_json(part)})];
+            };
+            file["file_id"] = Value::String(mapped.clone());
+        }
         Some("base64") => {
             let data = source
                 .get("data")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            file["file_data"] = Value::String(if data.starts_with("data:") {
+            file["file_data"] = Value::String(if is_data_url(data) {
                 data.to_owned()
             } else {
                 format!(
@@ -1362,6 +1608,7 @@ fn document_fallback(part: &Value) -> String {
         .map(|title| format!(" {}", serde_json::to_string(title).unwrap()))
         .unwrap_or_default();
     match source.get("type").and_then(Value::as_str) {
+        Some("file") => format!("[document{title}: mapped file]"),
         Some("url") => format!(
             "[document{title}: {}]",
             source
@@ -1417,7 +1664,11 @@ fn convert_search_result(part: &Value) -> Vec<Value> {
     result
 }
 
-fn convert_tool_result_content(content: Option<&Value>, is_error: bool) -> Value {
+fn convert_tool_result_content(
+    content: Option<&Value>,
+    is_error: bool,
+    file_map: &HashMap<String, String>,
+) -> Value {
     let mut result = Vec::new();
     if is_error {
         result.push(json!({"type":"text","text":TOOL_RESULT_ERROR_MARKER}));
@@ -1433,8 +1684,8 @@ fn convert_tool_result_content(content: Option<&Value>, is_error: bool) -> Value
                 }
                 match part.get("type").and_then(Value::as_str) {
                     Some("text") => result.push(json!({"type":"text","text":part.get("text").and_then(Value::as_str).unwrap_or_default()})),
-                    Some("image") => result.push(convert_image(part).unwrap_or_else(|| json!({"type":"text","text":bounded_json(part)}))),
-                    Some("document") => result.extend(convert_document_blocks(part)),
+                    Some("image") => result.push(convert_image(part, file_map).unwrap_or_else(|| json!({"type":"text","text":bounded_json(part)}))),
+                    Some("document") => result.extend(convert_document_blocks(part, file_map)),
                     Some("search_result") => result.extend(convert_search_result(part)),
                     _ => result.push(json!({"type":"text","text":bounded_json(part)})),
                 }
@@ -1477,12 +1728,19 @@ fn resolve_active_tools(tools: Option<&Value>, messages: &[Value]) -> Result<Vec
                 else {
                     continue;
                 };
-                let name = block
-                    .pointer("/tool/name")
+                let reference = block.get("tool").unwrap_or(&Value::Null);
+                let name = reference
+                    .get("name")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        invalid(format!("{kind} currently requires a named tool_reference"))
-                    })?;
+                    .filter(|name| !name.is_empty());
+                if reference.get("type").and_then(Value::as_str) != Some("tool_reference")
+                    || name.is_none()
+                {
+                    return Err(invalid(format!(
+                        "{kind} currently requires a named tool_reference; MCP tool-change references have no OpenAI function-tool equivalent"
+                    )));
+                }
+                let name = name.unwrap();
                 if !declared.contains_key(name) {
                     return Err(invalid(format!(
                         "{kind} references undeclared tool {}",
@@ -1771,7 +2029,7 @@ fn copy_if_present(
     source_key: &str,
     target_key: &str,
 ) {
-    if let Some(value) = source.get(source_key).filter(|value| !value.is_null()) {
+    if let Some(value) = source.get(source_key) {
         target.insert(target_key.into(), value.clone());
     }
 }
@@ -1813,9 +2071,136 @@ mod tests {
     #[test]
     fn enabled_thinking_requires_budget() {
         let error = transform_anthropic_request(&json!({
+            "model":"claude-test","max_tokens":32,
             "messages":[],"thinking":{"type":"enabled","budget_tokens":12}
         }))
         .unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn dynamic_tool_references_require_non_empty_tools() {
+        for messages in [
+            json!([
+                {"role":"user","content":"load tools"},
+                {"role":"system","content":[{
+                    "type":"tool_addition","tool":{"name":"lookup"}
+                }]},
+                {"role":"assistant","content":"ready"}
+            ]),
+            json!([{"role":"user","content":[{
+                "type":"tool_result","tool_use_id":"call_1","content":[{
+                    "type":"tool_reference","tool_name":"lookup"
+                }]
+            }]}]),
+        ] {
+            let error = transform_anthropic_request(&json!({
+                "model":"claude-test","max_tokens":32,"messages":messages
+            }))
+            .unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert_eq!(
+                error.message,
+                "tool changes and tool references require declared tools"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_required_request_scalars() {
+        for (body, message) in [
+            (
+                json!({"model":"","max_tokens":1,"messages":[]}),
+                "model must be a non-empty string",
+            ),
+            (
+                json!({"model":"m","max_tokens":1,"messages":{}}),
+                "messages must be an array",
+            ),
+            (
+                json!({"model":"m","max_tokens":-1,"messages":[]}),
+                "max_tokens must be a non-negative safe integer",
+            ),
+            (
+                json!({"model":"m","max_tokens":9007199254740992_u64,"messages":[]}),
+                "max_tokens must be a non-negative safe integer",
+            ),
+        ] {
+            let error = transform_anthropic_request(&body).unwrap_err();
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[test]
+    fn maps_metadata_and_service_tier_and_rejects_unsupported_fields() {
+        let result = transform_anthropic_request(&json!({
+            "model":"m","max_tokens":1,"messages":[],
+            "metadata":{"user_id":"user-1"},"service_tier":"standard_only"
+        }))
+        .unwrap();
+        assert_eq!(result["safety_identifier"], "user-1");
+        assert_eq!(result["service_tier"], "default");
+
+        for field in ["top_k", "cache_control", "inference_geo"] {
+            let mut body = json!({"model":"m","max_tokens":1,"messages":[]});
+            body[field] = json!(1);
+            let error = transform_anthropic_request(&body).unwrap_err();
+            assert_eq!(
+                error.message,
+                format!("{field} has no OpenAI protocol equivalent")
+            );
+        }
+
+        let error = transform_anthropic_request(&json!({
+            "model":"m","max_tokens":1,"messages":[],
+            "metadata":{"user_id":"x".repeat(513)}
+        }))
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            "metadata.user_id must be at most 512 characters"
+        );
+    }
+
+    #[test]
+    fn file_sources_require_explicit_mapping_and_never_leak_client_id() {
+        let request = json!({
+            "model":"m","max_tokens":1,"messages":[{"role":"user","content":[
+                {"type":"image","source":{"type":"file","file_id":"client-image"}},
+                {"type":"document","title":"report.pdf","source":{"type":"file","file_id":"client-doc"}}
+            ]}]
+        });
+        let error = transform_anthropic_request(&request).unwrap_err();
+        assert!(error.message.contains("has no X-Upstream-File-Map entry"));
+
+        let file_map = HashMap::from([
+            ("client-image".into(), "upstream-image".into()),
+            ("client-doc".into(), "upstream-doc".into()),
+        ]);
+        let result = transform_anthropic_request_with_file_map(&request, &file_map).unwrap();
+        assert_eq!(
+            result.pointer("/messages/0/content/0"),
+            Some(&json!({"type":"image_file","image_file":{"file_id":"upstream-image"}}))
+        );
+        assert_eq!(
+            result.pointer("/messages/0/content/1/file/file_id"),
+            Some(&json!("upstream-doc"))
+        );
+        assert!(!result.to_string().contains("client-image"));
+        assert!(!result.to_string().contains("client-doc"));
+    }
+
+    #[test]
+    fn preserves_case_insensitive_self_describing_data_urls() {
+        let result = transform_anthropic_request(&json!({
+            "model":"m","max_tokens":1,"messages":[{"role":"user","content":[
+                {"type":"image","source":{"type":"base64","data":"DATA:image/png;BASE64,AA=="}}
+            ]}]
+        }))
+        .unwrap();
+        assert_eq!(
+            result.pointer("/messages/0/content/0/image_url/url"),
+            Some(&json!("DATA:image/png;BASE64,AA=="))
+        );
     }
 }

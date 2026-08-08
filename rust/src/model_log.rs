@@ -1,10 +1,19 @@
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
 use tokio::{fs, io::AsyncWriteExt};
 use tracing::{error, info};
 use url::Url;
+
+const MAX_BODY_READ_ERROR_CHARS: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogMode {
@@ -70,6 +79,10 @@ fn parse_integer(name: &str, default: u64, minimum: u64) -> Result<u64, String> 
 pub struct ModelInteractionLogger {
     config: Arc<ModelLogConfig>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
+    pending_writes: Arc<AtomicUsize>,
+    writes_drained: Arc<tokio::sync::Notify>,
+    last_error_log_second: Arc<AtomicU64>,
+    suppressed_errors: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +100,10 @@ impl ModelInteractionLogger {
         Ok(Self {
             config: Arc::new(ModelLogConfig::from_env()?),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pending_writes: Arc::new(AtomicUsize::new(0)),
+            writes_drained: Arc::new(tokio::sync::Notify::new()),
+            last_error_log_second: Arc::new(AtomicU64::new(0)),
+            suppressed_errors: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -99,6 +116,10 @@ impl ModelInteractionLogger {
                 max_body_bytes: 1024 * 1024,
             }),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pending_writes: Arc::new(AtomicUsize::new(0)),
+            writes_drained: Arc::new(tokio::sync::Notify::new()),
+            last_error_log_second: Arc::new(AtomicU64::new(0)),
+            suppressed_errors: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -108,7 +129,7 @@ impl ModelInteractionLogger {
             return;
         }
         if let Err(cause) = fs::create_dir_all(&self.config.directory).await {
-            error!(error = %cause, "model interaction logging initialization failed; forwarding is unaffected");
+            self.log_io_error("initialization", &cause);
             return;
         }
         self.cleanup_expired().await;
@@ -201,6 +222,7 @@ impl ModelInteractionLogger {
             captured: Vec::new(),
             total: 0,
             finished: false,
+            body_read_error: None,
         }
     }
 
@@ -216,12 +238,59 @@ impl ModelInteractionLogger {
 
     fn append(&self, entry: Value) {
         let logger = self.clone();
+        logger.pending_writes.fetch_add(1, Ordering::AcqRel);
         tokio::spawn(async move {
             let _guard = logger.write_lock.lock().await;
             if let Err(cause) = append_entry(&logger.config, &entry).await {
-                error!(error = %cause, "model interaction logging failed; forwarding is unaffected");
+                logger.log_io_error("append", &cause);
             }
+            logger.pending_writes.fetch_sub(1, Ordering::AcqRel);
+            logger.writes_drained.notify_waiters();
         });
+    }
+
+    /// Waits for every write scheduled before or during the wait to finish.
+    /// The server calls this after graceful HTTP shutdown, when no request can
+    /// enqueue another interaction entry.
+    pub async fn flush(&self) {
+        loop {
+            let drained = self.writes_drained.notified();
+            if self.pending_writes.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            drained.await;
+        }
+    }
+
+    fn log_io_error(&self, operation: &'static str, cause: &std::io::Error) {
+        const THROTTLE_SECONDS: u64 = 60;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut previous = self.last_error_log_second.load(Ordering::Relaxed);
+        loop {
+            if previous != 0 && now.saturating_sub(previous) < THROTTLE_SECONDS {
+                self.suppressed_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            match self.last_error_log_second.compare_exchange_weak(
+                previous,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => previous = actual,
+            }
+        }
+        let suppressed = self.suppressed_errors.swap(0, Ordering::Relaxed);
+        error!(
+            error = %cause,
+            operation,
+            suppressed,
+            "model interaction logging failed; forwarding is unaffected"
+        );
     }
 
     async fn cleanup_expired(&self) {
@@ -229,7 +298,7 @@ impl ModelInteractionLogger {
         let mut entries = match fs::read_dir(&self.config.directory).await {
             Ok(entries) => entries,
             Err(cause) => {
-                error!(error = %cause, "model interaction log cleanup failed; forwarding is unaffected");
+                self.log_io_error("cleanup", &cause);
                 return;
             }
         };
@@ -247,7 +316,7 @@ impl ModelInteractionLogger {
             if date < cutoff
                 && let Err(cause) = fs::remove_file(entry.path()).await
             {
-                error!(error = %cause, "model interaction log cleanup failed; forwarding is unaffected");
+                self.log_io_error("cleanup", &cause);
             }
         }
     }
@@ -261,6 +330,7 @@ pub struct StreamingCapture {
     captured: Vec<u8>,
     total: usize,
     finished: bool,
+    body_read_error: Option<String>,
 }
 
 impl StreamingCapture {
@@ -280,6 +350,13 @@ impl StreamingCapture {
         self.finished = true;
     }
 
+    /// Marks an upstream body read failure. Dropping the capture will record
+    /// this separately from a downstream cancellation while keeping the error
+    /// text bounded for operational logs.
+    pub fn mark_read_error(&mut self, message: &str) {
+        self.body_read_error = Some(bound_body_read_error(message));
+    }
+
     fn record(&self, complete: bool) {
         if !self.logger.config.enabled() {
             return;
@@ -295,7 +372,11 @@ impl StreamingCapture {
         entry["duration_ms"] = json!(self.exchange.started_at.elapsed().as_millis() as u64);
         entry["complete"] = json!(complete);
         if !complete {
-            entry["body_cancelled"] = json!(true);
+            if let Some(error) = self.body_read_error.as_ref() {
+                entry["body_read_error"] = Value::String(error.clone());
+            } else {
+                entry["body_cancelled"] = json!(true);
+            }
         }
         add_body(
             &mut entry,
@@ -306,6 +387,19 @@ impl StreamingCapture {
         );
         self.logger.append(entry);
     }
+}
+
+fn bound_body_read_error(message: &str) -> String {
+    let mut chars = message.chars();
+    let mut bounded = chars
+        .by_ref()
+        .take(MAX_BODY_READ_ERROR_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        bounded.pop();
+        bounded.push('…');
+    }
+    bounded
 }
 
 impl Drop for StreamingCapture {
@@ -419,6 +513,10 @@ mod tests {
                 max_body_bytes: 8,
             }),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pending_writes: Arc::new(AtomicUsize::new(0)),
+            writes_drained: Arc::new(tokio::sync::Notify::new()),
+            last_error_log_second: Arc::new(AtomicU64::new(0)),
+            suppressed_errors: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -478,18 +576,12 @@ mod tests {
                 "sequence":sequence
             }));
         }
+        logger.flush().await;
         let path = directory.join(format!(
             "model-interactions-{}.ndjson",
             Utc::now().format("%Y-%m-%d")
         ));
-        let mut text = String::new();
-        for _ in 0..200 {
-            text = fs::read_to_string(&path).await.unwrap_or_default();
-            if text.lines().count() == 128 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        let text = fs::read_to_string(&path).await.unwrap();
         let lines = text.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 128);
         for line in lines {
@@ -527,6 +619,38 @@ mod tests {
         }
         assert_eq!(model_files, 7);
         assert!(unrelated);
+        fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_read_error_is_bounded_and_not_logged_as_cancellation() {
+        let directory =
+            std::env::temp_dir().join(format!("ocr-model-log-{}", uuid::Uuid::new_v4()));
+        let logger = test_logger(directory.clone(), LogMode::Metadata, 7);
+        let exchange = Exchange {
+            request_id: "read-error".into(),
+            upstream_url: "https://upstream.example.com/v1".into(),
+            format: "responses".into(),
+            model: None,
+            stream: true,
+            started_at: Instant::now(),
+        };
+        let mut capture = logger.streaming_capture(exchange, 200, json!({}));
+        capture.push(b"partial");
+        capture.mark_read_error(&"x".repeat(MAX_BODY_READ_ERROR_CHARS + 100));
+        drop(capture);
+        logger.flush().await;
+
+        let path = directory.join(format!(
+            "model-interactions-{}.ndjson",
+            Utc::now().format("%Y-%m-%d")
+        ));
+        let entry: Value = serde_json::from_str(&fs::read_to_string(path).await.unwrap()).unwrap();
+        assert_eq!(entry["complete"], false);
+        assert!(entry.get("body_cancelled").is_none());
+        let read_error = entry["body_read_error"].as_str().unwrap();
+        assert_eq!(read_error.chars().count(), MAX_BODY_READ_ERROR_CHARS);
+        assert!(read_error.ends_with('…'));
         fs::remove_dir_all(&directory).await.unwrap();
     }
 }
