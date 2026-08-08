@@ -73,15 +73,19 @@ jobs:
           provenance: false
           sbom: false
 
-      - name: Run container smoke test
+      - name: Run container and legacy log mount smoke test
         shell: bash
         env:
           IMAGE_TAG: open-claude-router:image-check-${{ matrix.artifact }}
         run: |
+          log_dir="$(mktemp -d)"
+          chmod 0750 "${log_dir}"
+          sudo chown root:root "${log_dir}"
+
           container_id="$(docker run --detach --rm \
             --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=16m \
-            --tmpfs /app/logs:rw,noexec,nosuid,size=16m \
+            --volume "${log_dir}:/app/logs" \
             --publish 127.0.0.1::3457 \
             --env OCR_MODEL_LOG_MODE=off \
             "${IMAGE_TAG}")"
@@ -94,7 +98,12 @@ jobs:
           for attempt in $(seq 1 30); do
             if response="$(curl --fail --silent --show-error "http://127.0.0.1:${host_port}/healthz")"; then
               test "${response}" = '{"status":"ok"}'
-              docker inspect --format '{{.Config.User}}' "${container_id}" | grep -Fxq '65532:65532'
+              test -z "$(docker inspect --format '{{.Config.User}}' "${container_id}")"
+              docker exec "${container_id}" sh -ceu '
+                test "$(id -u)" = "0"
+                touch /app/logs/.legacy-bind-write-check
+              '
+              test "$(sudo stat -c '%u:%g' "${log_dir}/.legacy-bind-write-check")" = "0:0"
               exit 0
             fi
             sleep 1

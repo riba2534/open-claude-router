@@ -15,8 +15,7 @@ COPY LICENSE ./LICENSE
 ENV PORT=3457
 ENV HOST=0.0.0.0
 ENV RUST_LOG=info
-RUN mkdir -p /app/logs && chown 65532:65532 /app/logs
+RUN mkdir -p /app/logs
 VOLUME ["/app/logs"]
 EXPOSE 3457
-USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/open-claude-router"]
