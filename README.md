@@ -10,6 +10,7 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.97+-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust" /></a>
+  <a href="https://github.com/riba2534/open-claude-router/releases/latest"><img src="https://img.shields.io/github/v/release/riba2534/open-claude-router?style=for-the-badge&color=2ea44f" alt="GitHub Release" /></a>
   <a href="https://hub.docker.com/r/riba2534/open-claude-router"><img src="https://img.shields.io/docker/pulls/riba2534/open-claude-router?style=for-the-badge&color=2496ED&logo=docker&logoColor=white" alt="Docker Pulls" /></a>
   <a href="https://github.com/riba2534/open-claude-router/stargazers"><img src="https://img.shields.io/github/stars/riba2534/open-claude-router?style=for-the-badge&color=f5a623" alt="Stars" /></a>
   <a href="https://github.com/riba2534/open-claude-router/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-teal.svg?style=for-the-badge" alt="License" /></a>
@@ -71,7 +72,11 @@ flowchart LR
 
 ### 1. 启动服务
 
-推荐用 Docker 一键启动（镜像在 [Dockerhub](https://hub.docker.com/r/riba2534/open-claude-router)，amd64 + arm64 双架构）：
+可以使用 Docker，也可以直接下载单个 Rust 可执行文件在本机运行。
+
+#### Docker
+
+镜像发布在 [Docker Hub](https://hub.docker.com/r/riba2534/open-claude-router)，支持 amd64 + arm64：
 
 ```bash
 docker pull riba2534/open-claude-router:latest
@@ -89,6 +94,50 @@ curl http://localhost:3457/healthz   # 预期 {"status":"ok"}
 ```
 
 > 端口被占用时改宿主端口即可，例如 `-p 13457:3457`，并把下面 alias 里的 `localhost:3457` 同步改成 `localhost:13457`。
+
+#### 预编译二进制
+
+每个稳定版本都会在 [GitHub Releases](https://github.com/riba2534/open-claude-router/releases) 提供以下归档，不需要安装 Rust：
+
+| 系统 | amd64 / x86-64 | arm64 / Apple Silicon |
+|---|---|---|
+| Linux | `linux-amd64.tar.gz`（静态 musl） | `linux-arm64.tar.gz`（静态 musl） |
+| macOS | `macos-amd64.tar.gz` | `macos-arm64.tar.gz` |
+| Windows | `windows-amd64.zip` | `windows-arm64.zip` |
+
+完整文件名格式为 `open-claude-router-vX.Y.Z-<平台>.tar.gz` 或 `.zip`。Release 同时提供 `SHA256SUMS`，建议在运行前校验下载文件。
+
+Linux / macOS：
+
+```bash
+# 把版本和平台替换成 Release 页面中的实际值
+VERSION=v0.6.5
+PLATFORM=linux-amd64
+ARCHIVE="open-claude-router-${VERSION}-${PLATFORM}.tar.gz"
+
+curl -fLO "https://github.com/riba2534/open-claude-router/releases/download/${VERSION}/${ARCHIVE}"
+curl -fLO "https://github.com/riba2534/open-claude-router/releases/download/${VERSION}/SHA256SUMS"
+
+# Linux 校验；macOS 可改用：grep " ${ARCHIVE}$" SHA256SUMS | shasum -a 256 -c -
+grep " ${ARCHIVE}$" SHA256SUMS | sha256sum -c -
+tar -xzf "${ARCHIVE}"
+cd "open-claude-router-${VERSION}-${PLATFORM}"
+./open-claude-router
+```
+
+Windows PowerShell：
+
+```powershell
+$Version = "v0.6.5"
+$Platform = "windows-amd64" # Windows on ARM 使用 windows-arm64
+$Archive = "open-claude-router-$Version-$Platform.zip"
+
+Invoke-WebRequest "https://github.com/riba2534/open-claude-router/releases/download/$Version/$Archive" -OutFile $Archive
+Expand-Archive $Archive
+& ".\open-claude-router-$Version-$Platform\open-claude-router.exe"
+```
+
+二进制默认监听 `0.0.0.0:3457`，模型交互日志写到当前目录的 `./logs`；端口、鉴权和日志配置与 Docker 版本使用相同的[环境变量](#环境变量)。macOS/Windows 产物目前没有商业代码签名；如系统拦截，请先用 `SHA256SUMS` 验证文件确实来自本项目 Release，再按系统提示放行。
 
 <details>
 <summary>开发者：本地裸跑</summary>
@@ -226,9 +275,14 @@ cargo build --locked --release --manifest-path rust/Cargo.toml
 
 协议改动必须同时增加对应的 Rust 单元测试或 `rust/tests/router_contract.rs` HTTP 契约测试。测试 fixture 不得写入真实 endpoint、模型名或凭证。
 
-### 发布 Docker 镜像
+### 发布版本
 
-推送版本 tag 时，GitHub Actions 会自动执行 Rust fmt/clippy/test 和 release 构建，通过后发布 `linux/amd64`、`linux/arm64` 多架构镜像并校验 manifest / attestations。发布前须在仓库 Actions secrets 配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`；tag 必须是 SemVer（可带 `v` 前缀），且必须与 `rust/Cargo.toml` 一致。使用 annotated tag，并显式推送该 tag：
+推送版本 tag 时，GitHub Actions 会自动执行 Rust fmt/clippy/test 和 release 构建。验证通过后会同时发布：
+
+- Docker Hub `linux/amd64`、`linux/arm64` 多架构镜像，并校验 manifest / attestations；
+- GitHub Release 的 Linux、macOS、Windows amd64/arm64 六个二进制归档和 `SHA256SUMS`。
+
+所有产物都在对应架构的 GitHub 托管 Runner 上原生编译，不使用 QEMU。发布前须在仓库 Actions secrets 配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`；tag 必须是 SemVer（可带 `v` 前缀），且必须与 `rust/Cargo.toml` 一致。使用 annotated tag，并显式推送该 tag：
 
 镜像构建只能在该 GitHub Actions 流程中进行；开发机和部署机不得本地构建镜像，只能使用 `docker pull` 拉取工作流发布的 tag 或 digest。
 

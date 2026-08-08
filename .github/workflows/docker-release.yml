@@ -1,15 +1,16 @@
-name: Publish Docker image
+name: Publish release
 
 on:
   push:
     tags:
       - "*"
+  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: docker-release-${{ github.ref }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -20,24 +21,38 @@ jobs:
     name: Validate Rust release
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      release_version: ${{ steps.version.outputs.release_version }}
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Validate tag and Cargo version
+        id: version
         shell: bash
         run: |
-          tag_version="${GITHUB_REF_NAME#v}"
           cargo_version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' rust/Cargo.toml | head -n 1)"
           semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
-          if [[ ! "${tag_version}" =~ ${semver_re} ]]; then
-            echo "Release tag must be SemVer, optionally prefixed with v." >&2
+          if [[ ! "${cargo_version}" =~ ${semver_re} ]]; then
+            echo "rust/Cargo.toml version must be SemVer." >&2
             exit 1
           fi
-          if [[ "${tag_version}" != "${cargo_version}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match rust/Cargo.toml version ${cargo_version}." >&2
-            exit 1
+
+          if [[ "${GITHUB_EVENT_NAME}" = "push" ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [[ ! "${tag_version}" =~ ${semver_re} ]]; then
+              echo "Release tag must be SemVer, optionally prefixed with v." >&2
+              exit 1
+            fi
+            if [[ "${tag_version}" != "${cargo_version}" ]]; then
+              echo "Tag ${GITHUB_REF_NAME} does not match rust/Cargo.toml version ${cargo_version}." >&2
+              exit 1
+            fi
+            release_version="${GITHUB_REF_NAME}"
+          else
+            release_version="v${cargo_version}"
           fi
+          echo "release_version=${release_version}" >> "${GITHUB_OUTPUT}"
 
       - name: Install Rust toolchain
         shell: bash
@@ -57,8 +72,209 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --manifest-path rust/Cargo.toml
 
+  build-binaries:
+    name: Build binary for ${{ matrix.platform }} natively
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            runner_arch: X64
+            target: x86_64-unknown-linux-musl
+            artifact: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            runner_arch: ARM64
+            target: aarch64-unknown-linux-musl
+            artifact: linux-arm64
+          - platform: macos/amd64
+            runner: macos-26-intel
+            runner_arch: X64
+            target: x86_64-apple-darwin
+            artifact: macos-amd64
+          - platform: macos/arm64
+            runner: macos-26
+            runner_arch: ARM64
+            target: aarch64-apple-darwin
+            artifact: macos-arm64
+          - platform: windows/amd64
+            runner: windows-2025
+            runner_arch: X64
+            target: x86_64-pc-windows-msvc
+            artifact: windows-amd64
+          - platform: windows/arm64
+            runner: windows-11-arm
+            runner_arch: ARM64
+            target: aarch64-pc-windows-msvc
+            artifact: windows-arm64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Confirm native Unix runner architecture
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.runner_arch }}
+        run: test "${RUNNER_ARCH}" = "${EXPECTED_ARCH}"
+
+      - name: Confirm native Windows runner architecture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          EXPECTED_ARCH: ${{ matrix.runner_arch }}
+        run: |
+          if ($env:RUNNER_ARCH -ne $env:EXPECTED_ARCH) {
+            throw "Expected $env:EXPECTED_ARCH runner, got $env:RUNNER_ARCH"
+          }
+
+      - name: Install Rust toolchain on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+          rustup target add "${TARGET}"
+
+      - name: Install Rust toolchain on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+          rustup target add $env:TARGET
+
+      - name: Install musl tools
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
+      - name: Build Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --manifest-path rust/Cargo.toml --target "${TARGET}"
+
+      - name: Build Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --manifest-path rust/Cargo.toml --target $env:TARGET
+
+      - name: Smoke test Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          binary="rust/target/${TARGET}/release/open-claude-router"
+          test -x "${binary}"
+          if [[ "${RUNNER_OS}" = "Linux" ]]; then
+            file "${binary}" | grep -Eq 'statically linked|static-pie linked'
+          fi
+
+          OCR_MODEL_LOG_MODE=off PORT=3457 "${binary}" >"${RUNNER_TEMP}/binary.log" 2>&1 &
+          server_pid=$!
+          cleanup() {
+            kill "${server_pid}" >/dev/null 2>&1 || true
+            wait "${server_pid}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for attempt in $(seq 1 30); do
+            if response="$(curl --fail --silent --show-error http://127.0.0.1:3457/healthz)"; then
+              test "${response}" = '{"status":"ok"}'
+              exit 0
+            fi
+            sleep 1
+          done
+
+          cat "${RUNNER_TEMP}/binary.log" >&2
+          exit 1
+
+      - name: Smoke test Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $binary = "rust/target/$env:TARGET/release/open-claude-router.exe"
+          if (-not (Test-Path $binary)) { throw "Missing binary: $binary" }
+          $env:OCR_MODEL_LOG_MODE = "off"
+          $env:PORT = "3457"
+          $process = Start-Process -FilePath $binary -PassThru -NoNewWindow `
+            -RedirectStandardOutput "$env:RUNNER_TEMP/binary.stdout.log" `
+            -RedirectStandardError "$env:RUNNER_TEMP/binary.stderr.log"
+          try {
+            foreach ($attempt in 1..30) {
+              try {
+                $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:3457/healthz"
+                if ($response.StatusCode -eq 200 -and $response.Content -eq '{"status":"ok"}') { exit 0 }
+              } catch {}
+              Start-Sleep -Seconds 1
+            }
+            Get-Content "$env:RUNNER_TEMP/binary.stdout.log" -ErrorAction SilentlyContinue
+            Get-Content "$env:RUNNER_TEMP/binary.stderr.log" -ErrorAction SilentlyContinue
+            throw "Binary health check failed"
+          } finally {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          package_name="open-claude-router-${RELEASE_VERSION}-${ARTIFACT}"
+          package_dir="${RUNNER_TEMP}/package/${package_name}"
+          release_dir="${RUNNER_TEMP}/release"
+          mkdir -p "${package_dir}" "${release_dir}"
+          cp "rust/target/${TARGET}/release/open-claude-router" "${package_dir}/"
+          cp LICENSE README.md "${package_dir}/"
+          tar -C "$(dirname "${package_dir}")" -czf "${release_dir}/${package_name}.tar.gz" "${package_name}"
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $packageName = "open-claude-router-$env:RELEASE_VERSION-$env:ARTIFACT"
+          $packageDir = Join-Path $env:RUNNER_TEMP "package/$packageName"
+          $releaseDir = Join-Path $env:RUNNER_TEMP "release"
+          New-Item -ItemType Directory -Force -Path $packageDir, $releaseDir | Out-Null
+          Copy-Item "rust/target/$env:TARGET/release/open-claude-router.exe" $packageDir
+          Copy-Item LICENSE, README.md $packageDir
+          Compress-Archive -Path $packageDir -DestinationPath (Join-Path $releaseDir "$packageName.zip")
+
+      - name: Upload binary archive
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          retention-days: 1
+
   build:
     name: Build ${{ matrix.platform }} natively
+    if: github.event_name == 'push'
     needs: validate
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -129,6 +345,7 @@ jobs:
 
   publish:
     name: Publish multi-platform manifest
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -232,4 +449,61 @@ jobs:
           if (( attestations < 2 )); then
             echo "Published manifest is missing per-platform attestations." >&2
             exit 1
+          fi
+
+  github-release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push'
+    needs:
+      - build-binaries
+      - publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download binary archives
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/release
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        env:
+          RELEASE_DIR: ${{ runner.temp }}/release
+        run: |
+          archive_count="$(find "${RELEASE_DIR}" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)"
+          test "${archive_count}" = "6"
+          (
+            cd "${RELEASE_DIR}"
+            sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+          )
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_DIR: ${{ runner.temp }}/release
+        run: |
+          shopt -s nullglob
+          assets=("${RELEASE_DIR}"/*.tar.gz "${RELEASE_DIR}"/*.zip "${RELEASE_DIR}/SHA256SUMS")
+          if (( ${#assets[@]} != 7 )); then
+            echo "Expected six archives and SHA256SUMS, found ${#assets[@]} assets." >&2
+            exit 1
+          fi
+
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
+          else
+            declare -a release_args=(
+              "${GITHUB_REF_NAME}"
+              "${assets[@]}"
+              --verify-tag
+              --title "open-claude-router ${GITHUB_REF_NAME}"
+              --generate-notes
+            )
+            if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+              release_args+=(--prerelease)
+            fi
+            gh release create "${release_args[@]}"
           fi
