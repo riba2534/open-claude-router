@@ -247,15 +247,15 @@ npm run test:live
 ```bash
 git switch main
 git pull --ff-only origin main
-test "$(node -p 'require("./package.json").version')" = "0.6.0"
-test "$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' rust/Cargo.toml | head -n 1)" = "0.6.0"
+test "$(node -p 'require("./package.json").version')" = "0.6.1"
+test "$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' rust/Cargo.toml | head -n 1)" = "0.6.1"
 test -z "$(git status --porcelain)"
-git tag -a v0.6.0 -m "release: 0.6.0"
+git tag -a v0.6.1 -m "release: 0.6.1"
 git push origin main
-git push origin refs/tags/v0.6.0
+git push origin refs/tags/v0.6.1
 ```
 
-稳定版本会发布 `0.6.0`、`0.6` 和 `latest`；预发布版本不会覆盖 `latest`。
+稳定版本会发布 `0.6.1`、`0.6` 和 `latest`；预发布版本不会覆盖 `latest`。
 
 ## API
 
