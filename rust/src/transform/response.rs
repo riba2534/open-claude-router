@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{bounded_json, ensure_text_block_citations, protocol_error};
+use super::{bounded_json, protocol_error};
 use crate::{
     error::{ApiError, error_type_for_status, status_from_openai_error},
     sse::format_sse_event,
@@ -50,7 +50,6 @@ pub fn transform_chat_json_response(
     let is_refusal = finish_reason == Some("content_filter") || !refusal_text.is_empty();
     let incomplete = finish_reason == Some("length") || is_refusal;
     let mut content = Vec::new();
-    let mut malformed_call = false;
 
     if let Some(blocks) = message.get("output_blocks").and_then(Value::as_array) {
         for block in blocks {
@@ -80,19 +79,14 @@ pub fn transform_chat_json_response(
                         content.push(incomplete_tool_diagnostic(name, block.get("input")));
                         continue;
                     }
-                    match parse_tool_input(block.get("input")) {
-                        Ok(input) => content.push(json!({
-                            "type":"tool_use",
-                            "id":block.get("id").cloned().unwrap_or(Value::Null),
-                            "name":name,
-                            "input":input,
-                            "caller":{"type":"direct"}
-                        })),
-                        Err(_) => {
-                            malformed_call = true;
-                            content.push(incomplete_tool_diagnostic(name, block.get("input")));
-                        }
-                    }
+                    let input = parse_tool_input(block.get("input"))?;
+                    content.push(json!({
+                        "type":"tool_use",
+                        "id":block.get("id").cloned().unwrap_or(Value::Null),
+                        "name":name,
+                        "input":input,
+                        "caller":{"type":"direct"}
+                    }));
                 }
                 Some("server_tool_use" | "web_search_tool_result") => content.push(block.clone()),
                 _ => content.push(json!({"type":"text","text":bounded_json(block)})),
@@ -233,19 +227,14 @@ pub fn transform_chat_json_response(
                 if incomplete {
                     content.push(incomplete_tool_diagnostic(name, Some(&arguments)));
                 } else {
-                    match parse_tool_input(Some(&arguments)) {
-                        Ok(input) => content.push(json!({
-                            "type":"tool_use",
-                            "id":id,
-                            "name":name,
-                            "input":input,
-                            "caller":{"type":"direct"}
-                        })),
-                        Err(_) => {
-                            malformed_call = true;
-                            content.push(incomplete_tool_diagnostic(name, Some(&arguments)));
-                        }
-                    }
+                    let input = parse_tool_input(Some(&arguments))?;
+                    content.push(json!({
+                        "type":"tool_use",
+                        "id":id,
+                        "name":name,
+                        "input":input,
+                        "caller":{"type":"direct"}
+                    }));
                 }
             }
         } else if let Some(name) = message
@@ -256,19 +245,14 @@ pub fn transform_chat_json_response(
             if incomplete {
                 content.push(incomplete_tool_diagnostic(name, arguments.as_ref()));
             } else {
-                match parse_tool_input(arguments.as_ref()) {
-                    Ok(input) => content.push(json!({
-                        "type":"tool_use",
-                        "id":format!("call_{}",Uuid::new_v4()),
-                        "name":name,
-                        "input":input,
-                        "caller":{"type":"direct"}
-                    })),
-                    Err(_) => {
-                        malformed_call = true;
-                        content.push(incomplete_tool_diagnostic(name, arguments.as_ref()));
-                    }
-                }
+                let input = parse_tool_input(arguments.as_ref())?;
+                content.push(json!({
+                    "type":"tool_use",
+                    "id":format!("call_{}",Uuid::new_v4()),
+                    "name":name,
+                    "input":input,
+                    "caller":{"type":"direct"}
+                }));
             }
         }
         for orphan in thinking_by_call.into_values() {
@@ -276,26 +260,8 @@ pub fn transform_chat_json_response(
         }
     }
 
-    if malformed_call {
-        for block in &mut content {
-            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
-                continue;
-            }
-            let name = block
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_owned();
-            let raw = block.get("input").cloned().unwrap_or_else(|| json!({}));
-            *block = incomplete_tool_diagnostic(&name, Some(&raw));
-        }
-    }
-
-    ensure_text_block_citations(&mut content);
     let stop_reason = if is_refusal {
         "refusal"
-    } else if malformed_call {
-        "max_tokens"
     } else {
         match finish_reason {
             Some("stop") => "end_turn",
@@ -590,8 +556,8 @@ mod tests {
     }
 
     #[test]
-    fn malformed_completed_tool_is_non_executable_and_max_tokens() {
-        let result = transform_chat_json_response(
+    fn malformed_completed_tool_is_a_retryable_protocol_error() {
+        let error = transform_chat_json_response(
             &json!({
                 "choices":[{"message":{"role":"assistant","tool_calls":[{
                     "id":"call_1","type":"function",
@@ -600,22 +566,13 @@ mod tests {
             }),
             false,
         )
-        .unwrap();
-        assert_eq!(result["stop_reason"], "max_tokens");
-        assert_eq!(result.pointer("/content/0/type"), Some(&json!("text")));
-        assert!(
-            result
-                .pointer("/content/0/text")
-                .and_then(Value::as_str)
-                .is_some_and(|text| text == "[incomplete tool_use lookup: {broken]")
+        .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            error.message,
+            "upstream tool arguments must be a valid JSON object"
         );
-        assert!(
-            result["content"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|block| block["type"] != "tool_use")
-        );
+        assert!(error.retryable);
     }
 
     #[test]

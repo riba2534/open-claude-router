@@ -2,9 +2,7 @@ mod request;
 mod response;
 mod responses;
 
-pub use request::{
-    prepare_chat_request, transform_anthropic_request, transform_anthropic_request_with_file_map,
-};
+pub use request::{prepare_chat_request, transform_anthropic_request};
 pub use response::{
     anthropic_content_block_to_sse, anthropic_json_to_sse, anthropic_terminal_to_sse,
     transform_chat_json_response,
@@ -49,17 +47,5 @@ fn bounded_json(value: &serde_json::Value) -> String {
             "[unsupported {block_type} block omitted: {} chars]",
             text.chars().count()
         )
-    }
-}
-
-fn ensure_text_block_citations(blocks: &mut [serde_json::Value]) {
-    for block in blocks {
-        if block.get("type").and_then(serde_json::Value::as_str) == Some("text")
-            && let Some(object) = block.as_object_mut()
-        {
-            object
-                .entry("citations".to_owned())
-                .or_insert(serde_json::Value::Null);
-        }
     }
 }

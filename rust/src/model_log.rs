@@ -14,6 +14,7 @@ use tracing::{error, info};
 use url::Url;
 
 const MAX_BODY_READ_ERROR_CHARS: usize = 1024;
+const MAX_PENDING_WRITES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogMode {
@@ -191,6 +192,29 @@ impl ModelInteractionLogger {
         bytes: &[u8],
         complete: bool,
     ) {
+        self.response_with_read_error(exchange, status, headers, bytes, complete, None);
+    }
+
+    pub fn response_read_error(
+        &self,
+        exchange: &Exchange,
+        status: u16,
+        headers: Value,
+        bytes: &[u8],
+        message: &str,
+    ) {
+        self.response_with_read_error(exchange, status, headers, bytes, false, Some(message));
+    }
+
+    fn response_with_read_error(
+        &self,
+        exchange: &Exchange,
+        status: u16,
+        headers: Value,
+        bytes: &[u8],
+        complete: bool,
+        read_error: Option<&str>,
+    ) {
         if !self.config.enabled() {
             return;
         }
@@ -204,6 +228,12 @@ impl ModelInteractionLogger {
         entry["headers"] = headers;
         entry["duration_ms"] = json!(exchange.started_at.elapsed().as_millis() as u64);
         entry["complete"] = json!(complete);
+        if let Some(message) = read_error {
+            entry["read_error"] = json!({
+                "name":"Error",
+                "message":bound_body_read_error(message)
+            });
+        }
         add_body(&mut entry, bytes, bytes.len(), &content_type, &self.config);
         self.append(entry);
     }
@@ -238,7 +268,22 @@ impl ModelInteractionLogger {
 
     fn append(&self, entry: Value) {
         let logger = self.clone();
-        logger.pending_writes.fetch_add(1, Ordering::AcqRel);
+        if logger
+            .pending_writes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                (pending < MAX_PENDING_WRITES).then_some(pending + 1)
+            })
+            .is_err()
+        {
+            logger.log_io_error(
+                "queue",
+                &std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "model interaction log queue is full; entry dropped",
+                ),
+            );
+            return;
+        }
         tokio::spawn(async move {
             let _guard = logger.write_lock.lock().await;
             if let Err(cause) = append_entry(&logger.config, &entry).await {
@@ -373,7 +418,7 @@ impl StreamingCapture {
         entry["complete"] = json!(complete);
         if !complete {
             if let Some(error) = self.body_read_error.as_ref() {
-                entry["body_read_error"] = Value::String(error.clone());
+                entry["read_error"] = json!({"name":"Error","message":error});
             } else {
                 entry["body_cancelled"] = json!(true);
             }
@@ -591,6 +636,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_write_queue_is_bounded_when_storage_stalls() {
+        let directory =
+            std::env::temp_dir().join(format!("ocr-model-log-{}", uuid::Uuid::new_v4()));
+        let logger = test_logger(directory.clone(), LogMode::Metadata, 7);
+        let guard = logger.write_lock.lock().await;
+        for sequence in 0..(MAX_PENDING_WRITES * 4) {
+            logger.append(json!({"event":"test","sequence":sequence}));
+        }
+        assert_eq!(
+            logger.pending_writes.load(Ordering::Acquire),
+            MAX_PENDING_WRITES
+        );
+        drop(guard);
+        logger.flush().await;
+        let path = directory.join(format!(
+            "model-interactions-{}.ndjson",
+            Utc::now().format("%Y-%m-%d")
+        ));
+        assert_eq!(
+            fs::read_to_string(&path).await.unwrap().lines().count(),
+            MAX_PENDING_WRITES
+        );
+        fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn cleanup_keeps_exact_utc_retention_window() {
         let directory =
             std::env::temp_dir().join(format!("ocr-model-log-{}", uuid::Uuid::new_v4()));
@@ -648,7 +719,7 @@ mod tests {
         let entry: Value = serde_json::from_str(&fs::read_to_string(path).await.unwrap()).unwrap();
         assert_eq!(entry["complete"], false);
         assert!(entry.get("body_cancelled").is_none());
-        let read_error = entry["body_read_error"].as_str().unwrap();
+        let read_error = entry["read_error"]["message"].as_str().unwrap();
         assert_eq!(read_error.chars().count(), MAX_BODY_READ_ERROR_CHARS);
         assert!(read_error.ends_with('…'));
         fs::remove_dir_all(&directory).await.unwrap();

@@ -3,7 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, State, rejection::BytesRejection},
     http::{HeaderMap, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -17,16 +17,16 @@ use crate::{
         Endpoint, UpstreamConfig, UpstreamFormat, apply_effort_controls, check_embedded_mode_auth,
         check_header_mode_auth, is_embedded_upstream_path, parse_access_tokens,
         parse_effort_levels, parse_effort_map, parse_embedded_upstream, parse_model_map,
-        parse_upstream_config, parse_upstream_file_map, parse_upstream_format,
-        parse_upstream_headers, resolve_upstream_model,
+        parse_upstream_config, parse_upstream_format, parse_upstream_headers,
+        resolve_upstream_model,
     },
     error::ApiError,
     model_log::{ModelInteractionLogger, selected_headers},
     sse::{aggregate_chat_sse, aggregate_responses_sse},
     streaming::{convert_chat_sse_stream, convert_responses_sse_stream},
-    tokenizer::{count_anthropic_tokens, validate_count_tokens_request},
+    tokenizer::count_anthropic_tokens,
     transform::{
-        anthropic_json_to_sse, prepare_chat_request, transform_anthropic_request_with_file_map,
+        anthropic_json_to_sse, prepare_chat_request, transform_anthropic_request,
         transform_chat_json_response, transform_responses_json, transform_responses_request,
     },
     upstream::{call_upstream, read_upstream_body, upstream_http_error},
@@ -85,8 +85,9 @@ pub fn build_app(state: Arc<AppState>) -> Router {
 async fn header_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
+    let body = extract_body(body)?;
     ensure_json_content_type(&headers)?;
     check_header_mode_auth(&headers, &state.access_tokens)?;
     let format = parse_upstream_format(&headers)?;
@@ -104,12 +105,12 @@ async fn header_messages(
 async fn header_count_tokens(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
+    let body = extract_body(body)?;
     ensure_json_content_type(&headers)?;
     check_header_mode_auth(&headers, &state.access_tokens)?;
     let payload = parse_json_body(&body)?;
-    validate_count_tokens_request(&payload)?;
     Ok(Json(json!({"input_tokens":count_anthropic_tokens(&payload)})).into_response())
 }
 
@@ -118,8 +119,9 @@ async fn fallback(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
+    let body = extract_body(body)?;
     if method != Method::POST || !is_embedded_upstream_path(&uri) {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -134,7 +136,6 @@ async fn fallback(
     let (mut upstream, endpoint) = parse_embedded_upstream(&uri, &headers)?;
     let payload = parse_json_body(&body)?;
     if endpoint == Endpoint::CountTokens {
-        validate_count_tokens_request(&payload)?;
         return Ok(Json(json!({"input_tokens":count_anthropic_tokens(&payload)})).into_response());
     }
     let model_map = parse_model_map(&headers)?;
@@ -144,6 +145,26 @@ async fn fallback(
         &model_map,
     );
     forward(state, headers, payload, format, upstream).await
+}
+
+fn extract_body(body: Result<Bytes, BytesRejection>) -> Result<Bytes, ApiError> {
+    body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                "request_too_large",
+                "Request body is too large",
+            )
+        } else {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid_body",
+                rejection.body_text(),
+            )
+        }
+    })
 }
 
 fn ensure_json_content_type(headers: &HeaderMap) -> Result<(), ApiError> {
@@ -204,8 +225,7 @@ async fn forward(
     let wants_stream = payload.get("stream").and_then(Value::as_bool) == Some(true);
     let omit_thinking =
         payload.pointer("/thinking/display").and_then(Value::as_str) == Some("omitted");
-    let file_map = parse_upstream_file_map(&headers)?;
-    let mut outbound = transform_anthropic_request_with_file_map(&payload, &file_map)?;
+    let mut outbound = transform_anthropic_request(&payload)?;
     if let Some(model) = upstream.model.as_ref() {
         outbound["model"] = Value::String(model.clone());
     }
@@ -221,14 +241,16 @@ async fn forward(
         .get("model")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
+    let request_id = uuid::Uuid::new_v4().to_string();
     info!(
+        request_id,
         model = outbound_model,
         stream = wants_stream,
         format = format.as_str(),
         "forwarding"
     );
     let exchange = state.model_logger.begin(
-        uuid::Uuid::new_v4().to_string(),
+        request_id,
         &upstream.url,
         format.as_str(),
         outbound.get("model").cloned(),
@@ -288,12 +310,12 @@ async fn forward(
     }
     let (response_bytes, read_error) = read_upstream_body(upstream_response).await;
     if let Some(error) = read_error {
-        state.model_logger.response(
+        state.model_logger.response_read_error(
             &exchange,
             response_status.as_u16(),
             response_headers,
             &response_bytes,
-            false,
+            &error,
         );
         if !response_status.is_success() {
             return Err(upstream_http_error(response_status, &response_bytes));

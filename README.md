@@ -74,6 +74,7 @@ flowchart LR
 推荐用 Docker 一键启动（镜像在 [Dockerhub](https://hub.docker.com/r/riba2534/open-claude-router)，amd64 + arm64 双架构）：
 
 ```bash
+docker pull riba2534/open-claude-router:latest
 docker run -d --name ocr --restart unless-stopped -p 3457:3457 \
   -v ocr-model-logs:/app/logs \
   riba2534/open-claude-router:latest
@@ -90,14 +91,10 @@ curl http://localhost:3457/healthz   # 预期 {"status":"ok"}
 > 端口被占用时改宿主端口即可，例如 `-p 13457:3457`，并把下面 alias 里的 `localhost:3457` 同步改成 `localhost:13457`。
 
 <details>
-<summary>开发者：自己构建 / 裸跑</summary>
+<summary>开发者：本地裸跑</summary>
 
 ```bash
-# 自己构建镜像
-docker build -t open-claude-router .
-docker run -d --name ocr --restart unless-stopped -p 3457:3457 open-claude-router
-
-# 或直接运行 Rust 服务
+# 直接运行 Rust 服务
 rustup toolchain install 1.97.1 --profile minimal
 cargo run --manifest-path rust/Cargo.toml
 
@@ -107,6 +104,8 @@ cargo build --locked --release --manifest-path rust/Cargo.toml
 ```
 
 仓库、测试和生产镜像均只包含 Rust 实现。
+
+> 镜像只能由仓库的 GitHub Actions 发布流程构建并推送。本机和部署机器禁止执行 `docker build` / `docker buildx build`，只允许拉取已发布镜像并做运行验证。
 </details>
 
 ### 2. 配置单行明文 alias（最推荐）
@@ -187,11 +186,11 @@ header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`�
 | 能力 | 默认（Chat Completions） | Responses API |
 |---|---|---|
 | 文本流式 SSE | ✅ 正式处理 multi-data、LF/CRLF/CR 与跨 chunk UTF-8；兼容 EOF trailing event | 同左 |
-| 工具调用（`tool_use` / `tool_result` 双向增量） | ✅ 含现代 `tool_calls` 并行工具；流式工具增量会先按调用缓冲，再输出合法的顺序 block；普通 OpenAI function call 返回为正式 `caller:{type:"direct"}`。同一终态中的任一并行调用 incomplete 或参数不是 JSON object 时，全部调用都降级为不可执行诊断 | ✅ 含并行工具，并采用相同的原子降级规则；历史 thinking/text/tool block 通过内部有序表示保真回放为 Responses items。`program` / `program_output`、programmatic/未知 caller，以及响应侧 `compaction` / `function_call_output` 都依赖无法映射的 hosted-runtime 状态，明确返回 502；caller 缺省或 `direct` 正常转换 |
-| 顶层多模态图片（base64 / URL / file） | ✅ 已知 source 精确映射为标准 `image_url`。Anthropic Files API 的 provider-owned `file_id` 只有在客户端通过 `X-Upstream-File-Map` 显式映射为当前上游自己的 file id 后，才转成 Chat `file` part；未映射本地 400，绝不盲传；已知但畸形的 source 返回 400，未来未知 source 有界文本降级；自描述 data URL 保留 | ✅ URL 转标准 `input_image.image_url`；显式映射后的 file id 转 `input_image.file_id`，同样不跨 provider 盲用 id，不按模型名猜视觉能力 |
+| 工具调用（`tool_use` / `tool_result` 双向增量） | ✅ 含现代 `tool_calls` 并行工具；流式工具增量会先按调用缓冲，再输出合法的顺序 block；普通 OpenAI function call 返回为正式 `caller:{type:"direct"}`。完整终态中的参数若不是 JSON object，按上游协议错误返回 retryable 502 | ✅ 含并行工具；历史 thinking/text/tool block 通过内部有序表示保真回放为 Responses items。`program` / `program_output`、programmatic/未知 caller，以及响应侧 `compaction` / `function_call_output` 都依赖无法映射的 hosted-runtime 状态，明确返回 502；caller 缺省或 `direct` 正常转换 |
+| 顶层多模态图片（base64 / URL / file） | ✅ base64 / URL 精确映射为标准 `image_url`；provider-owned `file_id` 无法跨上游安全复用，因此本地 400；已知但畸形的 source 返回 400，未来未知 source 有界文本降级；自描述 data URL 保留 | ✅ URL 转标准 `input_image.image_url`；provider-owned `file_id` 同样不跨 provider 盲传，不按模型名猜视觉能力 |
 | `tool_result` 中的图片 / 文件 | ⚠️ Chat 的 tool message 只能放文本；base64/URL 图片及可表示为 `file_data` 的文件会在整组 tool message 后转成标准 user 多模态 sidecar。单个多模态 tool result 依靠相邻顺序归属，不增加模型可见 marker；同批合并多个并行结果时，才在各组附件之后追加通用 provenance marker（工具序号 + 完整 ID 的可逆 UTF-16BE/base64url 编码）。视觉/文件输入得以保留，但 text/image 原始交错顺序仍会降级。URL-only 文件转有界文本；`is_error:true` 以前置的稳定 Router metadata marker 保留，false/缺省不改变内容 | ✅ `function_call_output.output` 原生保留 `input_text` / `input_image` / `input_file` 多 block 数组的顺序与归属；`is_error:true` marker 同样保留；纯文本保持 string 以兼容旧端点 |
 | 中途 `system` / 工具变更 | ✅ 普通 `messages[].role:"system"` 按正式位置规则保留为 system；direct block 与正式 `mid_conv_system` wrapper 都会展开；`defer_loading`、自定义客户端工具在 `tool_result` 返回的 `tool_reference`，以及 direct `tool_reference` 的 `tool_addition` / `tool_removal` 按历史顺序投影成当前生成应看到的最终工具子集，不把结构指令改成模型可见文本 | 同左；system content part 转正式 `input_text`。Anthropic server-owned tools（web search/fetch、code execution、advisor、tool search、MCP）及其历史块、MCP tool-change reference 没有通用 OpenAI function-tool 同构，明确返回协议错误而不伪造执行责任；内置 typed client tools（bash/computer/memory/text-editor）在实现版本化 schema 映射前同样明确报错，不伪造空 schema；`compaction` / `fallback` / `container_upload` 等 opaque replay block 不会泄漏为模型可见 JSON，而是明确报错 |
-| document / file block | ✅ base64 / text source 转 Chat `file_data`；Chat 没有正式 `file_url`，URL source 转含 URL 的有界文本；`source:content` 按原顺序展开 text/image，并用 metadata text 保留 title/context；未来未知 source 有界降级；provider-owned `file_id` 必须先经 `X-Upstream-File-Map` 映射 | ✅ base64/text/URL 转 `input_file`，`source:content` 原样展开为正式 input parts；显式映射后的上游 file id 转 `input_file.file_id` |
+| document / file block | ✅ base64 / text source 转 Chat `file_data`；Chat 没有正式 `file_url`，URL source 转含 URL 的有界文本；`source:content` 按原顺序展开 text/image，并用 metadata text 保留 title/context；未来未知 source 有界降级；provider-owned `file_id` 本地 400 | ✅ base64/text/URL 转 `input_file`，`source:content` 原样展开为正式 input parts；provider-owned `file_id` 不跨 provider 盲传 |
 | provider-owned replay state | ⚠️ 顶层 `container`、`redacted_thinking`、`compaction` / `container_upload` 等 opaque state 无法跨 Anthropic 与 OpenAI provider 重放，显式返回协议错误；对应 nullable 字段为 null 时是 no-op | 同左；Responses 输出的 compaction / hosted function-output state 同样显式 502，不伪装成普通文本 |
 | `/model sonnet` / `opus` / haiku 切换 | ✅ body.model 字段透传 | 同左 |
 | 客户端中断（Ctrl+C） | ✅ 取消当前上游 reader / fetch | 同左 |
@@ -201,17 +200,16 @@ header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`�
 | citations / search result | ⚠️ Anthropic `search_result` 的 title/source metadata 与全部非空 text block 按顺序保留；按 Anthropic 正式规则，`tool_result` 一旦含 search result 就不能混入其他可见 block。启用 document/search-result citations，或回放带非空 citations 的 text block 时，因 OpenAI 请求协议无可逆同构，本地 400；`citations:null` / 空数组为 no-op。若同时请求 structured output，优先返回 Anthropic 的 citations/structured-output 冲突 400 | ⚠️ 同左。响应侧 `web_search_call` 与 citation 按有界 typed JSON 文本保留 id/action/query/URL/range；Responses citation 没有 search-call 归属字段，Router 不猜测配对关系 |
 | 音频输出 | ⚠️ Chat 非流式 `message.audio.transcript` 转 text；原始音频字节只产生一次 `[generated audio omitted]`，不泄漏 base64 | ⚠️ SSE transcript delta 转 text；audio delta 只产生一次相同占位符，done 不重复 |
 | usage / 错误 | ✅ 输出当前 Anthropic Message/Usage nullable 字段，并映射 reasoning tokens 与可从流式首帧确定的 service tier；错误 envelope 含 nullable `request_id` | ✅ Responses reasoning tokens 保留到 Anthropic `thinking_tokens`。402/409/413/504/529 分别映射 `billing_error` / `conflict_error` / `request_too_large` / `timeout_error` / `overloaded_error`；所有上游非 2xx 均标记可重试且 Router 保持单次上游调用 |
-| `metadata` / service tier | ✅ Anthropic `metadata` 只接受正式的 `user_id` 字段（最多 512 个 Unicode code point），映射为 OpenAI `safety_identifier`；未知 metadata 字段本地 400。`standard_only` → `default`，`auto` → `auto` | 同左 |
 | refusal / content filter | ✅ refusal 文本保留为普通 assistant 文本；`content_filter` 映射 `stop_reason:"refusal"`，并返回 `{type:"refusal",category:null,explanation}` 形式的 `stop_details` | 同左；流式与非流式、SSE 聚合保持一致 |
-| incomplete / 截断工具调用 | ✅ Chat `length` 映射 `max_tokens`；调用名/参数原始字节以有界文本诊断保留，不生成可执行 `tool_use`；并行调用中任一个失败会使整批不可执行 | ✅ response 或任一 function item 为 incomplete / malformed 时同样以有界文本保留原始字节，`max_tokens` 优先于 `tool_use`；只有整批调用都完整时才以 `tool_use` 结束 |
-| stop sequence | ⚠️ 请求侧 `stop_sequences` 转 Chat `stop`；Chat 响应只报告通用 `finish_reason:"stop"`，无法恢复命中的具体分隔符 | ❌ Responses 没有 stop sequence 请求参数；非空 `stop_sequences` 本地返回 400，避免静默改变生成边界 |
+| incomplete / 截断工具调用 | ✅ Chat `length` 映射 `max_tokens`；调用名/参数原始字节以有界文本诊断保留，不生成可执行 `tool_use` | ✅ response 或 function item 明确标记 incomplete 时同样以有界文本保留原始字节并返回 `max_tokens`；完整终态中的畸形参数返回 retryable 502 |
+| stop sequence | ⚠️ 请求侧 `stop_sequences` 转 Chat `stop`；Chat 响应只报告通用 `finish_reason:"stop"`，无法恢复命中的具体分隔符 | ⚠️ Responses 没有 stop sequence 请求参数，沿用 TS 行为，在转换时省略该字段 |
 | Responses phase / channel | 不适用 | ⚠️ Responses item 的 `phase` / channel 元数据没有 Anthropic Messages 同构字段；Router 保留 reasoning/tool/text 的语义顺序，但不能无损往返 phase 标签 |
 | o-series / GPT-5 输出长度 | ⚠️ Chat 路径保留正式 Chat `max_tokens`，不会按模型名猜测并改写成 `max_completion_tokens`；只接受后者的端点应改走 Responses | ✅ Anthropic `max_tokens` 映射为 Responses `max_output_tokens` |
 | legacy `function_call`（旧式 Chat 工具调用） | ✅ 流式与非流式均归一为 `tool_use`，不会静默丢弃 | 不适用 |
 | 流式/非流式形态错位 | ✅ 响应形态永远跟随客户端 `stream` 标志：上游对 `stream:true` 回 JSON 时合成完整 SSE，对 `stream:false` 回 SSE 时聚合成 JSON | 同左 |
-| 需要缓冲的上游响应体 | ✅ JSON、非 2xx 及 `stream:false` 聚合路径上限 64 MiB；超限保持上游错误状态或返回 retryable 502。直接 SSE 转发不限制总流量，但单个事件仍受 16 MiB / 65,536 行上限 | 同左 |
+| 需要缓冲的上游响应体 | ⚠️ 与 TS 版本一致，Router 不额外限制 JSON、非 2xx 及 `stream:false` 聚合响应的总大小；直接 SSE 转发也不限制总流量，但单个事件仍受 16 MiB / 65,536 行上限 | 同左 |
 | Prompt cache（`cache_control`） | ⚠️ Anthropic 显式 breakpoint 会被剥（避免严格上游 400）；若上游自行报告 cached tokens，usage 会映射返回 | 同左 |
-| `count_tokens` 端点 | ⚠️ 服务本地 `tiktoken-rs`（o200k）粗略估算（非上游精确值）；覆盖 tools、图片固定预算、document/search、thinking、tool result 与 cache metadata，并避免把大段 base64 当文本逐 token 化 | 同左 |
+| `count_tokens` 端点 | ⚠️ 与 TS 版本一致，使用 o200k 做简单本地估算（非上游精确值）：统计 system/text、tool input/result、tools，图片使用固定 256 token；其他 block 不额外推断 | 同左 |
 
 Router 只做协议转换，不根据模型名猜测视觉、推理或工具能力。标准图片结构仍被文本模型或能力不完整的兼容端点拒绝时，错误属于所选模型 / 上游；Router 会保留上游状态并按既定策略标记为可重试。无法在两个协议间安全同构的状态会明确报错或使用有界降级，不会被静默丢弃或伪造成可执行工具状态。
 
@@ -231,6 +229,8 @@ cargo build --locked --release --manifest-path rust/Cargo.toml
 ### 发布 Docker 镜像
 
 推送版本 tag 时，GitHub Actions 会自动执行 Rust fmt/clippy/test 和 release 构建，通过后发布 `linux/amd64`、`linux/arm64` 多架构镜像并校验 manifest / attestations。发布前须在仓库 Actions secrets 配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`；tag 必须是 SemVer（可带 `v` 前缀），且必须与 `rust/Cargo.toml` 一致。使用 annotated tag，并显式推送该 tag：
+
+镜像构建只能在该 GitHub Actions 流程中进行；开发机和部署机不得本地构建镜像，只能使用 `docker pull` 拉取工作流发布的 tag 或 digest。
 
 ```bash
 version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' rust/Cargo.toml | head -n 1)"
@@ -261,7 +261,6 @@ git push origin "refs/tags/v${version}"
 | `X-Upstream-Authorization` | header | ✅ 必需 | 上游 Authorization 原值（原样透传、**不剥 Bearer**，请填上游需要的完整值；只有 path 模式的 `Authorization` 才会剥 `Bearer ` 前缀） |
 | `X-Upstream-Model` | 两种模式都可用 | 高级兼容、可选 | 固定覆盖 body 里的 `model`。标准 Claude Code 接入应优先使用四个模型环境变量，推荐 alias 不需要配置此 Header |
 | `X-Upstream-Model-Map` | 两种模式都可用 | 高级兼容、可选 | 按 body 模型名精确映射，格式 `from1=to1,from2=to2`，优先级高于 `X-Upstream-Model`。仅为已有客户端兼容保留，不是推荐的 Claude Code 模型配置方式 |
-| `X-Upstream-File-Map` | 两种模式都可用 | 使用 Anthropic `source.type:"file"` 时必需 | 非空 JSON object，把客户端/provider 文件 ID 显式映射为当前 OpenAI 上游的文件 ID。未命中、空键值或含控制字符均本地 400；Router 不盲传 provider-owned ID |
 | `X-Upstream-Effort-Map` | 两种模式都可用 | 可选 | effort 词汇映射表，格式 `max=xhigh,low=minimal`；左侧必须是 Anthropic effort（`low/medium/high/xhigh/max`）或通配 `*`，右侧为上游词汇原样转发，保留字 `off` 表示整个剥除该字段（例：`*=off` 适配"tools 与 reasoning_effort 不能同时出现"的网关）。不配置时显式 effort 永远精确透传，Router 自身绝不 clamp |
 | `X-Upstream-Effort-Levels` | 两种模式都可用 | 可选 | 上游支持的 effort 等级集合，格式 `none,low,medium,high,xhigh`；不在集合内的 effort 按规范等级序 `minimal < low < medium < high < xhigh < max` 就近 clamp，平局取低（例：上游只到 `xhigh` 时 `max` → `xhigh`，上游只到 `high` 时 `max` → `high`）。`none`/`auto` 是开关不是强度，只做精确匹配、永不作为 clamp 目标。与 `X-Upstream-Effort-Map` 同时出现时先按 Map 改写词汇、再按本表 clamp；Map 命中 `off` 则直接剥除、不再 clamp。不配置时显式 effort 永远精确透传 |
 | `X-Upstream-Headers` | 两种模式都可用 | 可选 | JSON object，显式声明要额外转发给上游的 header；不能覆盖受保护 header |

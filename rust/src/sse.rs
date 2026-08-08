@@ -763,6 +763,14 @@ impl ResponsesSseAggregator {
             self.audio_omission_index,
             &self.audio_transcripts,
         );
+        for item in self.items.values_mut() {
+            normalize_stream_part_indices(item);
+        }
+        if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
+            for item in output {
+                normalize_stream_part_indices(item);
+            }
+        }
         validate_terminal_functions(
             &self.items,
             response
@@ -1059,10 +1067,24 @@ fn append_message_part(
         item["content"] = json!([]);
     }
     let parts = item["content"].as_array_mut().unwrap();
-    while parts.len() <= index as usize {
-        parts.push(json!({"type":kind,key:""}));
-    }
-    let part = &mut parts[index as usize];
+    let position = parts
+        .iter()
+        .position(|part| part.get("__ocr_stream_part_index").and_then(Value::as_u64) == Some(index))
+        .or_else(|| {
+            usize::try_from(index)
+                .ok()
+                .filter(|position| *position < parts.len())
+                .filter(|position| parts[*position].get("__ocr_stream_part_index").is_none())
+        })
+        .unwrap_or_else(|| {
+            parts.push(json!({
+                "type":kind,
+                key:"",
+                "__ocr_stream_part_index":index
+            }));
+            parts.len() - 1
+        });
+    let part = &mut parts[position];
     let existing = part
         .get(key)
         .and_then(Value::as_str)
@@ -1124,10 +1146,24 @@ fn append_array_text_part(
         item[key] = json!([]);
     }
     let parts = item[key].as_array_mut().unwrap();
-    while parts.len() <= index as usize {
-        parts.push(json!({"type":kind,"text":""}));
-    }
-    let part = &mut parts[index as usize];
+    let position = parts
+        .iter()
+        .position(|part| part.get("__ocr_stream_part_index").and_then(Value::as_u64) == Some(index))
+        .or_else(|| {
+            usize::try_from(index)
+                .ok()
+                .filter(|position| *position < parts.len())
+                .filter(|position| parts[*position].get("__ocr_stream_part_index").is_none())
+        })
+        .unwrap_or_else(|| {
+            parts.push(json!({
+                "type":kind,
+                "text":"",
+                "__ocr_stream_part_index":index
+            }));
+            parts.len() - 1
+        });
+    let part = &mut parts[position];
     let existing = part.get("text").and_then(Value::as_str).unwrap_or_default();
     let incoming = text.unwrap_or_default();
     let next = if done {
@@ -1148,6 +1184,32 @@ fn append_array_text_part(
     };
     part["text"] = Value::String(next);
     Ok(())
+}
+
+fn normalize_stream_part_indices(item: &mut Value) {
+    for key in ["content", "summary"] {
+        let Some(parts) = item.get_mut(key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let mut indexed = parts
+            .drain(..)
+            .enumerate()
+            .map(|(position, part)| {
+                let index = part
+                    .get("__ocr_stream_part_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(position as u64);
+                (index, position, part)
+            })
+            .collect::<Vec<_>>();
+        indexed.sort_by_key(|(index, position, _)| (*index, *position));
+        parts.extend(indexed.into_iter().map(|(_, _, mut part)| {
+            if let Some(object) = part.as_object_mut() {
+                object.remove("__ocr_stream_part_index");
+            }
+            part
+        }));
+    }
 }
 
 #[cfg(test)]
@@ -1375,5 +1437,77 @@ mod tests {
             );
             assert!(error.retryable);
         }
+    }
+
+    #[test]
+    fn responses_sparse_content_indices_do_not_allocate_holes() {
+        let mut aggregator = ResponsesSseAggregator::default();
+        for (content_index, delta) in [(u64::MAX, "late"), (0, "first")] {
+            aggregator
+                .push_raw(
+                    &json!({
+                        "type":"response.output_text.delta",
+                        "output_index":0,
+                        "content_index":content_index,
+                        "delta":delta
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+        }
+        aggregator
+            .push_raw(
+                &json!({
+                    "type":"response.completed",
+                    "response":{"id":"r","model":"m","status":"completed","output":[]}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let response = aggregator.finish().unwrap();
+        assert_eq!(
+            response.pointer("/output/0/content"),
+            Some(&json!([
+                {"type":"output_text","text":"first"},
+                {"type":"output_text","text":"late"}
+            ]))
+        );
+        assert!(!response.to_string().contains("__ocr_stream_part_index"));
+    }
+
+    #[test]
+    fn responses_sparse_reasoning_indices_do_not_allocate_holes() {
+        let mut aggregator = ResponsesSseAggregator::default();
+        for (summary_index, delta) in [(u64::MAX, "late"), (0, "first")] {
+            aggregator
+                .push_raw(
+                    &json!({
+                        "type":"response.reasoning_summary_text.delta",
+                        "output_index":0,
+                        "summary_index":summary_index,
+                        "delta":delta
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+        }
+        aggregator
+            .push_raw(
+                &json!({
+                    "type":"response.completed",
+                    "response":{"id":"r","model":"m","status":"completed","output":[]}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let response = aggregator.finish().unwrap();
+        assert_eq!(
+            response.pointer("/output/0/summary"),
+            Some(&json!([
+                {"type":"summary_text","text":"first"},
+                {"type":"summary_text","text":"late"}
+            ]))
+        );
+        assert!(!response.to_string().contains("__ocr_stream_part_index"));
     }
 }

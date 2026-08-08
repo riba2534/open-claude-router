@@ -46,6 +46,18 @@ async fn chat_upstream(
     }))
 }
 
+async fn echo_upstream(Json(body): Json<Value>) -> Json<Value> {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("missing-model");
+    Json(json!({
+        "id":format!("chatcmpl-{model}"),"object":"chat.completion","model":model,
+        "choices":[{"index":0,"message":{"role":"assistant","content":model},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+    }))
+}
+
 async fn responses_upstream(
     State(state): State<MockState>,
     headers: HeaderMap,
@@ -134,6 +146,25 @@ async fn malformed_json_upstream(
     response
 }
 
+async fn malformed_tool_upstream(
+    State(state): State<MockState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    state.count.fetch_add(1, Ordering::SeqCst);
+    state
+        .requests
+        .lock()
+        .await
+        .push_back((HeaderMap::new(), body));
+    Json(json!({
+        "id":"chat_bad_tool","model":"upstream-chat",
+        "choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{
+            "id":"call_bad","type":"function",
+            "function":{"name":"read","arguments":"{"}
+        }]},"finish_reason":"tool_calls"}]
+    }))
+}
+
 async fn chat_stream_upstream(Json(_body): Json<Value>) -> Response {
     let stream = async_stream::stream! {
         yield Ok::<_, Infallible>(Bytes::from_static(
@@ -192,6 +223,7 @@ async fn start_mock() -> (String, MockState) {
     let state = MockState::default();
     let app = Router::new()
         .route("/chat", post(chat_upstream))
+        .route("/echo", post(echo_upstream))
         .route("/responses", post(responses_upstream))
         .route("/chat-stream", post(chat_stream_upstream))
         .route("/chat-truncated", post(truncated_chat_stream_upstream))
@@ -208,6 +240,7 @@ async fn start_mock() -> (String, MockState) {
         .route("/slow", post(slow_upstream))
         .route("/logical-error", post(logical_error_upstream))
         .route("/malformed-json", post(malformed_json_upstream))
+        .route("/malformed-tool", post(malformed_tool_upstream))
         .with_state(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -261,6 +294,71 @@ async fn start_hanging_upstream() -> (String, oneshot::Receiver<()>, oneshot::Re
     (format!("http://{addr}/hang"), started_rx, closed_rx)
 }
 
+async fn start_streaming_hanging_upstream(
+    format: &str,
+) -> (String, oneshot::Receiver<()>, oneshot::Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (started_tx, started_rx) = oneshot::channel();
+    let (closed_tx, closed_rx) = oneshot::channel();
+    let payload = if format == "responses" {
+        concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"m\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"first\"}\n\n"
+        )
+    } else {
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"first\"},\"finish_reason\":null}]}\n\n"
+    };
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count = socket.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                return;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{payload}"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let _ = started_tx.send(());
+        loop {
+            match socket.read(&mut buffer).await {
+                Ok(0) | Err(_) => {
+                    let _ = closed_tx.send(());
+                    return;
+                }
+                Ok(_) => {}
+            }
+        }
+    });
+    (format!("http://{addr}/stream"), started_rx, closed_rx)
+}
+
 fn test_router() -> Router {
     build_app(Arc::new(AppState {
         client: reqwest::Client::builder()
@@ -276,6 +374,17 @@ fn test_router_with_client(client: reqwest::Client) -> Router {
     build_app(Arc::new(AppState {
         client,
         access_tokens: HashSet::new(),
+        model_logger: ModelInteractionLogger::disabled(),
+    }))
+}
+
+fn authenticated_test_router() -> Router {
+    build_app(Arc::new(AppState {
+        client: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+        access_tokens: HashSet::from(["service-secret".to_owned()]),
         model_logger: ModelInteractionLogger::disabled(),
     }))
 }
@@ -549,6 +658,30 @@ async fn malformed_success_json_is_retryable_bad_gateway_and_single_attempt() {
 }
 
 #[tokio::test]
+async fn malformed_completed_tool_arguments_are_retryable_and_single_attempt() {
+    let (base, mock) = start_mock().await;
+    let response = send(
+        test_router(),
+        "/v1/messages",
+        &format!("{base}/malformed-tool"),
+        anthropic_body(false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.headers()["x-should-retry"], "true");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(body.pointer("/error/type"), Some(&json!("api_error")));
+    assert_eq!(
+        body.pointer("/error/message"),
+        Some(&json!(
+            "upstream tool arguments must be a valid JSON object"
+        ))
+    );
+    assert_eq!(mock.count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn upstream_timeout_is_retryable_bad_gateway_and_never_retried_in_router() {
     let (base, mock) = start_mock().await;
     let client = reqwest::Client::builder()
@@ -647,7 +780,46 @@ async fn json_post_routes_reject_missing_content_type_with_415() {
 }
 
 #[tokio::test]
-async fn count_tokens_validates_required_fields_in_both_access_modes() {
+async fn oversized_request_body_uses_anthropic_error_envelope() {
+    let response = test_router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header(
+                    "x-upstream-url",
+                    "https://upstream.example.com/v1/chat/completions",
+                )
+                .header("x-upstream-authorization", "Bearer secret")
+                .body(Body::from(vec![b'x'; 32 * 1024 * 1024 + 1]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(
+        body.pointer("/error/type"),
+        Some(&json!("request_too_large"))
+    );
+    assert_eq!(
+        body.pointer("/error/message"),
+        Some(&json!("Request body is too large"))
+    );
+}
+
+#[tokio::test]
+async fn count_tokens_keeps_typescript_route_validation_in_both_access_modes() {
     let invalid = json!({"messages":[]});
     let serialized = serde_json::to_vec(&invalid).unwrap();
     let header_response = test_router()
@@ -661,17 +833,14 @@ async fn count_tokens_validates_required_fields_in_both_access_modes() {
         )
         .await
         .unwrap();
-    assert_eq!(header_response.status(), StatusCode::BAD_REQUEST);
-    let error: Value = serde_json::from_slice(
+    assert_eq!(header_response.status(), StatusCode::OK);
+    let result: Value = serde_json::from_slice(
         &to_bytes(header_response.into_body(), 1 << 20)
             .await
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        error.pointer("/error/message"),
-        Some(&json!("model must be a non-empty string"))
-    );
+    assert_eq!(result["input_tokens"], 0);
 
     let embedded_response = test_router()
         .oneshot(
@@ -685,17 +854,14 @@ async fn count_tokens_validates_required_fields_in_both_access_modes() {
         )
         .await
         .unwrap();
-    assert_eq!(embedded_response.status(), StatusCode::BAD_REQUEST);
-    let error: Value = serde_json::from_slice(
+    assert_eq!(embedded_response.status(), StatusCode::OK);
+    let result: Value = serde_json::from_slice(
         &to_bytes(embedded_response.into_body(), 1 << 20)
             .await
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        error.pointer("/error/message"),
-        Some(&json!("model must be a non-empty string"))
-    );
+    assert_eq!(result["input_tokens"], 0);
 }
 
 #[tokio::test]
@@ -728,6 +894,43 @@ async fn downstream_disconnect_before_headers_cancels_upstream_request() {
 }
 
 #[tokio::test]
+async fn downstream_disconnect_after_first_stream_frame_cancels_both_upstream_formats() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, test_router()).await.unwrap();
+    });
+
+    for format in ["chat-completions", "responses"] {
+        let (upstream, started, closed) = start_streaming_hanging_upstream(format).await;
+        let payload = serde_json::to_vec(&anthropic_body(true)).unwrap();
+        let mut downstream = TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nX-Upstream-Url: {upstream}\r\nX-Upstream-Authorization: Bearer secret\r\nX-Upstream-Format: {format}\r\nContent-Length: {}\r\n\r\n",
+            payload.len()
+        );
+        downstream.write_all(request.as_bytes()).await.unwrap();
+        downstream.write_all(&payload).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .expect("upstream must start streaming")
+            .unwrap();
+        let mut first = [0_u8; 4096];
+        let count = tokio::time::timeout(Duration::from_secs(2), downstream.read(&mut first))
+            .await
+            .expect("router must forward the first converted frame")
+            .unwrap();
+        assert!(count > 0);
+        drop(downstream);
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("dropping the downstream stream must cancel its upstream reader")
+            .unwrap();
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn embedded_path_preserves_upstream_authorization_value() {
     let (base, mock) = start_mock().await;
     let authority = base.strip_prefix("http://").unwrap();
@@ -752,59 +955,76 @@ async fn embedded_path_preserves_upstream_authorization_value() {
 }
 
 #[tokio::test]
-async fn file_map_is_applied_in_header_and_embedded_modes_without_leaking_client_id() {
+async fn access_mode_format_and_response_shape_matrix_remains_orthogonal() {
     let (base, mock) = start_mock().await;
-    let mut body = anthropic_body(false);
-    body["messages"][0]["content"] = json!([{
-        "type":"image",
-        "source":{"type":"file","file_id":"file-client"}
-    }]);
-    let serialized = serde_json::to_vec(&body).unwrap();
-    let header_response = test_router()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .header("x-upstream-url", format!("{base}/chat"))
-                .header("x-upstream-authorization", "Bearer secret")
-                .header("x-upstream-file-map", r#"{"file-client":"file-upstream"}"#)
-                .body(Body::from(serialized.clone()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(header_response.status(), StatusCode::OK);
-
     let authority = base.strip_prefix("http://").unwrap();
-    let embedded_response = test_router()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/http://{authority}/chat/v1/messages"))
-                .header("content-type", "application/json")
-                .header("authorization", "Bearer upstream-secret")
-                .header("x-upstream-file-map", r#"{"file-client":"file-upstream"}"#)
-                .body(Body::from(serialized))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(embedded_response.status(), StatusCode::OK);
+    let router = authenticated_test_router();
 
-    let mut requests = mock.requests.lock().await;
-    assert_eq!(requests.len(), 2);
-    for (_, outbound) in requests.drain(..) {
-        assert_eq!(
-            outbound.pointer("/messages/1/content/0/file/file_id"),
-            Some(&json!("file-upstream"))
-        );
-        assert!(
-            !serde_json::to_string(&outbound)
-                .unwrap()
-                .contains("file-client")
-        );
+    for embedded in [false, true] {
+        for (format, endpoint) in [("chat-completions", "chat"), ("responses", "responses")] {
+            for stream in [false, true] {
+                let uri = if embedded {
+                    format!("/http://{authority}/{endpoint}/v1/messages")
+                } else {
+                    "/v1/messages".to_owned()
+                };
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header("x-upstream-format", format);
+                request = if embedded {
+                    request
+                        .header("authorization", "Bearer upstream-secret")
+                        .header("x-ocr-token", "service-secret")
+                } else {
+                    request
+                        .header("authorization", "Bearer service-secret")
+                        .header("x-upstream-url", format!("{base}/{endpoint}"))
+                        .header("x-upstream-authorization", "Custom upstream-secret")
+                };
+                let mut body = anthropic_body(stream);
+                body["messages"][0]["content"] = json!("matrix");
+                let response = router
+                    .clone()
+                    .oneshot(
+                        request
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                if stream {
+                    let text = String::from_utf8(bytes.to_vec()).unwrap();
+                    assert!(text.contains("event: message_start"));
+                    assert!(text.contains("event: message_stop"));
+                } else {
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(value["type"], "message");
+                    assert_eq!(value["stop_reason"], "end_turn");
+                }
+            }
+        }
     }
+
+    let requests = mock.requests.lock().await;
+    assert_eq!(requests.len(), 8);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(headers, _)| headers["authorization"] == "upstream-secret")
+            .count(),
+        4
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(headers, _)| headers["authorization"] == "Custom upstream-secret")
+            .count(),
+        4
+    );
 }
 
 #[tokio::test]
@@ -824,7 +1044,7 @@ async fn unmapped_provider_file_id_is_rejected_before_upstream() {
             .pointer("/error/message")
             .and_then(Value::as_str)
             .unwrap()
-            .contains("has no X-Upstream-File-Map entry")
+            .contains("is provider-owned and cannot be translated")
     );
     assert_eq!(mock.count.load(Ordering::SeqCst), 0);
 }
@@ -860,21 +1080,31 @@ async fn json_upstream_becomes_complete_sse_when_client_requests_streaming() {
 
 #[tokio::test]
 async fn concurrent_requests_share_the_pool_without_cross_talk() {
-    let (base, mock) = start_mock().await;
+    let (base, _) = start_mock().await;
     let router = test_router();
-    let upstream = format!("{base}/chat");
-    let requests = (0..128).map(|_| {
+    let upstream = format!("{base}/echo");
+    let requests = (0..512).map(|index| {
         let router = router.clone();
         let upstream = upstream.clone();
-        async move { send(router, "/v1/messages", &upstream, anthropic_body(false)).await }
+        async move {
+            let mut body = anthropic_body(false);
+            body["model"] = json!(format!("client-{index}"));
+            let response = send(router, "/v1/messages", &upstream, body).await;
+            let status = response.status();
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap())
+                    .unwrap();
+            (index, status, body)
+        }
     });
     let responses = futures_util::future::join_all(requests).await;
-    assert!(
-        responses
-            .iter()
-            .all(|response| response.status() == StatusCode::OK)
-    );
-    assert_eq!(mock.count.load(Ordering::SeqCst), 128);
+    for (index, status, body) in responses {
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.pointer("/content/0/text"),
+            Some(&json!(format!("client-{index}")))
+        );
+    }
 }
 
 #[tokio::test]

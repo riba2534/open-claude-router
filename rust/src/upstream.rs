@@ -7,7 +7,6 @@ use serde_json::Value;
 use crate::error::{ApiError, error_type_for_status};
 
 const MAX_ERROR_CHARS: usize = 4096;
-pub const MAX_BUFFERED_UPSTREAM_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 pub async fn call_upstream(
     client: &Client,
@@ -37,11 +36,11 @@ pub async fn call_upstream(
     })
 }
 
-/// Reads a body that must be buffered, retaining a bounded prefix before a
-/// transport failure or size violation. Callers still have the upstream HTTP
-/// status, so a truncated non-2xx response keeps its original retry contract.
+/// Reads a body that must be buffered. As in the TypeScript implementation,
+/// the router does not impose an additional response-size policy on upstream.
+/// Callers still retain the upstream status if reading fails partway through.
 pub async fn read_upstream_body(response: reqwest::Response) -> (Bytes, Option<String>) {
-    read_upstream_body_stream(response.bytes_stream(), MAX_BUFFERED_UPSTREAM_BODY_BYTES).await
+    read_upstream_body_stream(response.bytes_stream(), usize::MAX).await
 }
 
 async fn read_upstream_body_stream<S, E>(stream: S, max_bytes: usize) -> (Bytes, Option<String>)

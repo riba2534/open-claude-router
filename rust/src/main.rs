@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use open_claude_router::{AppState, build_app};
 use reqwest::redirect::Policy;
@@ -18,13 +18,8 @@ async fn main() {
         .init();
 
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_owned());
-    let port = std::env::var("PORT")
-        .ok()
-        .and_then(|raw| raw.parse::<u16>().ok())
-        .unwrap_or(3457);
-    let addr: SocketAddr = format!("{host}:{port}")
-        .parse()
-        .unwrap_or_else(|error| panic!("invalid HOST/PORT: {error}"));
+    let port = parse_port(std::env::var("PORT").ok())
+        .unwrap_or_else(|error| panic!("invalid PORT: {error}"));
 
     let client = reqwest::Client::builder()
         .redirect(Policy::none())
@@ -39,9 +34,14 @@ async fn main() {
     state.model_logger.start().await;
     let model_logger = state.model_logger.clone();
     let app = build_app(state);
-    let listener = TcpListener::bind(addr)
+    // Resolve the host and port separately so hostnames and unbracketed IPv6
+    // values such as `HOST=::` retain the behavior of the TypeScript server.
+    let listener = TcpListener::bind((host.as_str(), port))
         .await
-        .unwrap_or_else(|error| panic!("bind {addr}: {error}"));
+        .unwrap_or_else(|error| panic!("bind {host}:{port}: {error}"));
+    let addr = listener
+        .local_addr()
+        .unwrap_or_else(|error| panic!("read bound address: {error}"));
     info!(%addr, "open-claude-router Rust server listening");
 
     let result = axum::serve(listener, app)
@@ -51,6 +51,15 @@ async fn main() {
     if let Err(error) = result {
         error!(%error, "server stopped with error");
         std::process::exit(1);
+    }
+}
+
+fn parse_port(raw: Option<String>) -> Result<u16, String> {
+    match raw {
+        None => Ok(3457),
+        Some(raw) => raw
+            .parse::<u16>()
+            .map_err(|_| format!("{raw:?} must be an integer between 0 and 65535")),
     }
 }
 
@@ -71,4 +80,17 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
     info!("shutting down");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_port;
+
+    #[test]
+    fn port_defaults_only_when_unset() {
+        assert_eq!(parse_port(None).unwrap(), 3457);
+        assert_eq!(parse_port(Some("0".into())).unwrap(), 0);
+        assert!(parse_port(Some("not-a-port".into())).is_err());
+        assert!(parse_port(Some("70000".into())).is_err());
+    }
 }

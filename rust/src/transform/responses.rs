@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Map, Value, json};
 
-use super::{ensure_text_block_citations, protocol_error};
+use super::protocol_error;
 use crate::{
     error::{ApiError, error_type_for_status, status_from_openai_error},
     transform::request::scrub_cache_control,
@@ -15,17 +15,6 @@ pub fn transform_responses_request(body: &mut Value) -> Result<(), ApiError> {
     let object = body.as_object_mut().expect("unified request is object");
     if let Some(max_tokens) = object.remove("max_tokens") {
         object.insert("max_output_tokens".into(), max_tokens);
-    }
-    if object
-        .get("stop")
-        .is_some_and(|stop| !stop.is_null() && !stop.as_array().is_some_and(Vec::is_empty))
-    {
-        return Err(ApiError::new(
-            axum::http::StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "unsupported_stop_sequences",
-            "Anthropic stop_sequences are not supported by the OpenAI Responses API",
-        ));
     }
     object.remove("stop");
     let explicit_effort = object
@@ -335,22 +324,15 @@ pub fn transform_responses_json(payload: &Value, omit_reasoning: bool) -> Result
                     incomplete_call = true;
                     content.push(incomplete_tool_diagnostic(name, &arguments));
                 } else {
-                    match parse_tool_arguments(&arguments) {
-                        Ok(input) => {
-                            content.push(json!({
-                                "type":"tool_use",
-                                "id":call_id,
-                                "name":name,
-                                "input":input,
-                                "caller":{"type":"direct"}
-                            }));
-                            has_tool = true;
-                        }
-                        Err(_) => {
-                            incomplete_call = true;
-                            content.push(incomplete_tool_diagnostic(name, &arguments));
-                        }
-                    }
+                    let input = parse_tool_arguments(&arguments)?;
+                    content.push(json!({
+                        "type":"tool_use",
+                        "id":call_id,
+                        "name":name,
+                        "input":input,
+                        "caller":{"type":"direct"}
+                    }));
+                    has_tool = true;
                 }
             }
             "message" => {
@@ -439,7 +421,6 @@ pub fn transform_responses_json(payload: &Value, omit_reasoning: bool) -> Result
         .and_then(Value::as_str)
         == Some("content_filter");
     let is_refusal = !refusal.is_empty() || (response_incomplete && content_filter);
-    ensure_text_block_citations(&mut content);
     let stop_reason = if is_refusal {
         "refusal"
     } else if response_incomplete {
@@ -639,7 +620,7 @@ fn incomplete_tool_diagnostic(name: &str, raw: &Value) -> Value {
     if length > 4096 {
         bounded.push('…');
     }
-    json!({"type":"text","text":format!("[incomplete tool_use {name}: {bounded}]")})
+    json!({"type":"text","text":format!("[incomplete function_call {name}: {bounded}]")})
 }
 
 fn reasoning_text(item: &Value) -> String {
@@ -768,15 +749,10 @@ mod tests {
     }
 
     #[test]
-    fn request_rejects_non_empty_stop_sequences() {
+    fn request_drops_stop_sequences_like_typescript() {
         let mut body = json!({"messages":[],"stop":["END"]});
-        let error = transform_responses_request(&mut body).unwrap_err();
-        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(error.code, "unsupported_stop_sequences");
-        assert_eq!(
-            error.message,
-            "Anthropic stop_sequences are not supported by the OpenAI Responses API"
-        );
+        transform_responses_request(&mut body).unwrap();
+        assert!(body.get("stop").is_none());
 
         let mut empty = json!({"messages":[],"stop":[]});
         transform_responses_request(&mut empty).unwrap();
@@ -809,8 +785,8 @@ mod tests {
     }
 
     #[test]
-    fn malformed_completed_function_is_diagnostic_and_max_tokens() {
-        let result = transform_responses_json(
+    fn malformed_completed_function_is_a_retryable_protocol_error() {
+        let error = transform_responses_json(
             &json!({
                 "id":"r","status":"completed","output":[{
                     "type":"function_call","call_id":"call_1","name":"lookup",
@@ -819,24 +795,14 @@ mod tests {
             }),
             false,
         )
-        .unwrap();
-        assert_eq!(result["stop_reason"], "max_tokens");
-        assert_eq!(
-            result.pointer("/content/0/text"),
-            Some(&json!("[incomplete tool_use lookup: {broken]"))
-        );
-        assert!(
-            result["content"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|block| block["type"] != "tool_use")
-        );
+        .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert!(error.retryable);
     }
 
     #[test]
-    fn one_malformed_parallel_function_makes_every_call_non_executable() {
-        let result = transform_responses_json(
+    fn one_malformed_parallel_function_fails_the_response() {
+        let error = transform_responses_json(
             &json!({
                 "status":"completed","output":[
                     {"type":"function_call","call_id":"good","name":"good","arguments":"{}"},
@@ -845,15 +811,9 @@ mod tests {
             }),
             false,
         )
-        .unwrap();
-        assert_eq!(result["stop_reason"], "max_tokens");
-        assert!(
-            result["content"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|block| block["type"] != "tool_use")
-        );
+        .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert!(error.retryable);
     }
 
     #[test]

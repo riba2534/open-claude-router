@@ -15,7 +15,7 @@ pub fn transform_anthropic_request(request: &Value) -> Result<Value, ApiError> {
     transform_anthropic_request_with_file_map(request, &HashMap::new())
 }
 
-pub fn transform_anthropic_request_with_file_map(
+fn transform_anthropic_request_with_file_map(
     request: &Value,
     file_map: &HashMap<String, String>,
 ) -> Result<Value, ApiError> {
@@ -222,29 +222,6 @@ pub fn transform_anthropic_request_with_file_map(
     copy_if_present(object, &mut result, "top_p", "top_p");
     copy_if_present(object, &mut result, "stop_sequences", "stop");
     copy_if_present(object, &mut result, "stream", "stream");
-    if let Some(user_id) = object
-        .get("metadata")
-        .and_then(|metadata| metadata.get("user_id"))
-        .and_then(Value::as_str)
-    {
-        result.insert(
-            "safety_identifier".into(),
-            Value::String(user_id.to_owned()),
-        );
-    }
-    if let Some(service_tier) = object.get("service_tier").and_then(Value::as_str) {
-        result.insert(
-            "service_tier".into(),
-            Value::String(
-                if service_tier == "standard_only" {
-                    "default"
-                } else {
-                    "auto"
-                }
-                .into(),
-            ),
-        );
-    }
     if !active_tools.is_empty() {
         result.insert(
             "tools".into(),
@@ -387,59 +364,6 @@ fn validate_request(request: &Value, file_map: &HashMap<String, String>) -> Resu
     let object = request
         .as_object()
         .ok_or_else(|| invalid("request body must be a JSON object"))?;
-    if !object
-        .get("model")
-        .and_then(Value::as_str)
-        .is_some_and(|model| !model.trim().is_empty())
-    {
-        return Err(invalid("model must be a non-empty string"));
-    }
-    if !object.get("max_tokens").is_some_and(is_safe_token_count) {
-        return Err(invalid("max_tokens must be a non-negative safe integer"));
-    }
-    for field in ["top_k", "cache_control", "inference_geo"] {
-        if object.get(field).is_some_and(|value| !value.is_null()) {
-            return Err(invalid(format!(
-                "{field} has no OpenAI protocol equivalent"
-            )));
-        }
-    }
-    if let Some(metadata) = object.get("metadata").filter(|value| !value.is_null()) {
-        let metadata = metadata
-            .as_object()
-            .ok_or_else(|| invalid("metadata must be an object or null"))?;
-        if metadata.keys().any(|key| key != "user_id") {
-            return Err(invalid("metadata supports only the user_id field"));
-        }
-        if metadata
-            .get("user_id")
-            .is_some_and(|value| !value.is_null() && !value.is_string())
-        {
-            return Err(invalid("metadata.user_id must be a string or null"));
-        }
-        if metadata
-            .get("user_id")
-            .and_then(Value::as_str)
-            .is_some_and(|user_id| user_id.encode_utf16().count() > 512)
-        {
-            return Err(invalid("metadata.user_id must be at most 512 characters"));
-        }
-    }
-    if let Some(service_tier) = object.get("service_tier").filter(|value| !value.is_null())
-        && !matches!(service_tier.as_str(), Some("auto" | "standard_only"))
-    {
-        return Err(invalid(
-            "service_tier must be \"auto\", \"standard_only\", or null",
-        ));
-    }
-    if let Some(stop_sequences) = object.get("stop_sequences")
-        && (!stop_sequences.is_array()
-            || stop_sequences
-                .as_array()
-                .is_some_and(|stops| stops.iter().any(|stop| !stop.is_string())))
-    {
-        return Err(invalid("stop_sequences must be an array of strings"));
-    }
     if let Some(system) = object.get("system") {
         if !system.is_string() && !system.is_array() {
             return Err(invalid(
@@ -904,22 +828,6 @@ fn validate_request(request: &Value, file_map: &HashMap<String, String>) -> Resu
     Ok(())
 }
 
-fn is_safe_token_count(value: &Value) -> bool {
-    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-    let Some(number) = value.as_number() else {
-        return false;
-    };
-    if let Some(value) = number.as_u64() {
-        return value <= MAX_SAFE_INTEGER;
-    }
-    number.as_f64().is_some_and(|value| {
-        value.is_finite()
-            && value >= 0.0
-            && value <= MAX_SAFE_INTEGER as f64
-            && value.fract() == 0.0
-    })
-}
-
 fn message_references_dynamic_tools(message: &Value) -> bool {
     let Some(parts) = message.get("content").and_then(Value::as_array) else {
         return false;
@@ -1008,6 +916,11 @@ fn validate_mapped_file_source(
     label: &str,
     file_map: &HashMap<String, String>,
 ) -> Result<(), ApiError> {
+    if file_map.is_empty() {
+        return Err(invalid(format!(
+            "{label}.source.type \"file\" is provider-owned and cannot be translated to an OpenAI file id"
+        )));
+    }
     let file_id = source
         .get("file_id")
         .and_then(Value::as_str)
@@ -1018,7 +931,7 @@ fn validate_mapped_file_source(
         .is_some_and(|mapped| !mapped.is_empty())
     {
         return Err(invalid(format!(
-            "{label}.source.file_id has no X-Upstream-File-Map entry"
+            "{label}.source.type \"file\" is provider-owned and cannot be translated to an OpenAI file id"
         )));
     }
     Ok(())
@@ -2107,63 +2020,41 @@ mod tests {
     }
 
     #[test]
-    fn validates_required_request_scalars() {
-        for (body, message) in [
-            (
-                json!({"model":"","max_tokens":1,"messages":[]}),
-                "model must be a non-empty string",
-            ),
-            (
-                json!({"model":"m","max_tokens":1,"messages":{}}),
-                "messages must be an array",
-            ),
-            (
-                json!({"model":"m","max_tokens":-1,"messages":[]}),
-                "max_tokens must be a non-negative safe integer",
-            ),
-            (
-                json!({"model":"m","max_tokens":9007199254740992_u64,"messages":[]}),
-                "max_tokens must be a non-negative safe integer",
-            ),
+    fn matches_typescript_required_request_shape() {
+        for body in [
+            json!({"messages":[]}),
+            json!({"model":"","messages":[]}),
+            json!({"model":"m","max_tokens":-1,"messages":[]}),
         ] {
-            let error = transform_anthropic_request(&body).unwrap_err();
-            assert_eq!(error.message, message);
+            transform_anthropic_request(&body).unwrap();
         }
+        let error = transform_anthropic_request(&json!({"model":"m","max_tokens":1,"messages":{}}))
+            .unwrap_err();
+        assert_eq!(error.message, "messages must be an array");
     }
 
     #[test]
-    fn maps_metadata_and_service_tier_and_rejects_unsupported_fields() {
+    fn ignores_fields_without_an_openai_mapping_like_typescript() {
         let result = transform_anthropic_request(&json!({
             "model":"m","max_tokens":1,"messages":[],
-            "metadata":{"user_id":"user-1"},"service_tier":"standard_only"
+            "metadata":{"user_id":"user-1","future":true},
+            "service_tier":"standard_only",
+            "top_k":3,"cache_control":{"type":"ephemeral"},"inference_geo":"us"
         }))
         .unwrap();
-        assert_eq!(result["safety_identifier"], "user-1");
-        assert_eq!(result["service_tier"], "default");
-
-        for field in ["top_k", "cache_control", "inference_geo"] {
-            let mut body = json!({"model":"m","max_tokens":1,"messages":[]});
-            body[field] = json!(1);
-            let error = transform_anthropic_request(&body).unwrap_err();
-            assert_eq!(
-                error.message,
-                format!("{field} has no OpenAI protocol equivalent")
-            );
+        for field in [
+            "safety_identifier",
+            "service_tier",
+            "top_k",
+            "cache_control",
+            "inference_geo",
+        ] {
+            assert!(result.get(field).is_none());
         }
-
-        let error = transform_anthropic_request(&json!({
-            "model":"m","max_tokens":1,"messages":[],
-            "metadata":{"user_id":"x".repeat(513)}
-        }))
-        .unwrap_err();
-        assert_eq!(
-            error.message,
-            "metadata.user_id must be at most 512 characters"
-        );
     }
 
     #[test]
-    fn file_sources_require_explicit_mapping_and_never_leak_client_id() {
+    fn provider_owned_file_sources_are_rejected_like_typescript() {
         let request = json!({
             "model":"m","max_tokens":1,"messages":[{"role":"user","content":[
                 {"type":"image","source":{"type":"file","file_id":"client-image"}},
@@ -2171,23 +2062,10 @@ mod tests {
             ]}]
         });
         let error = transform_anthropic_request(&request).unwrap_err();
-        assert!(error.message.contains("has no X-Upstream-File-Map entry"));
-
-        let file_map = HashMap::from([
-            ("client-image".into(), "upstream-image".into()),
-            ("client-doc".into(), "upstream-doc".into()),
-        ]);
-        let result = transform_anthropic_request_with_file_map(&request, &file_map).unwrap();
         assert_eq!(
-            result.pointer("/messages/0/content/0"),
-            Some(&json!({"type":"image_file","image_file":{"file_id":"upstream-image"}}))
+            error.message,
+            "messages[0].content image.source.type \"file\" is provider-owned and cannot be translated to an OpenAI file id"
         );
-        assert_eq!(
-            result.pointer("/messages/0/content/1/file/file_id"),
-            Some(&json!("upstream-doc"))
-        );
-        assert!(!result.to_string().contains("client-image"));
-        assert!(!result.to_string().contains("client-doc"));
     }
 
     #[test]

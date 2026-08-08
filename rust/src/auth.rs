@@ -341,55 +341,6 @@ pub fn parse_upstream_headers(headers: &HeaderMap) -> Result<HeaderMap, ApiError
     Ok(result)
 }
 
-pub fn parse_upstream_file_map(headers: &HeaderMap) -> Result<HashMap<String, String>, ApiError> {
-    let Some(raw) = header(headers, "x-upstream-file-map") else {
-        return Ok(HashMap::new());
-    };
-    let parsed: Value = serde_json::from_str(raw).map_err(|_| {
-        invalid(
-            "invalid_file_map",
-            "X-Upstream-File-Map must be a non-empty JSON object",
-        )
-    })?;
-    let object = parsed
-        .as_object()
-        .filter(|object| !object.is_empty())
-        .ok_or_else(|| {
-            invalid(
-                "invalid_file_map",
-                "X-Upstream-File-Map must be a non-empty JSON object",
-            )
-        })?;
-    let mut result = HashMap::with_capacity(object.len());
-    for (client_file_id, upstream_file_id) in object {
-        let invalid_key = client_file_id.trim().is_empty()
-            || contains_invalid_header_value(client_file_id)
-            || client_file_id.chars().any(char::is_control)
-            || matches!(
-                client_file_id.to_ascii_lowercase().as_str(),
-                "__proto__" | "constructor" | "prototype"
-            );
-        let Some(upstream_file_id) = upstream_file_id.as_str() else {
-            return Err(invalid(
-                "invalid_file_map",
-                "X-Upstream-File-Map keys and values must be non-empty strings without control characters",
-            ));
-        };
-        if invalid_key
-            || upstream_file_id.trim().is_empty()
-            || contains_invalid_header_value(upstream_file_id)
-            || upstream_file_id.chars().any(char::is_control)
-        {
-            return Err(invalid(
-                "invalid_file_map",
-                "X-Upstream-File-Map keys and values must be non-empty strings without control characters",
-            ));
-        }
-        result.insert(client_file_id.clone(), upstream_file_id.to_owned());
-    }
-    Ok(result)
-}
-
 fn parse_assignments(
     raw: Option<&str>,
     code: &'static str,
@@ -576,40 +527,6 @@ mod tests {
             "https://upstream.example.com/v1/chat/completions"
         );
         assert_eq!(upstream.authorization, "Custom abc");
-    }
-
-    #[test]
-    fn file_map_requires_safe_non_empty_string_entries() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-upstream-file-map",
-            r#"{"file-client":"file-upstream"}"#.parse().unwrap(),
-        );
-        assert_eq!(
-            parse_upstream_file_map(&headers).unwrap()["file-client"],
-            "file-upstream"
-        );
-
-        for raw in [
-            "",
-            "{}",
-            "[]",
-            r#"{"file-client":1}"#,
-            r#"{"": "x"}"#,
-            r#"{"file\tclient":"file-upstream"}"#,
-            r#"{"file-client":"file\tupstream"}"#,
-            r#"{"file-client":"file\u0001upstream"}"#,
-        ] {
-            if raw.is_empty() {
-                headers.insert("x-upstream-file-map", " ".parse().unwrap());
-            } else {
-                headers.insert("x-upstream-file-map", raw.parse().unwrap());
-            }
-            assert_eq!(
-                parse_upstream_file_map(&headers).unwrap_err().code,
-                "invalid_file_map"
-            );
-        }
     }
 
     #[test]

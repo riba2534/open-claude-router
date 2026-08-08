@@ -19,13 +19,19 @@ cargo build --locked --release --manifest-path rust/Cargo.toml
 
 Protocol changes require focused unit tests and HTTP contract tests. Do not place real endpoints, model names, credentials, or private gateway details in source, tests, documentation, commits, or logs.
 
+## Container image policy
+
+Container images must be built and published only by the repository's GitHub Actions release workflow. Never run `docker build`, `docker buildx build`, or any equivalent local/container image build command on a developer machine or deployment host. Developer and deployment machines may only pull published images, run them, and perform runtime verification with commands such as `docker pull`, `docker run`, and `docker inspect`.
+
+If image validation requires a new image, push the appropriate commit/tag and let GitHub Actions produce it; then pull the published digest for testing. Do not use QEMU or a local native build as a substitute for this workflow.
+
 ## Architecture
 
 | Responsibility | Path |
 |---|---|
 | Router construction and request lifecycle | `rust/src/router.rs` |
 | Authentication, access modes, headers, model and effort controls | `rust/src/auth.rs` |
-| Upstream connection pool and bounded response reads | `rust/src/upstream.rs` |
+| Upstream connection pool and response reads | `rust/src/upstream.rs` |
 | Anthropic request conversion | `rust/src/transform/request.rs` |
 | Chat response conversion and Anthropic output | `rust/src/transform/response.rs` |
 | OpenAI Responses conversion | `rust/src/transform/responses.rs` |
@@ -52,11 +58,11 @@ Both access modes converge on the same conversion and transport path:
 - Upstream timeout, read, malformed JSON/SSE, missing terminal state, and protocol truncation errors are retryable.
 - A dropped downstream body must cancel the active upstream reader.
 - Model logging is fail-open and must not receive Authorization or additional upstream headers.
-- Fully buffered upstream bodies are bounded at 64 MiB. SSE partial lines and individual events are bounded at 16 MiB and 65,536 lines.
+- As in the TypeScript implementation, fully buffered upstream bodies have no additional Router size limit. SSE partial lines and individual events remain bounded at 16 MiB and 65,536 lines.
 - Do not infer model capabilities from model names, provider names, tool names, or business scenarios.
 - Preserve typed `tool_result` blocks. Chat tool messages remain text-only; multimodal bytes use a following user sidecar. Responses uses typed function output parts.
-- Provider-owned file IDs must be explicitly mapped through `X-Upstream-File-Map`.
-- Incomplete or malformed parallel function calls are atomic: if one call is unsafe, none of the sibling calls may be exposed as executable `tool_use`.
+- Provider-owned file IDs cannot be reused across providers and must fail locally.
+- Explicitly incomplete function calls remain non-executable diagnostics. Malformed arguments in a completed function call are retryable upstream protocol errors.
 - A Responses stream succeeds only after a formal completed or incomplete terminal event. EOF or `[DONE]` alone is not a success declaration.
 - Refusal has higher terminal priority than incomplete tool calls.
 - `thinking.display:"omitted"` hides visible thinking only when explicitly requested while preserving replay state.
@@ -65,7 +71,7 @@ Both access modes converge on the same conversion and transport path:
 ## Change map
 
 - Routes and access modes: `rust/src/router.rs`
-- Header parsing, service auth, model/file/effort mappings: `rust/src/auth.rs`
+- Header parsing, service auth, model and effort mappings: `rust/src/auth.rs`
 - Timeouts, redirects, response size, upstream read failures: `rust/src/upstream.rs`
 - Request fields, tools, thinking, documents, images: `rust/src/transform/request.rs`
 - Chat JSON/SSE responses and Anthropic event shape: `rust/src/transform/response.rs`, `rust/src/streaming.rs`

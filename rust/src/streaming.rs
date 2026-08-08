@@ -671,17 +671,23 @@ impl ChatStreamState {
                 "upstream tool call is missing id or function name",
             ));
         }
-        let malformed_call = complete_tools
-            && tools.values().any(|tool| {
-                match serde_json::from_str::<Value>(if tool.arguments.is_empty() {
+        if complete_tools {
+            for tool in tools.values() {
+                let input = serde_json::from_str::<Value>(if tool.arguments.is_empty() {
                     "{}"
                 } else {
                     &tool.arguments
-                }) {
-                    Ok(input) => !input.is_object(),
-                    Err(_) => true,
+                })
+                .map_err(|_| {
+                    protocol_error("upstream tool arguments must be a valid JSON object")
+                })?;
+                if !input.is_object() {
+                    return Err(protocol_error(
+                        "upstream tool arguments must decode to a JSON object",
+                    ));
                 }
-            });
+            }
+        }
         for item in deferred {
             match item {
                 DeferredSemantic::Text(text) => frames.extend(self.emit_text(&text)),
@@ -699,7 +705,7 @@ impl ChatStreamState {
                     } else {
                         &tool.name
                     };
-                    if !complete_tools || malformed_call {
+                    if !complete_tools {
                         frames.extend(self.emit_text(&incomplete_tool_text(name, &tool.arguments)));
                         continue;
                     }
@@ -735,8 +741,6 @@ impl ChatStreamState {
         frames.extend(self.close_open());
         let stop_reason = if is_refusal {
             "refusal"
-        } else if malformed_call {
-            "max_tokens"
         } else {
             match reason.as_str() {
                 "stop" => "end_turn",
@@ -1114,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_completed_stream_tool_is_diagnostic_max_tokens() {
+    fn malformed_completed_stream_tool_is_a_protocol_error() {
         let mut state = ChatStreamState::new(false);
         for event in [
             json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call","function":{"name":"lookup","arguments":"{broken"}}]},"finish_reason":null}]}),
@@ -1122,22 +1126,9 @@ mod tests {
         ] {
             state.on_raw_event(&event.to_string()).unwrap();
         }
-        let frames = state.finish(false).unwrap();
-        let payloads = payloads(&frames);
-        assert!(payloads.iter().any(|payload| {
-            payload
-                .pointer("/delta/text")
-                .and_then(Value::as_str)
-                .is_some_and(|text| text == "[incomplete tool_use lookup: {broken]")
-        }));
-        assert!(payloads.iter().any(|payload| {
-            payload.pointer("/delta/stop_reason") == Some(&json!("max_tokens"))
-        }));
-        assert!(
-            payloads.iter().all(|payload| {
-                payload.pointer("/content_block/type") != Some(&json!("tool_use"))
-            })
-        );
+        let error = state.finish(false).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert!(error.retryable);
     }
 
     #[test]
