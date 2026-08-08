@@ -1,6 +1,6 @@
 {
   "name": "open-claude-router",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Routing-stateless Anthropic <-> OpenAI protocol bridge for Claude Code. All upstream info passed per-request via headers.",
   "license": "MIT",
   "type": "module",
@@ -15,6 +15,8 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
     "test:stream": "tsx scripts/verify-thinking-stream.ts",
+    "test:rust-parity": "tsx scripts/verify-rust-parity.ts",
+    "bench:router": "tsx scripts/benchmark-router.ts",
     "test:live": "tsx scripts/verify-live-upstream.ts"
   },
   "dependencies": {

@@ -35,6 +35,7 @@ jobs:
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
           package_version="$(node -p 'require("./package.json").version')"
+          cargo_version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' rust/Cargo.toml | head -n 1)"
           semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
           if [[ ! "${tag_version}" =~ ${semver_re} ]]; then
             echo "Release tag must be a SemVer tag (optionally prefixed with v)." >&2
@@ -42,6 +43,10 @@ jobs:
           fi
           if [[ "${tag_version}" != "${package_version}" ]]; then
             echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${package_version}." >&2
+            exit 1
+          fi
+          if [[ "${tag_version}" != "${cargo_version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match rust/Cargo.toml version ${cargo_version}." >&2
             exit 1
           fi
 
@@ -59,6 +64,27 @@ jobs:
 
       - name: Build application
         run: npm run build
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+          rustup default 1.97.1
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path rust/Cargo.toml -- --check
+
+      - name: Lint Rust
+        run: cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+
+      - name: Run Rust unit and integration tests
+        run: cargo test --locked --manifest-path rust/Cargo.toml --all-targets
+
+      - name: Verify Rust and TypeScript protocol parity fixtures
+        run: npm run test:rust-parity
+
+      - name: Build Rust release binary
+        run: cargo build --locked --release --manifest-path rust/Cargo.toml
 
   publish:
     name: Publish multi-platform image

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-20.18.1+-3B82A6?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js" /></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.97+-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust" /></a>
   <a href="https://hub.docker.com/r/riba2534/open-claude-router"><img src="https://img.shields.io/docker/pulls/riba2534/open-claude-router?style=for-the-badge&color=2496ED&logo=docker&logoColor=white" alt="Docker Pulls" /></a>
   <a href="https://github.com/riba2534/open-claude-router/stargazers"><img src="https://img.shields.io/github/stars/riba2534/open-claude-router?style=for-the-badge&color=f5a623" alt="Stars" /></a>
   <a href="https://github.com/riba2534/open-claude-router/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-teal.svg?style=for-the-badge" alt="License" /></a>
@@ -49,7 +49,7 @@ Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(Ope
 - **结构化输出与严格工具**：Anthropic `output_config.format` 和 `tools[].strict` 分别映射到 Chat Completions / Responses 的正式结构，不按模型名猜测支持能力
 - **上游错误统一交给客户端重试**：上游返回任意非 2xx 时保留原状态码和错误内容，同时响应 `X-Should-Retry: true`，由 Claude Code 使用自身有界重试策略处理；服务端不读取错误文本后修改请求体重发
 - **两种接入方式**：上游信息可以放 HTTP header，也可以直接拼在 URL path 里
-- **轻量好部署**：esbuild 打包为单文件，Docker 镜像几十 MB，开箱即用
+- **高并发单二进制**：Axum + Tokio + rustls/HTTP2 连接池；流式链路逐 chunk 转换并传播背压与取消，生产镜像无需 Node.js 运行时
 
 ## 架构
 
@@ -90,17 +90,23 @@ curl http://localhost:3457/healthz   # 预期 {"status":"ok"}
 > 端口被占用时改宿主端口即可，例如 `-p 13457:3457`，并把下面 alias 里的 `localhost:3457` 同步改成 `localhost:13457`。
 
 <details>
-<summary>开发者：自己构建 / 用 npm 跑</summary>
+<summary>开发者：自己构建 / 裸跑</summary>
 
 ```bash
 # 自己构建镜像
 docker build -t open-claude-router .
 docker run -d --name ocr --restart unless-stopped -p 3457:3457 open-claude-router
 
-# 或直接用 npm 跑（tsx watch 模式）
-npm install
-npm run dev
+# 或直接运行 Rust 服务
+rustup toolchain install 1.97.1 --profile minimal
+cargo run --manifest-path rust/Cargo.toml
+
+# release 二进制
+cargo build --locked --release --manifest-path rust/Cargo.toml
+./rust/target/release/open-claude-router
 ```
+
+仓库保留 TypeScript 实现作为协议兼容性 oracle 和历史回归基线；生产镜像与默认部署运行 Rust 实现。
 </details>
 
 ### 2. 配置单行明文 alias（最推荐）
@@ -188,7 +194,7 @@ header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`�
 | document / file block | ✅ base64 / text source 转 Chat `file_data`；Chat 没有正式 `file_url`，URL source 转含 URL 的有界文本；`source:content` 按原顺序展开 text/image，并用 metadata text 保留 title/context；未来未知 source 有界降级；provider-owned `file_id` 本地 400 | ✅ base64/text/URL 转 `input_file`，`source:content` 原样展开为正式 input parts；同样拒绝跨 provider file id |
 | provider-owned replay state | ⚠️ 顶层 `container`、`redacted_thinking`、`compaction` / `container_upload` 等 opaque state 无法跨 Anthropic 与 OpenAI provider 重放，显式返回协议错误；对应 nullable 字段为 null 时是 no-op | 同左；Responses 输出的 compaction / hosted function-output state 同样显式 502，不伪装成普通文本 |
 | `/model sonnet` / `opus` / haiku 切换 | ✅ body.model 字段透传 | 同左 |
-| 客户端中断（Ctrl+C） | ✅ AbortSignal 传到上游 | 同左 |
+| 客户端中断（Ctrl+C） | ✅ 取消当前上游 reader / fetch | 同左 |
 | `output_config.effort` / `thinking` budget | ✅ `low/medium/high/xhigh/max` 精确转成 `reasoning_effort`，不按模型名截断；`thinking.type:"enabled"` 必须提供有限整数且 `budget_tokens >= 1024`，不能与强制 `any` / named tool choice 组合；`adaptive` 必须省略 budget | ✅ 显式 effort 精确转成 `reasoning.effort`；没有显式 effort 时，只有合法 enabled budget 才派生 heuristic 档位，adaptive 交给上游默认且允许强制工具 |
 | `thinking` 块 / display | ⚠️ 使用兼容扩展 `reasoning_content`；Chat 没有标准 encrypted replay state，Router 因此把上游明文 reasoning 封入自描述 opaque signature。普通模式显示 thinking，显式 `display:"omitted"` 只返回空 thinking + signature，下一轮再无状态解包回原 `reasoning_content`；这保证协议往返，但不是上游原生加密状态 | ✅ reasoning summary / `reasoning_text` 转 thinking；`{item id, encrypted_content}` 封装成 opaque signature，多个 reasoning item 独立封口并按与 tool call 的邻接关系回放。正式回放始终保留必填 id；可见模式下上游没有 encrypted state 时以 id + 可见 reasoning 兜底，显式 omitted 则必须保留 encrypted state |
 | 严格工具 / 结构化输出 | ✅ `tools[].strict` 保真；`output_config.format` → `response_format.json_schema` | ✅ 未声明 strict 时显式发送 `strict:false`；`output_config.format` → `text.format` |
@@ -200,13 +206,11 @@ header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`�
 | legacy `function_call`（旧式 Chat 工具调用） | ✅ 流式与非流式均归一为 `tool_use`，不会静默丢弃 | 不适用 |
 | 流式/非流式形态错位 | ✅ 响应形态永远跟随客户端 `stream` 标志：上游对 `stream:true` 回 JSON 时合成完整 SSE，对 `stream:false` 回 SSE 时聚合成 JSON | 同左 |
 | Prompt cache（`cache_control`） | ⚠️ Anthropic 显式 breakpoint 会被剥（避免严格上游 400）；若上游自行报告 cached tokens，usage 会映射返回 | 同左 |
-| `count_tokens` 端点 | ⚠️ 服务本地 `js-tiktoken` 粗略估算（非上游精确值） | 同左 |
+| `count_tokens` 端点 | ⚠️ 服务本地 `tiktoken-rs`（o200k）粗略估算（非上游精确值） | 同左 |
 
 Router 只做协议转换，不根据模型名猜测视觉、推理或工具能力。标准图片结构仍被文本模型或能力不完整的兼容端点拒绝时，错误属于所选模型 / 上游；Router 会保留上游状态并按既定策略标记为可重试。完整逐字段审计、责任边界和复现证据见 [`docs/protocol-audit-2026-07-31.md`](docs/protocol-audit-2026-07-31.md)。
 
 ### 开发验证
-
-当前 0.5.0 候选代码基于 0.4.0 发布提交 `2683537`；该 0.4.0 基线已经包含“所有上游非 2xx 标记 `X-Should-Retry:true`”的既定行为。本轮没有删除或改变该逻辑，并保留了状态码、单次 fetch 和 retry header 的回归测试。
 
 仓库完整验证：
 
@@ -216,7 +220,14 @@ npm run typecheck
 npm test
 npm run test:stream
 npm run build
+cargo fmt --manifest-path rust/Cargo.toml -- --check
+cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets --all-features -- -D warnings
+cargo test --locked --manifest-path rust/Cargo.toml --all-targets
+npm run test:rust-parity
+cargo build --locked --release --manifest-path rust/Cargo.toml
 ```
+
+`npm` 命令验证 TypeScript oracle；Rust 单元/HTTP 契约测试与差分夹具验证生产实现。协议转换改动应同时增加 Rust 测试和 TypeScript/Rust parity fixture。
 
 自动化回归、三套真实上游的最新通过数与 `origin/main` A/B 结果记录在[协议审计报告](docs/protocol-audit-2026-07-31.md)。真实矩阵覆盖文本、流式、单/并行工具、base64/URL 图片、document、嵌套 `tool_result`、reasoning 回放和错误边界。两项 classified skip 来自兼容网关跨请求回放 reasoning item 时明确返回 400/409 `item not found / different resource`，归类为上游跨资源状态限制。无效模型 400/404/502 和这两项回放拒绝均由 Router 单次转发、保留状态与 Anthropic error envelope，并返回 `X-Should-Retry:true`；仓库不记录 endpoint、模型名或凭证。可用自己的上游复跑：
 
@@ -231,19 +242,20 @@ npm run test:live
 
 ### 发布 Docker 镜像
 
-推送版本 tag 时，GitHub Actions 会自动执行类型检查、全部回归、流式验证和构建，通过后发布 `linux/amd64`、`linux/arm64` 多架构镜像并校验 manifest / attestations。发布前须在仓库 Actions secrets 配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`；候选分支应先合入并更新到最新 `main`，tag 必须是 SemVer（可带 `v` 前缀），且版本必须与 `package.json` 完全一致。使用 annotated tag，并显式推送该 tag，避免轻量 tag 被 `--follow-tags` 遗漏：
+推送版本 tag 时，GitHub Actions 会自动执行 TypeScript oracle、Rust fmt/clippy/test、差分夹具和 release 构建，通过后发布 Rust `linux/amd64`、`linux/arm64` 多架构镜像并校验 manifest / attestations。发布前须在仓库 Actions secrets 配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`；tag 必须是 SemVer（可带 `v` 前缀），且版本必须同时与 `package.json`、`rust/Cargo.toml` 一致。使用 annotated tag，并显式推送该 tag：
 
 ```bash
 git switch main
 git pull --ff-only origin main
-test "$(node -p 'require("./package.json").version')" = "0.5.0"
+test "$(node -p 'require("./package.json").version')" = "0.6.0"
+test "$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' rust/Cargo.toml | head -n 1)" = "0.6.0"
 test -z "$(git status --porcelain)"
-git tag -a v0.5.0 -m "release: 0.5.0"
+git tag -a v0.6.0 -m "release: 0.6.0"
 git push origin main
-git push origin refs/tags/v0.5.0
+git push origin refs/tags/v0.6.0
 ```
 
-稳定版本会发布 `0.5.0`、`0.5` 和 `latest`；预发布版本不会覆盖 `latest`。
+稳定版本会发布 `0.6.0`、`0.6` 和 `latest`；预发布版本不会覆盖 `latest`。
 
 ## API
 
@@ -286,14 +298,15 @@ Claude Code 会自动追加 `/v1/messages`，服务端识别并砍掉这个后�
 |---|---|---|
 | `PORT` | `3457` | 监听端口 |
 | `HOST` | `0.0.0.0` | 监听地址 |
-| `LOG_LEVEL` | `info` | Pino 日志级别（`trace` / `debug` / `info` / `warn`） |
+| `RUST_LOG` | `info` | `tracing` 过滤器，例如 `info`、`open_claude_router=debug,tower_http=info` |
+| `LOG_LEVEL` | `info` | 兼容变量；未设置 `RUST_LOG` 时作为运行日志过滤器 |
 | `OCR_ACCESS_TOKENS` | unset | 逗号分隔的访问 token 白名单；不设则关闭服务自身鉴权。header 模式校验 `Authorization: Bearer ...`，path 模式校验 `X-OCR-Token` header |
 | `OCR_MODEL_LOG_MODE` | `full` | 模型交互日志正文模式：`full` 记录正文、`metadata` 仅记录模型/状态/耗时/字节数、`off` 关闭 |
 | `OCR_MODEL_LOG_RETENTION_DAYS` | `7` | 模型交互日志保留的 UTC 自然日数（非负整数）；`0` 等价于关闭日志，与 `OCR_MODEL_LOG_MODE=off` 效果相同 |
 | `OCR_MODEL_LOG_DIR` | `./logs` | 日志目录；官方镜像工作目录下对应 `/app/logs` |
 | `OCR_MODEL_LOG_MAX_BODY_BYTES` | `1048576` | 每个请求或响应最多保留的正文 byte 数；超出后只截断日志副本，不影响实际转发 |
 
-> 上游请求默认超时 **1 小时**（`src/utils/upstream.ts`，为长补全 / 推理模型留足余量），目前硬编码、暂不可通过环境变量调整。客户端中断（Ctrl+C）会通过 AbortSignal 立即传到上游。
+> 上游请求默认超时 **1 小时**（`rust/src/main.rs`，为长补全 / 推理模型留足余量），目前硬编码、暂不可通过环境变量调整。客户端中断（Ctrl+C）会立即取消当前上游读取。
 
 ### 模型交互日志
 
@@ -315,13 +328,13 @@ docker run -d --name ocr --restart unless-stopped -p 3457:3457 \
   riba2534/open-claude-router:latest
 
 # 只看元数据，或完全关闭
-OCR_MODEL_LOG_MODE=metadata npm start
-OCR_MODEL_LOG_MODE=off npm start
+OCR_MODEL_LOG_MODE=metadata cargo run --manifest-path rust/Cargo.toml
+OCR_MODEL_LOG_MODE=off cargo run --manifest-path rust/Cargo.toml
 ```
 
 `off` 只停止新增日志，不会主动删除已有文件；重新启用后，启动清理会按当时配置的保留期处理历史文件。
 
-日志写入是 fail-open 的：目录不可写或磁盘异常只会产生一条运行告警，不会改变请求/响应、流式背压、状态码或重试语义。`LOG_LEVEL` 控制的 Pino 运行日志仍写 stdout，其保留期由 Docker/宿主机日志驱动决定，不受上述变量影响。
+日志写入是 fail-open 的：目录不可写或磁盘异常只会产生一条运行告警，不会改变请求/响应、流式背压、状态码或重试语义。`RUST_LOG`（或兼容的 `LOG_LEVEL`）控制 JSON 运行日志并写 stdout，其保留期由 Docker/宿主机日志驱动决定，不受上述变量影响。
 
 > `full` 会记录提示词、工具参数/结果以及模型输出，可能包含业务数据；服务不会把 `Authorization`、`X-Upstream-Authorization` 或额外上游 header 写入模型交互日志。多人共享部署可按需要改用 `metadata` 或 `off`。
 
@@ -331,9 +344,9 @@ OCR_MODEL_LOG_MODE=off npm start
 
 | 场景 | 命令 |
 |---|---|
-| 本地 npm / 裸跑，仅本机访问 | `HOST=127.0.0.1 npm run dev` |
-| 进程层启用 IPv6 双栈 | `HOST=:: npm run dev` |
-| 自定义端口 | `PORT=8080 npm run dev` |
+| 本地裸跑，仅本机访问 | `HOST=127.0.0.1 cargo run --manifest-path rust/Cargo.toml` |
+| 进程层启用 IPv6 双栈 | `HOST=:: cargo run --manifest-path rust/Cargo.toml` |
+| 自定义端口 | `PORT=8080 cargo run --manifest-path rust/Cargo.toml` |
 | Docker，宿主仅本机访问（**推荐**） | `docker run -d -p 127.0.0.1:3457:3457 riba2534/open-claude-router:latest` |
 
 > ⚠️ Docker bridge 模式（`-p` 端口映射）下，**不要**在容器内设 `HOST=127.0.0.1`——docker-proxy 是从宿主转发到容器 IP（通常 `172.17.x.x`），容器只听 lo 接口会直接连不通。要限制宿主访问范围，改宿主端口绑定（`-p 127.0.0.1:3457:3457`），容器内继续 `0.0.0.0`。
@@ -351,7 +364,7 @@ OCR_MODEL_LOG_MODE=off npm start
 
 - 这是**透明转发**服务：上游凭证经服务转发，**务必走 HTTPS**
 - 公网部署强烈建议设置 `OCR_ACCESS_TOKENS` 防止扫描滥用
-- 日志默认脱敏 `authorization` / `x-upstream-authorization` / `x-upstream-headers` / `x-api-key`（Pino `redact`）
+- JSON 运行日志不记录请求 header；模型交互日志只接收转换后的正文和脱敏 URL
 - 模型交互日志不记录请求 header，但 `full` 模式会记录提示词、工具内容和模型输出；敏感场景请改用 `OCR_MODEL_LOG_MODE=metadata` 或 `off`
 - 不要把上游凭证写入版本控制的文件，用 `~/.zshrc` 或 1Password CLI 等工具按需注入
 
@@ -367,7 +380,7 @@ OCR_MODEL_LOG_MODE=off npm start
 
 ## 致谢
 
-本项目的协议转换核心代码移植自 [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router)（MIT 协议）。我们把它的 transformer 实现包装成一个路由和会话无状态的 HTTP 服务，配合 Claude Code 客户端的 alias 形态使用。协议审计还交叉参考了 CLIProxyAPI 与 claude-code-router 的源码和可执行 fixture；它们是证据来源，不是天然正确或需要机械对齐的实现基线。
+本项目最初的 TypeScript 协议转换核心移植自 [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router)（MIT 协议）；当前生产服务已用 Rust 独立实现，并以保留的 TypeScript transformer 和可执行 fixture 做差分验证。协议审计还交叉参考了 CLIProxyAPI 与 claude-code-router；它们是证据来源，不是天然正确或需要机械对齐的实现基线。
 
 ## License
 

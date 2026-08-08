@@ -4,22 +4,44 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目定位
 
-open-claude-router 是一个**路由和会话无状态**的 Anthropic Messages API ↔ OpenAI 协议（Chat Completions / Responses）转换服务。所有上游信息（URL、Authorization、模型名）由请求方逐请求传过来，服务端不读 provider 配置、不存任何凭证。客户端通过 HTTP header `X-Upstream-Format` 选择上游协议变体（不传或 `chat-completions` = 默认；`responses` = OpenAI o-series / gpt-5 原生协议）。服务默认把模型侧请求/响应写入保留 7 天的运维审计日志，但不写 Authorization；详见 README 的“模型交互日志”。
+open-claude-router 是一个**路由和会话无状态**的 Anthropic Messages API ↔ OpenAI 协议（Chat Completions / Responses）转换服务。生产实现位于 `rust/`，使用 Axum + Tokio；`src/` 下的 TypeScript 实现保留为协议兼容性 oracle 和历史回归基线，不进入生产 Docker 镜像。所有上游信息（URL、Authorization、模型名）由请求方逐请求传过来，服务端不读 provider 配置、不存任何凭证。客户端通过 HTTP header `X-Upstream-Format` 选择上游协议变体（不传或 `chat-completions` = 默认；`responses` = OpenAI o-series / gpt-5 原生协议）。服务默认把模型侧请求/响应写入保留 7 天的运维审计日志，但不写 Authorization；详见 README 的“模型交互日志”。
 
 ## 常用命令
 
-- `npm run dev` — tsx watch 启动，默认监听 `:3457`
-- `npm run typecheck` — `tsc --noEmit`，改动后必跑
-- `npm test` — Node test runner 自动化回归套件
-- `npm run test:stream` — 流式集成/回归测试
-- `npm run test:live` — 使用 `OCR_LIVE_*` 环境变量运行真实 Chat / Responses 上游矩阵
-- `npm run build` — esbuild 打包成 `dist/server.js` 单文件
-- `npm start` — 跑 build 产物
+- `cargo run --manifest-path rust/Cargo.toml` — 启动生产 Rust 服务，默认监听 `:3457`
+- `cargo fmt --manifest-path rust/Cargo.toml -- --check` — Rust 格式检查
+- `cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets --all-features -- -D warnings` — Rust 严格 lint
+- `cargo test --locked --manifest-path rust/Cargo.toml --all-targets` — Rust 单元和 HTTP 契约测试
+- `cargo build --locked --release --manifest-path rust/Cargo.toml` — 构建 release 单二进制
+- `npm run test:rust-parity` — TypeScript oracle ↔ Rust 差分夹具，协议改动后必跑
+- `npm run dev` / `npm run build` — 仅启动/构建 TypeScript oracle
+- `npm run typecheck && npm test && npm run test:stream` — TypeScript 历史回归基线
+- `npm run test:live` — 使用 `OCR_LIVE_*` 环境变量运行真实 Chat / Responses 上游矩阵（可指向 Rust 实例）
 - `docker buildx build --platform linux/amd64,linux/arm64 -t riba2534/open-claude-router:latest --push .` — 推 Dockerhub（多架构）
 
-完整验收先执行 `npm ci`，再执行 `npm run typecheck && npm test && npm run test:stream && npm run build`。协议转换改动必须补对应 fixture；需要真实上游 canary 时使用 `scripts/verify-live-upstream.ts`，不得把 endpoint、模型名或凭证写进仓库。
+完整验收先执行 `npm ci`，再依次执行 TypeScript 基线、Rust fmt/clippy/test、`npm run test:rust-parity`、Rust release 构建。协议转换改动必须补 Rust 测试及 parity fixture；需要真实上游 canary 时使用 `scripts/verify-live-upstream.ts`，不得把 endpoint、模型名或凭证写进仓库。
 
 ## 高层架构
+
+### Rust 生产实现
+
+| 责任 | Rust 文件 |
+|---|---|
+| 路由、两种接入模式、响应形态选择 | `rust/src/router.rs` |
+| 鉴权、上游 URL/model/effort/header 解析 | `rust/src/auth.rs` |
+| 上游连接池、单次请求、错误正文 | `rust/src/upstream.rs` |
+| Anthropic 请求 → unified/Chat | `rust/src/transform/request.rs` |
+| unified ↔ Responses | `rust/src/transform/responses.rs` |
+| Chat/Anthropic 响应与 JSON→SSE | `rust/src/transform/response.rs` |
+| SSE 增量解码、聚合与流式转换 | `rust/src/sse.rs`、`rust/src/streaming.rs` |
+| 模型交互日志 | `rust/src/model_log.rs` |
+| token 粗估 | `rust/src/tokenizer.rs` |
+
+Rust 使用一个共享的 `reqwest::Client` 连接池，禁用 redirect，Chat 与纯文本 Responses SSE 支持首 token 增量返回；需要先封口的 reasoning/tool Responses 项只缓冲语义状态。下游 body 被丢弃时必须同步丢弃上游 reader。生产改动先落 Rust；若改变协议契约，再同步 TypeScript oracle/fixture，保证差分测试有明确证据。
+
+### TypeScript 协议 oracle
+
+以下架构描述对应 `src/` 下的 oracle。它继续承载完整历史回归和 vendor 差异说明，但不是生产请求链路；Rust 文件应实现同一外部契约。
 
 ### 两种客户端接入模式 + 一个协议选择 header
 
@@ -137,7 +159,9 @@ Claude Code 客户端会带 `anthropic-version`、`anthropic-beta`、`x-stainles
 - 流结束但从未出现 finish_reason 时，不得丢弃已收到的内容：只有见过 `[DONE]` 才能按上游自己的完成声明兼容封口为 `end_turn`；body 直接断掉属于传输/协议截断，必须在保留已收文本或残缺工具诊断后发 `error`，不得猜成 `max_tokens` 成功终态。有残缺 tool call 时绝不能生成可执行 `tool_use`。
 - Responses 历史回放：assistant 轮次是否补空壳取决于**实际产出的 item 数**，不是 `output_blocks.length`，否则全部 block 不可回放时会留下连续两条 user。reasoning item 必须按正式 Responses schema 同时保留必填的 `id` / `summary` / `type`；`encrypted_content` 是无状态回放的补充，不能替代必填 `id`。兼容网关明确拒绝跨资源/过期状态时，保留原始非 2xx 响应并交给客户端，不得删除历史后二次请求上游。
 
-## 改动指引
+## TypeScript oracle 改动指引
+
+下表只定位 oracle。生产实现的对应文件见前面的 Rust 表；修复不能只落在 `src/`，必须先修 `rust/` 并由 parity fixture 证明两边契约一致。
 
 | 任务 | 主要文件 |
 |---|---|
@@ -153,14 +177,14 @@ Claude Code 客户端会带 `anthropic-version`、`anthropic-beta`、`x-stainles
 
 模块系统是 ESM（`"type": "module"`），源码 import 必须带 `.js` 扩展名后缀（TS 编译后生效）。新功能优先看 transformer vendor 里是否已有可复用的方法，不要自己实现 SSE 解析。
 
-### 加新上游协议（如 Gemini / Vertex）的 4 步模板
+### TypeScript oracle 加新上游协议（如 Gemini / Vertex）的 4 步模板
 
 1. **Vendor transformer** 到 `src/transformers/<name>.ts`，按下面"vendor cheat sheet"修
 2. **`src/utils/auth.ts`** `UpstreamFormat` 加新枚举值，`parseUpstreamFormat` 加 `if` 分支
 3. **`src/routes/messages.ts`** `registerMessagesRoute` new 第三个 transformer 实例 + 赋 logger；`forwardMessages` 当前请求侧是 `if (responses) {…} else {chat}`、响应侧 `if (responses) {…}`——加第三协议前先把请求侧 `else` 显式化为 `else if (format === "chat-completions")` 再追加新分支，响应侧同理，否则新协议会落进 chat 兜底被错误处理
 4. **README** 加 `### 方式 D` 示例 + "请求头"表 `X-Upstream-Format` 行的可选值清单
 
-路由层、auth 层、utils 都不动——这是 `X-Upstream-Format` header 设计的扩展点。
+完成 oracle 后，还必须在 `rust/src/auth.rs` 增加格式枚举与解析，在 `rust/src/router.rs` 显式增加请求/响应分支，并在 `rust/src/transform/` 实现转换和差分夹具。不能让新协议落入 Chat 默认分支。
 
 ### Vendor [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router) transformer 的 cheat sheet
 
