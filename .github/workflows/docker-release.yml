@@ -2,8 +2,13 @@ name: Publish release
 
 on:
   push:
+    branches:
+      - "feat/rust-rewrite"
     tags:
       - "*"
+    paths:
+      - ".github/workflows/docker-release.yml"
+      - "rust/**"
   workflow_dispatch:
 
 permissions:
@@ -38,7 +43,7 @@ jobs:
             exit 1
           fi
 
-          if [[ "${GITHUB_EVENT_NAME}" = "push" ]]; then
+          if [[ "${GITHUB_REF_TYPE}" = "tag" ]]; then
             tag_version="${GITHUB_REF_NAME#v}"
             if [[ ! "${tag_version}" =~ ${semver_re} ]]; then
               echo "Release tag must be SemVer, optionally prefixed with v." >&2
@@ -274,7 +279,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.platform }} natively
-    if: github.event_name == 'push'
+    if: github.ref_type == 'tag'
     needs: validate
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -345,7 +350,7 @@ jobs:
 
   publish:
     name: Publish multi-platform manifest
-    if: github.event_name == 'push'
+    if: github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -453,7 +458,7 @@ jobs:
 
   github-release:
     name: Publish GitHub Release
-    if: github.event_name == 'push'
+    if: github.ref_type == 'tag'
     needs:
       - build-binaries
       - publish
