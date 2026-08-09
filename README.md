@@ -5,52 +5,53 @@
 <h1 align="center">open-claude-router</h1>
 
 <p align="center">
-  把任意 OpenAI 兼容上游"包装成" Anthropic Messages API，让 <a href="https://docs.anthropic.com/claude/docs/claude-code">Claude Code</a> 能直接使用。
+  让 Claude Code 通过 Anthropic Messages API 使用 OpenAI Chat Completions 或 Responses 协议上游。
 </p>
 
 <p align="center">
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.97+-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust" /></a>
   <a href="https://github.com/riba2534/open-claude-router/releases/latest"><img src="https://img.shields.io/github/v/release/riba2534/open-claude-router?style=for-the-badge&color=2ea44f" alt="GitHub Release" /></a>
   <a href="https://hub.docker.com/r/riba2534/open-claude-router"><img src="https://img.shields.io/docker/pulls/riba2534/open-claude-router?style=for-the-badge&color=2496ED&logo=docker&logoColor=white" alt="Docker Pulls" /></a>
   <a href="https://github.com/riba2534/open-claude-router/stargazers"><img src="https://img.shields.io/github/stars/riba2534/open-claude-router?style=for-the-badge&color=f5a623" alt="Stars" /></a>
-  <a href="https://github.com/riba2534/open-claude-router/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-teal.svg?style=for-the-badge" alt="License" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-teal.svg?style=for-the-badge" alt="License" /></a>
 </p>
 
 ---
 
 ## 这是什么
 
-[Claude Code](https://docs.anthropic.com/claude/docs/claude-code) 只接受 Anthropic Messages API，但你想用的模型可能跑在 OpenAI 协议上——OpenAI 官方、第三方聚合网关、自托管推理服务。这个项目就是夹在中间的**协议转换桥梁**：
+[Claude Code](https://code.claude.com/docs/en/overview) 使用 Anthropic Messages API。open-claude-router 在客户端与 OpenAI 协议上游之间转换请求和响应：
 
 ```
 Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(OpenAI Chat Completions / Responses)──▶  上游
 ```
 
-跟其他类似工具最大的差异：**路由和会话无状态**。所有上游信息（URL、Authorization、模型名）由客户端逐请求通过 HTTP header 或 URL path 传入——服务端不读 provider 配置、不存任何 API Key、不维护会话状态。一份部署可以同时服务任意客户端、任意上游。为了排查协议兼容问题，服务会把模型侧请求/响应及直接客户端 IP 写入本地审计日志（默认保留 7 天，可配置或关闭；Authorization 不写入日志）。
+服务的协议路由和会话是无状态的。上游 URL、Authorization 和模型名由客户端逐请求传入；服务端不读取上游配置文件、不持久化凭证、不维护对话状态。一份部署可以同时服务多个客户端和上游。
+
+上游凭证在转发时会经过 Router 进程，但不会写入模型交互日志。默认审计日志会记录转换后的上游请求、上游原始响应和直接客户端 IP，按 UTC 日期保存 7 天；可调整保留期、只记录元数据或完全关闭。
 
 典型场景：
 
-- **个人自部署**：`docker run` 一行起，shell alias 里写你的上游凭证
-- **团队共享**：内网起一份部署，每人 alias 里写各自的上游和 token，**凭证完全留在客户端，服务端无需集中管理**
+- **个人自部署**：启动一个容器或二进制，在 shell alias 里配置上游
+- **团队共享**：内网部署一份服务，每人通过自己的 alias 逐请求提供上游配置；服务端不需要维护统一的上游账号表
 - **多家上游切换**：不同 alias 指向不同上游 / 模型，无需重启服务
 
 ## 目录
 
-[特性](#特性) · [架构](#架构) · [快速开始](#快速开始) · [协议覆盖与边界](#协议覆盖与边界) · [API](#api) · [环境变量](#环境变量) · [常见问题](#常见问题) · [安全](#安全) · [致谢](#致谢)
+[快速开始](#快速开始) · [配置说明](#配置说明) · [协议覆盖与边界](#协议覆盖与边界) · [API](#api) · [环境变量](#环境变量) · [模型交互日志](#模型交互日志) · [常见问题](#常见问题) · [安全](#安全)
 
 ## 特性
 
-- **路由和会话无状态**：服务侧不存任何 API Key、不读 provider 配置、不维护会话状态；上游信息全部由客户端逐请求传入（配置都在客户端 alias 里）
+- **路由和会话无状态**：服务侧不持久化 API Key、不读上游配置、不维护会话状态；上游信息由客户端逐请求传入
 - **模型交互日志**：按请求 ID 记录直接客户端 IP、接入模式、转换后实际发给上游的 JSON、上游原始 JSON/SSE 和取消阶段，默认按 UTC 天轮转并保留 7 天；正文模式、保留期、目录和单条上限均可配置
-- **任意 Authorization 格式**：标准 `Bearer sk-...`、企业网关常见的非 Bearer 自定义协议头都能原样透传
-- **完整覆盖 Claude Code 协议**：流式 SSE、工具调用（`tool_use` / `tool_result` 双向增量）、多模态图片、`thinking` 块（覆盖范围与限制见下方["协议覆盖与边界"](#协议覆盖与边界)表）
-- **同时支持 OpenAI 两套协议**：默认走 Chat Completions（兼容 OpenAI 官方、OpenRouter、各类 OpenAI 兼容网关 / Kimi / DeepSeek 等），通过 `X-Upstream-Format: responses` opt-in 切到 Responses API（OpenAI o-series / gpt-5 原生协议，含 reasoning summary 转 Anthropic `thinking` 块）
+- **Authorization 值透明转发**：合法的 Bearer 或非 Bearer 上游鉴权值不会被解析或重组
+- **覆盖 Claude Code 核心链路**：支持流式 SSE、工具调用、多模态输入、thinking、结构化输出、错误转换和客户端取消；不能安全转换的边界会明确报错
+- **支持两种 OpenAI 协议**：默认使用 Chat Completions；通过 `X-Upstream-Format: responses` 选择 Responses API
 - **alias 里完成全部配置**：Claude Code 标准模型环境变量、上游 URL、上游凭证、服务鉴权和额外网关 header 都能随 alias 注入
 - **遵循 Claude Code 模型配置**：通过 `ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_OPUS_MODEL`、`ANTHROPIC_DEFAULT_SONNET_MODEL`、`ANTHROPIC_DEFAULT_HAIKU_MODEL` 直接填写真实上游模型；Router 默认原样转发请求体中的 `model`
 - **结构化输出与严格工具**：Anthropic `output_config.format` 和 `tools[].strict` 分别映射到 Chat Completions / Responses 的正式结构，不按模型名猜测支持能力
 - **上游错误统一交给客户端重试**：上游返回任意非 2xx 时保留原状态码和错误内容，同时响应 `X-Should-Retry: true`，由 Claude Code 使用自身有界重试策略处理；服务端不读取错误文本后修改请求体重发
 - **两种接入方式**：上游信息可以放 HTTP header，也可以直接拼在 URL path 里
-- **高并发单二进制**：Axum + Tokio + rustls/HTTP2 连接池；流式链路逐 chunk 转换并传播背压与取消，生产镜像只包含 Rust 可执行文件
+- **Rust 单二进制运行时**：复用上游连接，流式链路逐 chunk 转换并传播背压与取消；应用进程只需一个可执行文件
 
 ## 架构
 
@@ -95,7 +96,8 @@ curl http://localhost:3457/healthz   # 预期 {"status":"ok"}
 
 > 端口被占用时改宿主端口即可，例如 `-p 13457:3457`，并把下面 alias 里的 `localhost:3457` 同步改成 `localhost:13457`。
 
-#### 预编译二进制
+<details>
+<summary>不用 Docker：下载预编译二进制</summary>
 
 每个稳定版本都会在 [GitHub Releases](https://github.com/riba2534/open-claude-router/releases) 提供以下归档，不需要安装 Rust：
 
@@ -111,7 +113,7 @@ Linux / macOS：
 
 ```bash
 # 把版本和平台替换成 Release 页面中的实际值
-VERSION=v0.6.9
+VERSION=v0.6.10
 PLATFORM=linux-amd64
 ARCHIVE="open-claude-router-${VERSION}-${PLATFORM}.tar.gz"
 
@@ -128,7 +130,7 @@ cd "open-claude-router-${VERSION}-${PLATFORM}"
 Windows PowerShell：
 
 ```powershell
-$Version = "v0.6.9"
+$Version = "v0.6.10"
 $Platform = "windows-amd64" # Windows on ARM 使用 windows-arm64
 $Archive = "open-claude-router-$Version-$Platform.zip"
 
@@ -138,6 +140,8 @@ Expand-Archive $Archive
 ```
 
 二进制默认监听 `0.0.0.0:3457`，模型交互日志写到当前目录的 `./logs`；端口、鉴权和日志配置与 Docker 版本使用相同的[环境变量](#环境变量)。macOS/Windows 产物目前没有商业代码签名；如系统拦截，请先用 `SHA256SUMS` 验证文件确实来自本项目 Release，再按系统提示放行。
+
+</details>
 
 <details>
 <summary>开发者：本地裸跑</summary>
@@ -157,80 +161,126 @@ cargo build --locked --release --manifest-path rust/Cargo.toml
 > 镜像只能由仓库的 GitHub Actions 发布流程构建并推送。本机和部署机器禁止执行 `docker build` / `docker buildx build`，只允许拉取已发布镜像并做运行验证。
 </details>
 
-### 2. 配置单行明文 alias（最推荐）
+### 2. 把 Claude Code alias 写入 `~/.zshrc`
 
-**本项目最推荐的使用方式，是把完整配置以一条明文 alias 写进个人 `~/.zshrc`。** 这样所有上游配置都跟着 alias 走：平时只需输入 alias 名称即可启动 Claude Code，切换上游时换一个 alias，不需要在 Router 服务端维护 provider 配置。
+推荐把一个上游完整配置成一条 alias。以后输入 alias 名称即可启动 Claude Code；要切换上游或模型，就使用另一条 alias。Router 服务端不需要保存上游配置。
 
-下面每个 alias 从 `alias` 到最后的 `claude` 都是**同一条物理行**，可直接作为一整行放进 `~/.zshrc`，不要拆成反斜杠续行。示例没有使用任何真实服务信息；复制前只需替换：
+先确认下面三个值：
 
-- `upstream.example.com`：你的上游域名；
-- `YOUR_UPSTREAM_API_KEY`：上游要求的鉴权值；
-- `YOUR_UPSTREAM_MODEL`：上游实际模型名。
+| 占位符 | 填写内容 |
+|---|---|
+| `upstream.example.com` | 上游域名，远程上游应使用 HTTPS |
+| `YOUR_UPSTREAM_API_KEY` | 上游要求的鉴权值 |
+| `YOUR_UPSTREAM_MODEL` | 上游接受的真实模型 ID |
 
-> alias 会在你的个人 shell 配置中明文保存上游地址和凭证，这是本项目面向个人自部署场景的首选方式。不要把含真实凭证的 `~/.zshrc`、截图或 alias 内容提交到仓库；建议保持 `chmod 600 ~/.zshrc`。
+下面的 alias 都是**一整行**，复制到 `~/.zshrc` 后再替换占位符。
 
-#### Chat Completions：默认格式
+#### 上游使用 Chat Completions
 
-```bash
-alias ocr-chat="ANTHROPIC_BASE_URL=http://127.0.0.1:3457/https://upstream.example.com/v1/chat/completions ANTHROPIC_AUTH_TOKEN='Bearer YOUR_UPSTREAM_API_KEY' ANTHROPIC_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL=YOUR_UPSTREAM_MODEL claude"
-```
-
-#### Responses API
-
-Responses 与 Chat 的区别只有上游路径和 `X-Upstream-Format`，整条 alias 仍然只占 `~/.zshrc` 一行：
+Chat Completions 是默认协议，不需要额外的协议 Header：
 
 ```bash
-alias ocr-responses="ANTHROPIC_BASE_URL=http://127.0.0.1:3457/https://upstream.example.com/v1/responses ANTHROPIC_AUTH_TOKEN='Bearer YOUR_UPSTREAM_API_KEY' ANTHROPIC_CUSTOM_HEADERS='X-Upstream-Format: responses' ANTHROPIC_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL=YOUR_UPSTREAM_MODEL claude"
+alias ocr-chat="ANTHROPIC_BASE_URL=http://127.0.0.1:3457/https://upstream.example.com/v1/chat/completions ANTHROPIC_AUTH_TOKEN='Bearer YOUR_UPSTREAM_API_KEY' ANTHROPIC_MODEL='YOUR_UPSTREAM_MODEL' ANTHROPIC_DEFAULT_OPUS_MODEL='YOUR_UPSTREAM_MODEL' ANTHROPIC_DEFAULT_SONNET_MODEL='YOUR_UPSTREAM_MODEL' ANTHROPIC_DEFAULT_HAIKU_MODEL='YOUR_UPSTREAM_MODEL' CLAUDE_CODE_SUBAGENT_MODEL='YOUR_UPSTREAM_MODEL' CLAUDE_CODE_EFFORT_LEVEL=high API_TIMEOUT_MS=3600000 claude"
 ```
 
-保存后重新加载并启动：
+#### 上游使用 Responses API
+
+Responses alias 需要把上游路径改为 `/v1/responses`，并声明 `X-Upstream-Format: responses`：
+
+```bash
+alias ocr-responses="ANTHROPIC_BASE_URL=http://127.0.0.1:3457/https://upstream.example.com/v1/responses ANTHROPIC_AUTH_TOKEN='Bearer YOUR_UPSTREAM_API_KEY' ANTHROPIC_CUSTOM_HEADERS='X-Upstream-Format: responses' ANTHROPIC_MODEL='YOUR_UPSTREAM_MODEL' ANTHROPIC_DEFAULT_OPUS_MODEL='YOUR_UPSTREAM_MODEL' ANTHROPIC_DEFAULT_SONNET_MODEL='YOUR_UPSTREAM_MODEL' ANTHROPIC_DEFAULT_HAIKU_MODEL='YOUR_UPSTREAM_MODEL' CLAUDE_CODE_SUBAGENT_MODEL='YOUR_UPSTREAM_MODEL' CLAUDE_CODE_EFFORT_LEVEL=high API_TIMEOUT_MS=3600000 claude"
+```
+
+加载配置并启动：
 
 ```bash
 source ~/.zshrc
-ocr-chat       # Chat Completions
-ocr-responses  # Responses API
+ocr-chat       # 使用 Chat Completions 上游
+ocr-responses  # 使用 Responses 上游
 ```
 
-模型名使用 Claude Code 的四个标准环境变量配置，Router 不需要额外做模型映射。上面的单模型示例把四个槽位都指向同一个真实上游模型；如果上游为不同槽位提供不同模型，直接分别填写：
+进入 Claude Code 后可先发送一个简单问题，再执行一次需要工具的任务，确认文本、流式输出和工具调用都正常。
+
+> alias 会在个人 shell 配置中明文保存上游地址和凭证。不要把真实 alias、截图或 `~/.zshrc` 提交到版本控制；建议执行 `chmod 600 ~/.zshrc`。如果 Router 不在本机，客户端到 Router、Router 到上游两段连接都应使用 HTTPS。
+
+## 配置说明
+
+### alias 中的 Claude Code 环境变量
+
+主示例只使用 [Claude Code 官方支持的环境变量](https://code.claude.com/docs/en/env-vars)：
+
+| 变量 | 作用 |
+|---|---|
+| `ANTHROPIC_BASE_URL` | 指向 Router；path 模式下同时把完整上游 URL 拼在 Router 地址后面 |
+| `ANTHROPIC_AUTH_TOKEN` | Claude Code 会在外层加上 `Bearer `；path 模式下 Router 剥掉这一层后，把剩余值作为上游 Authorization |
+| `ANTHROPIC_MODEL` | 当前会话默认模型 |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` / `SONNET` / `HAIKU` | Claude Code 内置模型槽位对应的真实上游模型 ID |
+| `CLAUDE_CODE_SUBAGENT_MODEL` | 子 Agent 使用的模型；单模型上游通常与主模型保持一致 |
+| `CLAUDE_CODE_EFFORT_LEVEL` | Claude Code 推理等级；示例使用 `high`，可改为当前客户端和模型支持的等级，或删除后使用客户端默认值 |
+| `API_TIMEOUT_MS` | Claude Code 请求超时，示例设为 1 小时，与 Router 的上游超时一致 |
+| `ANTHROPIC_CUSTOM_HEADERS` | 通过 Claude Code 给 Router 增加请求 Header；多个 Header 用换行分隔 |
+
+上面的单模型 alias 把所有模型槽位都指向同一个上游模型。如果上游提供多个模型，分别设置即可：
 
 ```bash
-ANTHROPIC_MODEL=YOUR_DEFAULT_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL=YOUR_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL=YOUR_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL=YOUR_HAIKU_MODEL
+ANTHROPIC_MODEL='YOUR_DEFAULT_MODEL' ANTHROPIC_DEFAULT_OPUS_MODEL='YOUR_OPUS_MODEL' ANTHROPIC_DEFAULT_SONNET_MODEL='YOUR_SONNET_MODEL' ANTHROPIC_DEFAULT_HAIKU_MODEL='YOUR_HAIKU_MODEL' CLAUDE_CODE_SUBAGENT_MODEL='YOUR_SUBAGENT_MODEL'
 ```
 
-#### 两个独立选择：接入模式与上游协议
+### 推理等级
 
-alias 的接入模式和上游协议相互独立，不是三种互斥配置：
+Router 不根据模型名猜测推理能力。Claude Code 显式发送 `low`、`medium`、`high`、`xhigh` 或 `max` 时，默认原样转换为：
 
-| 配置维度 | 选项 | 如何选择 |
+- Chat Completions：`reasoning_effort`；
+- Responses：`reasoning.effort`。
+
+如果上游只支持部分等级，可以在 alias 中声明。例如上游最高支持 `high`：
+
+```bash
+# Chat Completions
+ANTHROPIC_CUSTOM_HEADERS='X-Upstream-Effort-Levels: low,medium,high'
+
+# Responses：与协议 Header 放在同一个变量中
+ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Format: responses\nX-Upstream-Effort-Levels: low,medium,high'
+```
+
+此时 `xhigh` 和 `max` 会在请求上游前就近调整为 `high`。也可使用 `X-Upstream-Effort-Map: max=xhigh` 做精确映射，或使用 `X-Upstream-Effort-Map: *=off` 删除推理等级。未配置这些 Header 时，Router 不改写等级；如果上游拒绝，Router 保留错误并交给 Claude Code 决定是否重试。
+
+### path 模式与 header 模式
+
+接入模式和上游协议是两个独立选择：
+
+| 配置维度 | 选项 | 说明 |
 |---|---|---|
-| 上游信息入口 | path 模式 / header 模式 | path 模式把上游 URL 拼进 `ANTHROPIC_BASE_URL`；header 模式使用 `X-Upstream-Url` 和 `X-Upstream-Authorization` |
+| 上游信息入口 | path / header | path 把上游 URL 拼进 `ANTHROPIC_BASE_URL`；header 使用 `X-Upstream-Url` 和 `X-Upstream-Authorization` |
 | 上游协议 | Chat Completions / Responses | Chat 是默认值；Responses 增加 `X-Upstream-Format: responses` |
 
-上面的两个首选 alias 使用 path 模式。path 中放的是**上游 URL**，上游凭证仍来自 `ANTHROPIC_AUTH_TOKEN`；Claude Code 自动添加的外层 `Bearer ` 会被 Router 剥掉，然后把剩余内容作为上游 Authorization 原样发送：
+快速开始里的 alias 使用 path 模式。Claude Code 会把 `ANTHROPIC_AUTH_TOKEN` 放进外层 `Authorization: Bearer ...`；Router 只剥掉第一层 `Bearer `，剩余内容原样作为上游 Authorization。因此：
 
-- 上游需要 `Authorization: Bearer ...` → 写 `ANTHROPIC_AUTH_TOKEN='Bearer YOUR_UPSTREAM_API_KEY'`；
-- 上游需要非 Bearer 自定义值 → 把引号内内容替换为上游要求的完整值。
+- 上游需要 `Authorization: Bearer ...`：写 `ANTHROPIC_AUTH_TOKEN='Bearer YOUR_UPSTREAM_API_KEY'`；
+- 上游需要非 Bearer 值：把引号内内容替换为上游要求的完整值。
 
-path 模式适合不带 query 的上游 URL。如果上游地址必须包含 `?api-version=...` 等 query，或希望显式分离服务鉴权与上游鉴权，请改用 header 模式：
+path 模式不包含 URL query。上游 URL 必须带 query，或希望把 Router 鉴权与上游鉴权明确分开时，使用 header 模式：
 
 ```bash
-alias ocr-header="ANTHROPIC_BASE_URL=http://127.0.0.1:3457 ANTHROPIC_AUTH_TOKEN='YOUR_ROUTER_ACCESS_TOKEN' ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Url: https://upstream.example.com/v1/chat/completions\nX-Upstream-Authorization: Bearer YOUR_UPSTREAM_API_KEY' ANTHROPIC_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL=YOUR_UPSTREAM_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL=YOUR_UPSTREAM_MODEL claude"
+alias ocr-header="ANTHROPIC_BASE_URL=http://127.0.0.1:3457 ANTHROPIC_AUTH_TOKEN='YOUR_ROUTER_ACCESS_TOKEN' ANTHROPIC_CUSTOM_HEADERS=$'X-Upstream-Url: https://upstream.example.com/v1/chat/completions\nX-Upstream-Authorization: Bearer YOUR_UPSTREAM_API_KEY' ANTHROPIC_MODEL='YOUR_UPSTREAM_MODEL' ANTHROPIC_DEFAULT_OPUS_MODEL='YOUR_UPSTREAM_MODEL' ANTHROPIC_DEFAULT_SONNET_MODEL='YOUR_UPSTREAM_MODEL' ANTHROPIC_DEFAULT_HAIKU_MODEL='YOUR_UPSTREAM_MODEL' CLAUDE_CODE_SUBAGENT_MODEL='YOUR_UPSTREAM_MODEL' CLAUDE_CODE_EFFORT_LEVEL=high API_TIMEOUT_MS=3600000 claude"
 ```
 
-header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`，并在同一个 `ANTHROPIC_CUSTOM_HEADERS` 值中增加 `\nX-Upstream-Format: responses`。
+header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`，并在 `ANTHROPIC_CUSTOM_HEADERS` 中增加 `\nX-Upstream-Format: responses`。
 
 如果服务启用了 `OCR_ACCESS_TOKENS`：
 
-- header 模式的 `ANTHROPIC_AUTH_TOKEN` 填服务访问 token；未启用服务鉴权时该值不会被 Router 校验；
-- path 模式则在 `ANTHROPIC_CUSTOM_HEADERS` 中增加 `X-OCR-Token: YOUR_ROUTER_ACCESS_TOKEN`。
+- header 模式：`ANTHROPIC_AUTH_TOKEN` 填 Router 访问 token；
+- path 模式：在 `ANTHROPIC_CUSTOM_HEADERS` 中增加 `X-OCR-Token: YOUR_ROUTER_ACCESS_TOKEN`。
 
-`X-Upstream-Headers` 可用于显式添加上游要求的额外 header。Router 不会透传 Claude Code 原始请求头，也不允许覆盖 `authorization`、`content-type`、`accept`、`host`、`x-ocr-token`、`x-upstream-*` 或 hop-by-hop headers。
-
-### 3. 启动 Claude Code
-
-直接执行你写入 `~/.zshrc` 的 alias 即可。正常对话、工具调用和历史回放都会透明转换；模型选择由 Claude Code 的 `ANTHROPIC_MODEL` 和三个 `ANTHROPIC_DEFAULT_*_MODEL` 标准环境变量决定，Router 原样转发。
+`X-Upstream-Headers` 可显式添加上游要求的额外 Header。Router 不会透传 Claude Code 的其他原始请求头，也不允许覆盖 Authorization、Host、协议选择 Header 和逐跳 Header。
 
 ## 协议覆盖与边界
+
+下面是排障和评估上游兼容性时使用的详细参考。首次使用只需完成前面的快速开始。
+
+<details>
+<summary>展开协议兼容性明细</summary>
+
 
 | 能力 | 默认（Chat Completions） | Responses API |
 |---|---|---|
@@ -238,7 +288,7 @@ header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`�
 | 工具调用（`tool_use` / `tool_result` 双向增量） | ✅ 含现代 `tool_calls` 并行工具；流式工具增量会先按调用缓冲，再输出合法的顺序 block；普通 OpenAI function call 返回为正式 `caller:{type:"direct"}`。Anthropic 合法但超过 Chat 64 字符限制的工具名会在单次请求内做稳定、无碰撞、双向透明映射。完整终态中的参数若不是 JSON object，按上游协议错误返回 retryable 502 | ✅ 含并行工具；历史 thinking/text/tool block 通过内部有序表示保真回放为 Responses items，超过 Responses 64 字符限制的历史 `call_id` 会稳定缩短并保持调用/结果严格配对。`program` / `program_output`、programmatic/未知 caller，以及响应侧 `compaction` / `function_call_output` 都依赖无法映射的 hosted-runtime 状态，明确返回 502；caller 缺省或 `direct` 正常转换 |
 | 顶层多模态图片（base64 / URL / file） | ✅ base64 / URL 精确映射为标准 `image_url`；provider-owned `file_id` 无法跨上游安全复用，因此本地 400；已知但畸形的 source 返回 400，未来未知 source 有界文本降级；自描述 data URL 保留 | ✅ URL 转标准 `input_image.image_url`；provider-owned `file_id` 同样不跨 provider 盲传，不按模型名猜视觉能力 |
 | `tool_result` 中的图片 / 文件 | ⚠️ Chat 的 tool message 只能放文本；base64/URL 图片及可表示为 `file_data` 的文件会在整组 tool message 后转成标准 user 多模态 sidecar。单个多模态 tool result 依靠相邻顺序归属，不增加模型可见 marker；同批合并多个并行结果时，才在各组附件之后追加通用 provenance marker（工具序号 + 完整 ID 的可逆 UTF-16BE/base64url 编码）。视觉/文件输入得以保留，但 text/image 原始交错顺序仍会降级。URL-only 文件转有界文本；`is_error:true` 以前置的稳定 Router metadata marker 保留，false/缺省不改变内容 | ✅ `function_call_output.output` 原生保留 `input_text` / `input_image` / `input_file` 多 block 数组的顺序与归属；`is_error:true` marker 同样保留；纯文本保持 string 以兼容旧端点 |
-| 中途 `system` / 工具变更 | ✅ 普通 `messages[].role:"system"` 按正式位置规则保留为 system；direct block 与正式 `mid_conv_system` wrapper 都会展开；`defer_loading`、自定义客户端工具在 `tool_result` 返回的 `tool_reference`，以及 direct `tool_reference` 的 `tool_addition` / `tool_removal` 按历史顺序投影成当前生成应看到的最终工具子集，不把结构指令改成模型可见文本 | 同左；system content part 转正式 `input_text`。Anthropic server-owned tools（web search/fetch、code execution、advisor、tool search、MCP）及其历史块、MCP tool-change reference 没有通用 OpenAI function-tool 同构，明确返回协议错误而不伪造执行责任；内置 typed client tools（bash/computer/memory/text-editor）在实现版本化 schema 映射前同样明确报错，不伪造空 schema；`compaction` / `fallback` / `container_upload` 等 opaque replay block 不会泄漏为模型可见 JSON，而是明确报错 |
+| 中途 `system` / 工具变更 | ✅ 普通 `messages[].role:"system"` 按正式位置规则保留为 system；direct block 与正式 `mid_conv_system` wrapper 都会展开；`defer_loading`、自定义客户端工具在 `tool_result` 返回的 `tool_reference`，以及 direct `tool_reference` 的 `tool_addition` / `tool_removal` 按历史顺序投影成当前生成应看到的最终工具子集，不把结构指令改成模型可见文本 | 同左；system content part 转正式 `input_text`。依赖服务端执行环境的 hosted tools、hosted tool history 和 opaque replay state 没有通用 OpenAI function-tool 同构，会明确返回协议错误，不伪造成客户端可执行工具或模型可见 JSON |
 | document / file block | ✅ base64 / text source 转 Chat `file_data`；Chat 没有正式 `file_url`，URL source 转含 URL 的有界文本；`source:content` 按原顺序展开 text/image，并用 metadata text 保留 title/context；未来未知 source 有界降级；provider-owned `file_id` 本地 400 | ✅ base64/text/URL 转 `input_file`，`source:content` 原样展开为正式 input parts；provider-owned `file_id` 不跨 provider 盲传 |
 | provider-owned replay state | ⚠️ 顶层 `container`、`redacted_thinking`、`compaction` / `container_upload` 等 opaque state 无法跨 Anthropic 与 OpenAI provider 重放，显式返回协议错误；对应 nullable 字段为 null 时是 no-op | 同左；Responses 输出的 compaction / hosted function-output state 同样显式 502，不伪装成普通文本 |
 | `/model sonnet` / `opus` / haiku 切换 | ✅ body.model 字段透传 | 同左 |
@@ -251,16 +301,20 @@ header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`�
 | usage / 错误 | ✅ 输出当前 Anthropic Message/Usage nullable 字段，并映射 reasoning tokens 与可从流式首帧确定的 service tier；错误 envelope 含 nullable `request_id` | ✅ Responses reasoning tokens 保留到 Anthropic `thinking_tokens`。402/409/413/504/529 分别映射 `billing_error` / `conflict_error` / `request_too_large` / `timeout_error` / `overloaded_error`；所有上游非 2xx 均标记可重试且 Router 保持单次上游调用。上游合法且单值的 `Retry-After` / `Retry-After-Ms` 会原值返回，其他响应头不会随之透传 |
 | refusal / content filter | ✅ refusal 文本保留为普通 assistant 文本；`content_filter` 映射 `stop_reason:"refusal"`，并返回 `{type:"refusal",category:null,explanation}` 形式的 `stop_details` | 同左；流式与非流式、SSE 聚合保持一致 |
 | incomplete / 截断工具调用 | ✅ Chat `length` 映射 `max_tokens`；调用名/参数原始字节以有界文本诊断保留，不生成可执行 `tool_use` | ✅ response 或 function item 明确标记 incomplete 时同样以有界文本保留原始字节并返回 `max_tokens`；完整终态中的畸形参数返回 retryable 502 |
-| stop sequence | ⚠️ 请求侧 `stop_sequences` 转 Chat `stop`；Chat 响应只报告通用 `finish_reason:"stop"`，无法恢复命中的具体分隔符 | ⚠️ Responses 没有 stop sequence 请求参数，沿用 TS 行为，在转换时省略该字段 |
+| stop sequence | ⚠️ 请求侧 `stop_sequences` 转 Chat `stop`；Chat 响应只报告通用 `finish_reason:"stop"`，无法恢复命中的具体分隔符 | ⚠️ Responses 没有 stop sequence 请求参数，转换时省略该字段 |
 | Responses phase / channel | 不适用 | ⚠️ Responses item 的 `phase` / channel 元数据没有 Anthropic Messages 同构字段；Router 保留 reasoning/tool/text 的语义顺序，但不能无损往返 phase 标签 |
-| o-series / GPT-5 输出长度 | ⚠️ Chat 路径保留正式 Chat `max_tokens`，不会按模型名猜测并改写成 `max_completion_tokens`；只接受后者的端点应改走 Responses | ✅ Anthropic `max_tokens` 映射为 Responses `max_output_tokens` |
+| 输出长度 | ⚠️ Chat 路径保留正式 Chat `max_tokens`，不会按模型名猜测并改写成 `max_completion_tokens`；只接受后者的端点应改走 Responses | ✅ Anthropic `max_tokens` 映射为 Responses `max_output_tokens` |
 | legacy `function_call`（旧式 Chat 工具调用） | ✅ 流式与非流式均归一为 `tool_use`，不会静默丢弃 | 不适用 |
 | 流式/非流式形态错位 | ✅ 响应形态永远跟随客户端 `stream` 标志：上游对 `stream:true` 回 JSON 时合成完整 SSE，对 `stream:false` 回 SSE 时聚合成 JSON | 同左 |
-| 需要缓冲的上游响应体 | ⚠️ 与 TS 版本一致，Router 不额外限制 JSON、非 2xx 及 `stream:false` 聚合响应的总大小；直接 SSE 转发也不限制总流量，但单个事件仍受 16 MiB / 65,536 行上限 | 同左 |
+| 需要缓冲的上游响应体 | ⚠️ Router 不额外限制 JSON、非 2xx 及 `stream:false` 聚合响应的总大小；直接 SSE 转发也不限制总流量，但单个事件仍受 16 MiB / 65,536 行上限 | 同左 |
 | Prompt cache（`cache_control`） | ⚠️ Anthropic 显式 breakpoint 会被剥（避免严格上游 400）；若上游自行报告 cached tokens，usage 会映射返回 | 同左 |
-| `count_tokens` 端点 | ⚠️ 与 TS 版本一致，使用 o200k 做简单本地估算（非上游精确值）：统计 system/text、tool input/result、tools，图片使用固定 256 token；其他 block 不额外推断 | 同左 |
+| `count_tokens` 端点 | ⚠️ 使用本地 tokenizer 做近似估算，不是上游精确值：统计 system/text、tool input/result、tools，图片固定按 256 token；其他 block 不额外推断 | 同左 |
 
 Router 只做协议转换，不根据模型名猜测视觉、推理或工具能力。标准图片结构仍被文本模型或能力不完整的兼容端点拒绝时，错误属于所选模型 / 上游；Router 会保留上游状态并按既定策略标记为可重试。无法在两个协议间安全同构的状态会明确报错或使用有界降级，不会被静默丢弃或伪造成可执行工具状态。
+
+</details>
+
+## 开发与发布
 
 ### 开发验证
 
@@ -316,7 +370,7 @@ git push origin "refs/tags/v${version}"
 | `X-Upstream-Model` | 两种模式都可用 | 高级兼容、可选 | 固定覆盖 body 里的 `model`。标准 Claude Code 接入应优先使用四个模型环境变量，推荐 alias 不需要配置此 Header |
 | `X-Upstream-Model-Map` | 两种模式都可用 | 高级兼容、可选 | 按 body 模型名精确映射，格式 `from1=to1,from2=to2`，优先级高于 `X-Upstream-Model`。仅为已有客户端兼容保留，不是推荐的 Claude Code 模型配置方式 |
 | `X-Upstream-Effort-Map` | 两种模式都可用 | 可选 | effort 词汇映射表，格式 `max=xhigh,low=minimal`；左侧必须是 Anthropic effort（`low/medium/high/xhigh/max`）或通配 `*`，右侧为上游词汇原样转发，保留字 `off` 表示整个剥除该字段（例：`*=off` 适配"tools 与 reasoning_effort 不能同时出现"的网关）。不配置时显式 effort 永远精确透传，Router 自身绝不 clamp |
-| `X-Upstream-Effort-Levels` | 两种模式都可用 | 可选 | 上游支持的 effort 等级集合，格式 `none,low,medium,high,xhigh`；不在集合内的 effort 按规范等级序 `minimal < low < medium < high < xhigh < max` 就近 clamp，平局取低（例：上游只到 `xhigh` 时 `max` → `xhigh`，上游只到 `high` 时 `max` → `high`）。`none`/`auto` 是开关不是强度，只做精确匹配、永不作为 clamp 目标。与 `X-Upstream-Effort-Map` 同时出现时先按 Map 改写词汇、再按本表 clamp；Map 命中 `off` 则直接剥除、不再 clamp。不配置时显式 effort 永远精确透传 |
+| `X-Upstream-Effort-Levels` | 两种模式都可用 | 可选 | 声明上游支持的 effort 集合，例如 `low,medium,high`。已知强度顺序为 `minimal < low < medium < high < xhigh < max`；请求值不在集合中时就近调整，平局取较低等级。`none` / `auto` 只做精确匹配，不参与强度调整。与 Map 同时使用时先映射、再调整；Map 命中 `off` 时直接删除字段。未配置时不调整 |
 | `X-Upstream-Headers` | 两种模式都可用 | 可选 | JSON object，显式声明要额外转发给上游的 header；不能覆盖受保护 header |
 | `Authorization: Bearer <token>` | header | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | 服务自身访问鉴权 |
 | `X-OCR-Token` | path | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | path 模式下 `Authorization` 被上游凭证占用，服务鉴权改走此 header |
@@ -327,7 +381,7 @@ git push origin "refs/tags/v${version}"
 把上游完整 URL 直接拼在服务地址后面，例如：
 
 ```
-http://localhost:3457/https://api.openai.com/v1/chat/completions
+http://localhost:3457/https://upstream.example.com/v1/chat/completions
 ```
 
 Claude Code 会自动追加 `/v1/messages`，服务端识别并砍掉这个后缀，剩下的就是上游 URL。上游 Authorization 走标准 `Authorization: Bearer ...` header，服务端剥 `Bearer ` 前缀后原样透传上游。
@@ -415,20 +469,20 @@ OCR_MODEL_LOG_MODE=off cargo run --manifest-path rust/Cargo.toml
 ## 常见问题
 
 - **上游错误会重试吗**：会上报为可重试。上游返回任意非 2xx、连接/读取超时，或已请求上游后发现 JSON/SSE 畸形、截断、缺少正式终态时，服务保留/映射状态与 Anthropic 错误体，并增加 `X-Should-Retry: true`。合法、单值的 `Retry-After`（非负秒数或 HTTP-date）和 `Retry-After-Ms`（非负毫秒数）会保持原值返回；重复或畸形值会被丢弃，不会连带透传其他上游响应头。实时 SSE 只能在初始 HTTP 响应已有这些提示时返回，因为流开始后 HTTP header 已不可修改。本地请求校验 400 不带该 header；只有明确的客户端断开返回 499 且不标记重试。具体次数和退避由 Claude Code 决定，Router 自身始终只请求上游一次。
-- **上游报 401 / 403**：先确认 `ANTHROPIC_AUTH_TOKEN` 没填反——path 模式里它是**上游凭证**、服务鉴权走 `X-OCR-Token`；header 模式里它是**服务鉴权 token**、上游凭证走 `X-Upstream-Authorization`（见[两个独立选择：接入模式与上游协议](#两个独立选择接入模式与上游协议)）。另外启用了 `OCR_ACCESS_TOKENS` 却没带对应 token 也会被服务拒绝。
+- **上游报 401 / 403**：先确认 `ANTHROPIC_AUTH_TOKEN` 没填反——path 模式里它是**上游凭证**、服务鉴权走 `X-OCR-Token`；header 模式里它是**Router 访问 token**、上游凭证走 `X-Upstream-Authorization`（见[path 模式与 header 模式](#path-模式与-header-模式)）。另外启用了 `OCR_ACCESS_TOKENS` 却没带对应 token 也会被服务拒绝。
 - **连不通 / `upstream_unreachable`（502）**：检查上游 URL 是否写全（path 模式要拼到 `/chat/completions` 或 `/responses` 这一级）；Docker 下不要在容器内设 `HOST=127.0.0.1`（见[自定义监听地址](#自定义监听地址)的警告）。
-- **上游报 `thinking is enabled but reasoning_content is missing in assistant tool call message`**：部分 DeepSeek / Kimi 式上游在开启 thinking 时，要求带工具调用的 assistant 消息必须携带 `reasoning_content`。服务已自动把 Anthropic `thinking` 转成 `reasoning_content`，并对缺失的历史工具调用消息兜底补全；若仍遇到，请确认运行的是最新版本。
+- **上游报 `thinking is enabled but reasoning_content is missing in assistant tool call message`**：部分 Chat Completions 上游在开启 thinking 时，要求带工具调用的 assistant 消息必须携带 `reasoning_content`。服务会把 Anthropic `thinking` 转成 `reasoning_content`，并对缺失的历史工具调用消息补空字符串；若仍遇到，请确认运行的是最新版本。
 - **上游报未知字段 400（如 `cache_control` / `reasoning`）**：服务默认会剥掉 Anthropic 专有字段，正常不会发生；若你接的是 Responses 协议上游，确认 alias 带了 `X-Upstream-Format: responses`。
-- **o-series / GPT-5 的 Chat 端点拒绝 `max_tokens`**：这类端点通常要求 `max_completion_tokens`。Router 不按模型名猜字段；请把 URL 改为 `/v1/responses` 并设置 `X-Upstream-Format: responses`，此时会发送 `max_output_tokens`。
+- **Chat 端点拒绝 `max_tokens`**：Router 不按模型名猜字段。如果同一上游提供 Responses API，请把 URL 改为 `/v1/responses` 并设置 `X-Upstream-Format: responses`，此时会发送 `max_output_tokens`。
 - **返回里没有 `cache_read_input_tokens` / 看不到 thinking**：Anthropic `cache_control` breakpoint 不会透传；只有上游 usage 自身报告 cached tokens 时才会返回。Chat 的 thinking 依赖非标准 `reasoning_content` 兼容扩展；需要原生 reasoning 请使用 Responses API alias。
 
 ## 安全
 
-- 这是**透明转发**服务：上游凭证经服务转发，**务必走 HTTPS**
+- 上游凭证会经过 Router 进程；远程上游应使用 HTTPS，Router 对外提供服务时客户端到 Router 也应使用 HTTPS
 - 公网部署强烈建议设置 `OCR_ACCESS_TOKENS` 防止扫描滥用
-- JSON 运行日志不记录请求 header；模型交互日志只接收直接客户端 IP、接入模式、转换后的正文和脱敏 URL
-- 模型交互日志不记录请求 header，但 `client_ip` 属于访问来源数据，`full` 模式还会记录提示词、工具内容和模型输出；敏感场景请缩短 `OCR_MODEL_LOG_RETENTION_DAYS`，或改用 `OCR_MODEL_LOG_MODE=metadata` / `off`
-- 不要把上游凭证写入版本控制的文件，用 `~/.zshrc` 或 1Password CLI 等工具按需注入
+- JSON 运行日志和模型交互日志都不记录请求 Header；模型交互日志中的上游 URL 会移除 userinfo、query 和 fragment
+- `client_ip` 属于访问来源数据，`full` 模式还会记录提示词、工具内容和模型输出；敏感场景请缩短 `OCR_MODEL_LOG_RETENTION_DAYS`，或改用 `OCR_MODEL_LOG_MODE=metadata` / `off`
+- 不要把上游凭证写入版本控制；可以保存在权限受限的个人 shell 配置中，或在启动 alias 前由本机凭证工具注入
 
 ## Star History
 
@@ -439,10 +493,6 @@ OCR_MODEL_LOG_MODE=off cargo run --manifest-path rust/Cargo.toml
     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=riba2534/open-claude-router&type=Date" />
   </picture>
 </a>
-
-## 致谢
-
-感谢 [Axum](https://github.com/tokio-rs/axum)、[Tokio](https://tokio.rs/)、[Reqwest](https://github.com/seanmonstar/reqwest)、[Serde](https://serde.rs/) 和 `tiktoken-rs` 等开源项目提供的基础能力。
 
 ## License
 

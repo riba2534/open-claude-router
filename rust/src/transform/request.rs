@@ -2102,7 +2102,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_typescript_required_request_shape() {
+    fn validates_required_request_shape() {
         for body in [
             json!({"messages":[]}),
             json!({"model":"","messages":[]}),
@@ -2116,7 +2116,7 @@ mod tests {
     }
 
     #[test]
-    fn ignores_fields_without_an_openai_mapping_like_typescript() {
+    fn ignores_fields_without_an_openai_mapping() {
         let result = transform_anthropic_request(&json!({
             "model":"m","max_tokens":1,"messages":[],
             "metadata":{"user_id":"user-1","future":true},
@@ -2136,7 +2136,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_owned_file_sources_are_rejected_like_typescript() {
+    fn provider_owned_file_sources_are_rejected() {
         let request = json!({
             "model":"m","max_tokens":1,"messages":[{"role":"user","content":[
                 {"type":"image","source":{"type":"file","file_id":"client-image"}},

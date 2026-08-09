@@ -58,7 +58,7 @@ Both access modes converge on the same conversion and transport path:
 - Upstream timeout, read, malformed JSON/SSE, missing terminal state, and protocol truncation errors are retryable.
 - A dropped downstream body must cancel the active upstream reader.
 - Model logging is fail-open and must not receive Authorization or additional upstream headers.
-- As in the TypeScript implementation, fully buffered upstream bodies have no additional Router size limit. SSE partial lines and individual events remain bounded at 16 MiB and 65,536 lines.
+- Fully buffered upstream bodies have no additional Router size limit. SSE partial lines and individual events remain bounded at 16 MiB and 65,536 lines.
 - Do not infer model capabilities from model names, provider names, tool names, or business scenarios.
 - Preserve typed `tool_result` blocks. Chat tool messages remain text-only; multimodal bytes use a following user sidecar. Responses uses typed function output parts.
 - Provider-owned file IDs cannot be reused across providers and must fail locally.

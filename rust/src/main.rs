@@ -35,7 +35,7 @@ async fn main() {
     let model_logger = state.model_logger.clone();
     let app = build_app(state);
     // Resolve the host and port separately so hostnames and unbracketed IPv6
-    // values such as `HOST=::` retain the behavior of the TypeScript server.
+    // values such as `HOST=::` remain valid listener settings.
     let listener = TcpListener::bind((host.as_str(), port))
         .await
         .unwrap_or_else(|error| panic!("bind {host}:{port}: {error}"));

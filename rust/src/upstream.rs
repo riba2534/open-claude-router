@@ -36,8 +36,8 @@ pub async fn call_upstream(
     })
 }
 
-/// Reads a body that must be buffered. As in the TypeScript implementation,
-/// the router does not impose an additional response-size policy on upstream.
+/// Reads a body that must be buffered. The router does not impose an additional
+/// response-size policy on upstream.
 /// Callers still retain the upstream status if reading fails partway through.
 pub async fn read_upstream_body(response: reqwest::Response) -> (Bytes, Option<String>) {
     read_upstream_body_stream(response.bytes_stream(), usize::MAX).await

@@ -1334,7 +1334,7 @@ async fn oversized_request_body_uses_anthropic_error_envelope() {
 }
 
 #[tokio::test]
-async fn count_tokens_keeps_typescript_route_validation_in_both_access_modes() {
+async fn count_tokens_validates_routes_in_both_access_modes() {
     let invalid = json!({"messages":[]});
     let serialized = serde_json::to_vec(&invalid).unwrap();
     let header_response = test_router()

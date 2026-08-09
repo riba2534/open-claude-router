@@ -28,8 +28,8 @@ fn count_json(value: &Value) -> usize {
     count_text(&serde_json::to_string(value).unwrap_or_default())
 }
 
-/// Matches the original TypeScript estimator. This endpoint is deliberately a
-/// small local approximation, not a second protocol validator or tokenizer.
+/// This endpoint is deliberately a small local approximation, not a second
+/// protocol validator or an upstream-exact tokenizer.
 pub fn count_anthropic_tokens(request: &Value) -> usize {
     let Some(request) = request.as_object() else {
         return 0;
@@ -115,7 +115,7 @@ mod tests {
     use super::count_anthropic_tokens;
 
     #[test]
-    fn matches_typescript_estimator_fixtures() {
+    fn matches_estimator_fixtures() {
         assert_eq!(
             count_anthropic_tokens(&json!({
                 "model":"m","messages":[{"role":"user","content":"hello"}]
@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn ignores_document_bytes_like_typescript() {
+    fn ignores_document_bytes() {
         assert_eq!(
             count_anthropic_tokens(&json!({
                 "messages":[{"role":"user","content":[

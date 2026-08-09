@@ -3,7 +3,7 @@ name: Publish release
 on:
   push:
     branches:
-      - "feat/rust-rewrite"
+      - "main"
     tags:
       - "*"
     paths:

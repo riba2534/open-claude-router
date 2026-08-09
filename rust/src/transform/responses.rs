@@ -787,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn request_drops_stop_sequences_like_typescript() {
+    fn request_drops_unsupported_stop_sequences() {
         let mut body = json!({"messages":[],"stop":["END"]});
         transform_responses_request(&mut body).unwrap();
         assert!(body.get("stop").is_none());
