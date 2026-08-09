@@ -371,6 +371,69 @@ async fn truncated_responses_stream_upstream(Json(_body): Json<Value>) -> Respon
     response
 }
 
+async fn protocol_stream_upstream(
+    State(state): State<MockState>,
+    Path(case): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state.count.fetch_add(1, Ordering::SeqCst);
+    state.requests.lock().await.push_back((headers, body));
+    let body = match case.as_str() {
+        "responses-sparse" => Body::from(concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":1,\"delta\":\"second\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"model\":\"m\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"first \"},{\"type\":\"output_text\",\"text\":\"second\"}]}]}}\n\n",
+            "data: [DONE]\n\n"
+        )),
+        "chat-metadata" => Body::from(concat!(
+            "data: {\"id\":\"chat-meta\",\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":1}}\n\n",
+            "data: [DONE]\n\n"
+        )),
+        "chat-name-delta" => Body::from(concat!(
+            "data: {\"id\":\"chat-name\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"weather\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )),
+        "chat-incomplete-tool" => Body::from(concat!(
+            "data: {\"id\":\"chat-partial\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{partial\"}}]},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )),
+        "responses-done-skeleton" => Body::from(concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"model\":\"m\",\"status\":\"completed\",\"output\":[]}}\n\n",
+            "data: [DONE]\n\n"
+        )),
+        "responses-incomplete-tool" => Body::from(concat!(
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"r\",\"model\":\"m\",\"status\":\"incomplete\",\"output\":[{\"type\":\"function_call\",\"status\":\"incomplete\",\"arguments\":\"{partial\"}]}}\n\n",
+            "data: [DONE]\n\n"
+        )),
+        "responses-refusal-order" => {
+            let stream = async_stream::stream! {
+                yield Ok::<_, Infallible>(Bytes::from_static(
+                    concat!(
+                        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"message_1\",\"content\":[]}}\n\n",
+                        "data: {\"type\":\"response.refusal.delta\",\"item_id\":\"message_1\",\"content_index\":0,\"delta\":\"denied\"}\n\n"
+                    ).as_bytes(),
+                ));
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                yield Ok::<_, Infallible>(Bytes::from_static(concat!(
+                    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"arguments\":\"{broken\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"model\":\"m\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"arguments\":\"{broken\"},{\"type\":\"message\",\"id\":\"message_1\",\"role\":\"assistant\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"denied\"}]}]}}\n\n",
+                    "data: [DONE]\n\n"
+                ).as_bytes()));
+            };
+            Body::from_stream(stream)
+        }
+        _ => unreachable!("unknown protocol stream fixture"),
+    };
+    let mut response = Response::new(body);
+    response
+        .headers_mut()
+        .insert("content-type", "text/event-stream".parse().unwrap());
+    response
+}
+
 async fn start_mock() -> (String, MockState) {
     let state = MockState::default();
     let app = Router::new()
@@ -386,6 +449,7 @@ async fn start_mock() -> (String, MockState) {
             "/responses-truncated",
             post(truncated_responses_stream_upstream),
         )
+        .route("/protocol-stream/{case}", post(protocol_stream_upstream))
         .route("/status/{status}", post(status_upstream))
         .route("/retry-hint/{case}", post(retry_hint_upstream))
         .route(
@@ -592,6 +656,77 @@ fn long_tool_body(stream: bool) -> (Value, String, String, String) {
         ]
     });
     (body, exact_64, long_a, long_b)
+}
+
+#[tokio::test]
+async fn final_model_and_max_tokens_are_validated_before_upstream() {
+    let (base, mock) = start_mock().await;
+    let make_request = |body: Value, model_override: Option<&str>, format: Option<&str>| {
+        let upstream = if format == Some("responses") {
+            format!("{base}/responses")
+        } else {
+            format!("{base}/chat")
+        };
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("x-upstream-url", upstream)
+            .header("x-upstream-authorization", "Bearer secret");
+        if let Some(model) = model_override {
+            builder = builder.header("x-upstream-model", model);
+        }
+        if let Some(format) = format {
+            builder = builder.header("x-upstream-format", format);
+        }
+        builder
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+
+    for body in [
+        json!({"max_tokens":1,"messages":[]}),
+        json!({"model":"","max_tokens":1,"messages":[]}),
+        json!({"model":"m","messages":[]}),
+        json!({"model":"m","max_tokens":null,"messages":[]}),
+        json!({"model":"m","max_tokens":"1","messages":[]}),
+        json!({"model":"m","max_tokens":1.5,"messages":[]}),
+        json!({"model":"m","max_tokens":-1,"messages":[]}),
+        json!({"model":"m","max_tokens":0,"stream":true,"messages":[]}),
+    ] {
+        let response = test_router()
+            .oneshot(make_request(body, None, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(mock.count.load(Ordering::SeqCst), 0);
+
+    let response = test_router()
+        .oneshot(make_request(
+            json!({"model":7,"max_tokens":0,"messages":[]}),
+            Some("override-model"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (_, chat) = mock.requests.lock().await.pop_front().unwrap();
+    assert_eq!(chat["model"], "override-model");
+    assert_eq!(chat["max_tokens"], 0);
+
+    let response = test_router()
+        .oneshot(make_request(
+            json!({"model":"m","max_tokens":0,"messages":[]}),
+            None,
+            Some("responses"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (_, responses) = mock.requests.lock().await.pop_front().unwrap();
+    assert_eq!(responses["max_output_tokens"], 0);
+    assert!(responses.get("max_tokens").is_none());
 }
 
 async fn send(router: Router, url: &str, upstream: &str, body: Value) -> axum::response::Response {
@@ -986,6 +1121,208 @@ async fn truncated_responses_sse_never_claims_success() {
     .unwrap();
     assert!(body.contains("event: error"));
     assert!(!body.contains("event: message_stop"));
+}
+
+#[tokio::test]
+async fn responses_sparse_content_index_merges_with_populated_terminal_contract() {
+    let (base, mock) = start_mock().await;
+    let response = test_router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header(
+                    "x-upstream-url",
+                    format!("{base}/protocol-stream/responses-sparse"),
+                )
+                .header("x-upstream-authorization", "Bearer secret")
+                .header("x-upstream-format", "responses")
+                .body(Body::from(
+                    serde_json::to_vec(&anthropic_body(false)).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(
+        result.pointer("/content/0/text"),
+        Some(&json!("first second"))
+    );
+    assert_eq!(mock.count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn chat_metadata_only_done_is_retryable_stream_error_contract() {
+    let (base, mock) = start_mock().await;
+    let response = send(
+        test_router(),
+        "/v1/messages",
+        &format!("{base}/protocol-stream/chat-metadata"),
+        anthropic_body(true),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("event: error"));
+    assert!(body.contains("upstream Chat stream was empty"));
+    assert!(!body.contains("event: message_start"));
+    assert!(!body.contains("event: message_stop"));
+    assert_eq!(mock.count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn responses_out_of_order_refusal_is_buffered_until_safe_contract() {
+    let (base, mock) = start_mock().await;
+    let response = test_router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header(
+                    "x-upstream-url",
+                    format!("{base}/protocol-stream/responses-refusal-order"),
+                )
+                .header("x-upstream-authorization", "Bearer secret")
+                .header("x-upstream-format", "responses")
+                .body(Body::from(
+                    serde_json::to_vec(&anthropic_body(true)).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .is_err(),
+        "unsafe output_index=1 refusal text leaked before the earlier item arrived"
+    );
+    let mut body = String::new();
+    while let Some(chunk) = stream.next().await {
+        body.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+    }
+    assert!(body.contains("suppressed by refusal"));
+    assert!(body.contains("suppressed by refusal unknown"));
+    assert!(body.contains("denied"));
+    assert!(body.contains("event: message_stop"));
+    assert!(body.contains("\"stop_reason\":\"refusal\""));
+    assert!(!body.contains("event: error"));
+    assert_eq!(mock.count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn responses_output_item_done_skeleton_preserves_streamed_delta_contract() {
+    let (base, mock) = start_mock().await;
+    let response = test_router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header(
+                    "x-upstream-url",
+                    format!("{base}/protocol-stream/responses-done-skeleton"),
+                )
+                .header("x-upstream-authorization", "Bearer secret")
+                .header("x-upstream-format", "responses")
+                .body(Body::from(
+                    serde_json::to_vec(&anthropic_body(false)).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(result.pointer("/content/0/text"), Some(&json!("hello")));
+    assert_eq!(mock.count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn chat_fragmented_function_name_is_merged_through_live_route_contract() {
+    let (base, mock) = start_mock().await;
+    let response = send(
+        test_router(),
+        "/v1/messages",
+        &format!("{base}/protocol-stream/chat-name-delta"),
+        anthropic_body(true),
+    )
+    .await;
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("\"name\":\"get_weather\""));
+    assert!(body.contains("event: message_stop"));
+    assert!(!body.contains("event: error"));
+    assert_eq!(mock.count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn incomplete_tools_without_identity_remain_non_executable_contract() {
+    let (base, mock) = start_mock().await;
+    let chat = send(
+        test_router(),
+        "/v1/messages",
+        &format!("{base}/protocol-stream/chat-incomplete-tool"),
+        anthropic_body(true),
+    )
+    .await;
+    let chat =
+        String::from_utf8(to_bytes(chat.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+    assert!(chat.contains("incomplete tool_use unknown"));
+    assert!(chat.contains("\"stop_reason\":\"max_tokens\""));
+    assert!(!chat.contains("\"type\":\"tool_use\""));
+    assert!(!chat.contains("event: error"));
+
+    let responses = test_router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header(
+                    "x-upstream-url",
+                    format!("{base}/protocol-stream/responses-incomplete-tool"),
+                )
+                .header("x-upstream-authorization", "Bearer secret")
+                .header("x-upstream-format", "responses")
+                .body(Body::from(
+                    serde_json::to_vec(&anthropic_body(true)).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let responses = String::from_utf8(
+        to_bytes(responses.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(responses.contains("incomplete function_call unknown"));
+    assert!(responses.contains("\"stop_reason\":\"max_tokens\""));
+    assert!(!responses.contains("\"type\":\"tool_use\""));
+    assert!(!responses.contains("event: error"));
+    assert_eq!(mock.count.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Map, Value, json};
 
-use super::{identity::ResponsesCallIdMap, protocol_error};
+use super::{identity::ResponsesCallIdMap, invalid, protocol_error};
 use crate::{
     error::{ApiError, error_type_for_status, status_from_openai_error},
     transform::request::scrub_cache_control,
@@ -74,11 +74,12 @@ pub fn transform_responses_request(body: &mut Value) -> Result<(), ApiError> {
                 for block in blocks {
                     match block.get("type").and_then(Value::as_str) {
                         Some("thinking") => {
-                            if let Some(replay) = block
-                                .get("signature")
-                                .and_then(Value::as_str)
-                                .and_then(decode_reasoning_signature)
-                            {
+                            if let Some(replay) = decode_reasoning_signature_checked(
+                                block
+                                    .get("signature")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default(),
+                            )? {
                                 input.push(replayed_reasoning(replay));
                             }
                         }
@@ -136,10 +137,12 @@ pub fn transform_responses_request(body: &mut Value) -> Result<(), ApiError> {
                 .or_else(|| message.get("thinking").cloned().map(|value| vec![value]))
                 .unwrap_or_default();
             for block in blocks {
-                let Some(replay) = block
-                    .get("signature")
-                    .and_then(Value::as_str)
-                    .and_then(decode_reasoning_signature)
+                let Some(replay) = decode_reasoning_signature_checked(
+                    block
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )?
                 else {
                     continue;
                 };
@@ -285,6 +288,27 @@ pub fn transform_responses_json(payload: &Value, omit_reasoning: bool) -> Result
         .get("output")
         .and_then(Value::as_array)
         .ok_or_else(|| protocol_error("upstream Responses payload is missing output"))?;
+    let response_incomplete = payload.get("status").and_then(Value::as_str) == Some("incomplete");
+    let content_filter = payload
+        .pointer("/incomplete_details/reason")
+        .and_then(Value::as_str)
+        == Some("content_filter");
+    let has_refusal = output.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("message")
+            && item
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|part| {
+                    part.get("type").and_then(Value::as_str) == Some("refusal")
+                        && part
+                            .get("refusal")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                })
+    });
+    let refusal_preempts_tools = has_refusal || (response_incomplete && content_filter);
     let mut content = Vec::new();
     let mut pending_reasoning = Vec::new();
     let mut has_tool = false;
@@ -331,37 +355,34 @@ pub fn transform_responses_json(payload: &Value, omit_reasoning: bool) -> Result
                 }));
             }
             "function_call" => {
+                let is_incomplete = response_incomplete
+                    || item.get("status").and_then(Value::as_str) == Some("incomplete");
                 let call_id = item
                     .get("call_id")
                     .or_else(|| item.get("id"))
                     .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .ok_or_else(|| {
-                        protocol_error(
-                            "upstream Responses function_call is missing call_id or name",
-                        )
-                    })?;
+                    .filter(|id| !id.is_empty());
                 let name = item
                     .get("name")
                     .and_then(Value::as_str)
-                    .filter(|name| !name.is_empty())
-                    .ok_or_else(|| {
-                        protocol_error(
-                            "upstream Responses function_call is missing call_id or name",
-                        )
-                    })?;
-                let is_incomplete = payload.get("status").and_then(Value::as_str)
-                    == Some("incomplete")
-                    || item.get("status").and_then(Value::as_str) == Some("incomplete");
+                    .filter(|name| !name.is_empty());
+                let diagnostic_name = name.unwrap_or("unknown");
                 content.append(&mut pending_reasoning);
                 let arguments = item
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| Value::String("{}".into()));
-                if is_incomplete {
+                if refusal_preempts_tools {
+                    content.push(suppressed_tool_diagnostic(diagnostic_name, &arguments));
+                } else if is_incomplete {
                     incomplete_call = true;
-                    content.push(incomplete_tool_diagnostic(name, &arguments));
+                    content.push(incomplete_tool_diagnostic(diagnostic_name, &arguments));
                 } else {
+                    let (call_id, name) = call_id.zip(name).ok_or_else(|| {
+                        protocol_error(
+                            "upstream Responses function_call is missing call_id or name",
+                        )
+                    })?;
                     let input = parse_tool_arguments(&arguments)?;
                     content.push(json!({
                         "type":"tool_use",
@@ -445,6 +466,23 @@ pub fn transform_responses_json(payload: &Value, omit_reasoning: bool) -> Result
         }
         has_tool = false;
     }
+    let response_incomplete = response_incomplete || incomplete_call;
+    let mut is_refusal = has_refusal || (response_incomplete && content_filter);
+    if is_refusal {
+        for block in &mut content {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let name = block
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            let raw = block.get("input").cloned().unwrap_or_else(|| json!({}));
+            *block = suppressed_tool_diagnostic(&name, &raw);
+        }
+        has_tool = false;
+    }
     if payload
         .get("__ocr_stream_aggregated")
         .and_then(Value::as_bool)
@@ -452,13 +490,7 @@ pub fn transform_responses_json(payload: &Value, omit_reasoning: bool) -> Result
     {
         content = coalesce_adjacent_text_blocks(content);
     }
-    let response_incomplete =
-        payload.get("status").and_then(Value::as_str) == Some("incomplete") || incomplete_call;
-    let content_filter = payload
-        .pointer("/incomplete_details/reason")
-        .and_then(Value::as_str)
-        == Some("content_filter");
-    let is_refusal = !refusal.is_empty() || (response_incomplete && content_filter);
+    is_refusal |= !refusal.is_empty();
     let stop_reason = if is_refusal {
         "refusal"
     } else if response_incomplete {
@@ -604,7 +636,30 @@ fn decode_reasoning_signature(signature: &str) -> Option<Value> {
         .get("id")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())?;
+    if value
+        .get("encrypted_content")
+        .is_some_and(|encrypted| !encrypted.is_string())
+        || value
+            .get("summary")
+            .is_some_and(|summary| !summary.is_array())
+        || value
+            .get("content")
+            .is_some_and(|content| !content.is_array())
+    {
+        return None;
+    }
     Some(value)
+}
+
+fn decode_reasoning_signature_checked(signature: &str) -> Result<Option<Value>, ApiError> {
+    if !signature.starts_with(SIGNATURE_PREFIX) {
+        return Ok(None);
+    }
+    decode_reasoning_signature(signature)
+        .map(Some)
+        .ok_or_else(|| {
+            invalid("assistant thinking signature contains malformed Router Responses replay state")
+        })
 }
 
 fn replayed_reasoning(value: Value) -> Value {
@@ -659,6 +714,19 @@ fn incomplete_tool_diagnostic(name: &str, raw: &Value) -> Value {
         bounded.push('…');
     }
     json!({"type":"text","text":format!("[incomplete function_call {name}: {bounded}]")})
+}
+
+fn suppressed_tool_diagnostic(name: &str, raw: &Value) -> Value {
+    let raw = raw
+        .as_str()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| serde_json::to_string(raw).unwrap_or_default());
+    let length = raw.chars().count();
+    let mut bounded = raw.chars().take(4096).collect::<String>();
+    if length > 4096 {
+        bounded.push('…');
+    }
+    json!({"type":"text","text":format!("[function_call suppressed by refusal {name}: {bounded}]")})
 }
 
 fn reasoning_text(item: &Value) -> String {
@@ -927,6 +995,117 @@ mod tests {
             Some(&json!("opaque"))
         );
         assert_eq!(request.pointer("/input/0/summary"), Some(&json!([])));
+    }
+
+    #[test]
+    fn malformed_router_reasoning_state_is_rejected_but_foreign_state_keeps_turn() {
+        let malformed = [
+            "ocr-responses-reasoning-v1:not-base64".to_owned(),
+            format!(
+                "{SIGNATURE_PREFIX}{}",
+                URL_SAFE_NO_PAD.encode(
+                    serde_json::to_vec(&json!({"id":"reason_1","encrypted_content":7})).unwrap()
+                )
+            ),
+            format!(
+                "{SIGNATURE_PREFIX}{}",
+                URL_SAFE_NO_PAD
+                    .encode(serde_json::to_vec(&json!({"id":"reason_1","summary":{}})).unwrap())
+            ),
+            format!(
+                "{SIGNATURE_PREFIX}{}",
+                URL_SAFE_NO_PAD
+                    .encode(serde_json::to_vec(&json!({"id":"reason_1","content":"bad"})).unwrap())
+            ),
+        ];
+        for signature in malformed {
+            let mut request = json!({
+                "messages":[{"role":"assistant","output_blocks":[{
+                    "type":"thinking","thinking":"","signature":signature
+                }]}]
+            });
+            let error = transform_responses_request(&mut request).unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(!error.retryable);
+        }
+
+        let mut foreign = json!({
+            "messages":[{"role":"assistant","output_blocks":[{
+                "type":"thinking","thinking":"visible","signature":"native-or-chat-state"
+            }]}]
+        });
+        transform_responses_request(&mut foreign).unwrap();
+        assert_eq!(
+            foreign.pointer("/input/0"),
+            Some(&json!({"role":"assistant","content":""}))
+        );
+    }
+
+    #[test]
+    fn refusal_suppresses_completed_and_even_malformed_function_calls() {
+        let result = transform_responses_json(
+            &json!({
+                "status":"completed",
+                "output":[
+                    {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{broken"},
+                    {"type":"message","content":[{"type":"refusal","refusal":"denied"}]}
+                ]
+            }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(result["stop_reason"], "refusal");
+        assert!(
+            result["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block.get("type") != Some(&json!("tool_use")))
+        );
+        assert!(result.to_string().contains("suppressed by refusal"));
+    }
+
+    #[test]
+    fn incomplete_or_refused_function_without_identity_is_non_executable_diagnostic() {
+        let incomplete = transform_responses_json(
+            &json!({
+                "status":"incomplete","output":[{
+                    "type":"function_call","arguments":"{partial","status":"incomplete"
+                }]
+            }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(incomplete["stop_reason"], "max_tokens");
+        assert!(
+            incomplete
+                .to_string()
+                .contains("incomplete function_call unknown")
+        );
+
+        let refused = transform_responses_json(
+            &json!({
+                "status":"completed","output":[
+                    {"type":"function_call","arguments":"{broken"},
+                    {"type":"message","content":[{"type":"refusal","refusal":"denied"}]}
+                ]
+            }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(refused["stop_reason"], "refusal");
+        assert!(
+            refused
+                .to_string()
+                .contains("suppressed by refusal unknown")
+        );
+        assert!(
+            refused["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block.get("type") != Some(&json!("tool_use")))
+        );
     }
 
     #[test]

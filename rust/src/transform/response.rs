@@ -26,7 +26,7 @@ pub(crate) fn transform_chat_json_response_with_tool_names(
     omit_thinking: bool,
     tool_names: &ChatToolNameMap,
 ) -> Result<Value, ApiError> {
-    if let Some(error) = payload.get("error") {
+    if let Some(error) = payload.get("error").filter(|error| !error.is_null()) {
         let status = status_from_openai_error(error, axum::http::StatusCode::OK);
         return Err(ApiError::new(
             status,
@@ -86,16 +86,25 @@ pub(crate) fn transform_chat_json_response_with_tool_names(
                     let wire_name = block
                         .get("name")
                         .and_then(Value::as_str)
-                        .unwrap_or("unknown");
-                    let name = tool_names.original_name(wire_name);
+                        .filter(|name| !name.is_empty());
+                    let id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty());
+                    let diagnostic_name = wire_name.unwrap_or("unknown");
+                    let name = tool_names.original_name(diagnostic_name);
                     if incomplete {
                         content.push(incomplete_tool_diagnostic(name, block.get("input")));
                         continue;
                     }
+                    let (id, wire_name) = id.zip(wire_name).ok_or_else(|| {
+                        protocol_error("upstream tool call is missing id or function name")
+                    })?;
+                    let name = tool_names.original_name(wire_name);
                     let input = parse_tool_input(block.get("input"))?;
                     content.push(json!({
                         "type":"tool_use",
-                        "id":block.get("id").cloned().unwrap_or(Value::Null),
+                        "id":id,
                         "name":name,
                         "input":input,
                         "caller":{"type":"direct"}
@@ -219,19 +228,13 @@ pub(crate) fn transform_chat_json_response_with_tool_names(
                 let id = call
                     .get("id")
                     .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .ok_or_else(|| {
-                        protocol_error("upstream tool call is missing id or function name")
-                    })?;
+                    .filter(|id| !id.is_empty());
                 let wire_name = call
                     .pointer("/function/name")
                     .and_then(Value::as_str)
-                    .filter(|name| !name.is_empty())
-                    .ok_or_else(|| {
-                        protocol_error("upstream tool call is missing id or function name")
-                    })?;
-                let name = tool_names.original_name(wire_name);
-                if let Some(reasoning) = thinking_by_call.remove(id) {
+                    .filter(|name| !name.is_empty());
+                let name = tool_names.original_name(wire_name.unwrap_or("unknown"));
+                if let Some(reasoning) = id.and_then(|id| thinking_by_call.remove(id)) {
                     content.extend(reasoning);
                 }
                 let arguments = call
@@ -241,6 +244,9 @@ pub(crate) fn transform_chat_json_response_with_tool_names(
                 if incomplete {
                     content.push(incomplete_tool_diagnostic(name, Some(&arguments)));
                 } else {
+                    let (id, _) = id.zip(wire_name).ok_or_else(|| {
+                        protocol_error("upstream tool call is missing id or function name")
+                    })?;
                     let input = parse_tool_input(Some(&arguments))?;
                     content.push(json!({
                         "type":"tool_use",
@@ -251,15 +257,19 @@ pub(crate) fn transform_chat_json_response_with_tool_names(
                     }));
                 }
             }
-        } else if let Some(wire_name) = message
-            .pointer("/function_call/name")
-            .and_then(Value::as_str)
-        {
-            let name = tool_names.original_name(wire_name);
-            let arguments = message.pointer("/function_call/arguments").cloned();
+        } else if let Some(function_call) = message.get("function_call") {
+            let wire_name = function_call
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty());
+            let name = tool_names.original_name(wire_name.unwrap_or("unknown"));
+            let arguments = function_call.get("arguments").cloned();
             if incomplete {
                 content.push(incomplete_tool_diagnostic(name, arguments.as_ref()));
             } else {
+                wire_name.ok_or_else(|| {
+                    protocol_error("upstream tool call is missing id or function name")
+                })?;
                 let input = parse_tool_input(arguments.as_ref())?;
                 content.push(json!({
                     "type":"tool_use",
@@ -591,6 +601,29 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_chat_tool_without_identity_is_non_executable_diagnostic() {
+        for finish_reason in ["length", "content_filter"] {
+            let result = transform_chat_json_response(
+                &json!({
+                    "choices":[{"message":{"role":"assistant","tool_calls":[{
+                        "type":"function","function":{"arguments":"{partial"}
+                    }]} ,"finish_reason":finish_reason}]
+                }),
+                false,
+            )
+            .unwrap();
+            assert!(result.to_string().contains("incomplete tool_use unknown"));
+            assert!(
+                result["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|block| block.get("type") != Some(&json!("tool_use")))
+            );
+        }
+    }
+
+    #[test]
     fn anthropic_sse_block_starts_use_official_empty_shapes() {
         let text = anthropic_content_block_to_sse(
             &json!({"type":"thinking","thinking":"hidden","signature":"opaque"}),
@@ -620,6 +653,38 @@ mod tests {
         let error = transform_chat_json_response(&json!({"choices":[]}), false).unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
         assert!(error.retryable);
+    }
+
+    #[test]
+    fn null_logical_error_does_not_reject_a_chat_success() {
+        let result = transform_chat_json_response(
+            &json!({
+                "error":null,
+                "choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]
+            }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.pointer("/content/0/text"), Some(&json!("ok")));
+    }
+
+    #[test]
+    fn completed_output_block_tool_requires_string_identity() {
+        for block in [
+            json!({"type":"tool_use","name":"lookup","input":"{}"}),
+            json!({"type":"tool_use","id":"call_1","input":"{}"}),
+            json!({"type":"tool_use","id":7,"name":"lookup","input":"{}"}),
+        ] {
+            let error = transform_chat_json_response(
+                &json!({
+                    "choices":[{"message":{"role":"assistant","output_blocks":[block]},"finish_reason":"tool_calls"}]
+                }),
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+            assert!(error.retryable);
+        }
     }
 
     #[test]

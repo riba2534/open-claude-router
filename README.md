@@ -113,7 +113,7 @@ Linux / macOS：
 
 ```bash
 # 把版本和平台替换成 Release 页面中的实际值
-VERSION=v0.6.10
+VERSION=v0.6.11
 PLATFORM=linux-amd64
 ARCHIVE="open-claude-router-${VERSION}-${PLATFORM}.tar.gz"
 
@@ -130,7 +130,7 @@ cd "open-claude-router-${VERSION}-${PLATFORM}"
 Windows PowerShell：
 
 ```powershell
-$Version = "v0.6.10"
+$Version = "v0.6.11"
 $Platform = "windows-amd64" # Windows on ARM 使用 windows-arm64
 $Archive = "open-claude-router-$Version-$Platform.zip"
 
@@ -299,11 +299,11 @@ header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`�
 | citations / search result | ⚠️ Anthropic `search_result` 的 title/source metadata 与全部非空 text block 按顺序保留；按 Anthropic 正式规则，`tool_result` 一旦含 search result 就不能混入其他可见 block。启用 document/search-result citations，或回放带非空 citations 的 text block 时，因 OpenAI 请求协议无可逆同构，本地 400；`citations:null` / 空数组为 no-op。若同时请求 structured output，优先返回 Anthropic 的 citations/structured-output 冲突 400 | ⚠️ 同左。响应侧 `web_search_call` 与 citation 按有界 typed JSON 文本保留 id/action/query/URL/range；Responses citation 没有 search-call 归属字段，Router 不猜测配对关系 |
 | 音频输出 | ⚠️ Chat 非流式 `message.audio.transcript` 转 text；原始音频字节只产生一次 `[generated audio omitted]`，不泄漏 base64 | ⚠️ SSE transcript delta 转 text；audio delta 只产生一次相同占位符，done 不重复 |
 | usage / 错误 | ✅ 输出当前 Anthropic Message/Usage nullable 字段，并映射 reasoning tokens 与可从流式首帧确定的 service tier；错误 envelope 含 nullable `request_id` | ✅ Responses reasoning tokens 保留到 Anthropic `thinking_tokens`。402/409/413/504/529 分别映射 `billing_error` / `conflict_error` / `request_too_large` / `timeout_error` / `overloaded_error`；所有上游非 2xx 均标记可重试且 Router 保持单次上游调用。上游合法且单值的 `Retry-After` / `Retry-After-Ms` 会原值返回，其他响应头不会随之透传 |
-| refusal / content filter | ✅ refusal 文本保留为普通 assistant 文本；`content_filter` 映射 `stop_reason:"refusal"`，并返回 `{type:"refusal",category:null,explanation}` 形式的 `stop_details` | 同左；流式与非流式、SSE 聚合保持一致 |
+| refusal / content filter | ✅ refusal 文本保留为普通 assistant 文本；`content_filter` 映射 `stop_reason:"refusal"`，并返回 `{type:"refusal",category:null,explanation}` 形式的 `stop_details` | 同左；refusal 优先于同一响应中的 function call，工具调用仅保留为有界诊断文本，绝不生成可执行 `tool_use`；流式与非流式、SSE 聚合保持一致 |
 | incomplete / 截断工具调用 | ✅ Chat `length` 映射 `max_tokens`；调用名/参数原始字节以有界文本诊断保留，不生成可执行 `tool_use` | ✅ response 或 function item 明确标记 incomplete 时同样以有界文本保留原始字节并返回 `max_tokens`；完整终态中的畸形参数返回 retryable 502 |
 | stop sequence | ⚠️ 请求侧 `stop_sequences` 转 Chat `stop`；Chat 响应只报告通用 `finish_reason:"stop"`，无法恢复命中的具体分隔符 | ⚠️ Responses 没有 stop sequence 请求参数，转换时省略该字段 |
 | Responses phase / channel | 不适用 | ⚠️ Responses item 的 `phase` / channel 元数据没有 Anthropic Messages 同构字段；Router 保留 reasoning/tool/text 的语义顺序，但不能无损往返 phase 标签 |
-| 输出长度 | ⚠️ Chat 路径保留正式 Chat `max_tokens`，不会按模型名猜测并改写成 `max_completion_tokens`；只接受后者的端点应改走 Responses | ✅ Anthropic `max_tokens` 映射为 Responses `max_output_tokens` |
+| 输出长度 | ⚠️ 最终 model controls 生效后，`model` 必须是非空字符串，`max_tokens` 必须是非负整数；`max_tokens:0` 用于只填充 prompt cache，不能与 stream、thinking、structured output 或强制工具选择组合。Chat 路径保留正式 Chat `max_tokens`，不会按模型名猜测并改写成 `max_completion_tokens`；只接受后者的端点应改走 Responses | ✅ 同一套本地校验；Anthropic `max_tokens` 映射为 Responses `max_output_tokens` |
 | legacy `function_call`（旧式 Chat 工具调用） | ✅ 流式与非流式均归一为 `tool_use`，不会静默丢弃 | 不适用 |
 | 流式/非流式形态错位 | ✅ 响应形态永远跟随客户端 `stream` 标志：上游对 `stream:true` 回 JSON 时合成完整 SSE，对 `stream:false` 回 SSE 时聚合成 JSON | 同左 |
 | 需要缓冲的上游响应体 | ⚠️ Router 不额外限制 JSON、非 2xx 及 `stream:false` 聚合响应的总大小；直接 SSE 转发也不限制总流量，但单个事件仍受 16 MiB / 65,536 行上限 | 同左 |

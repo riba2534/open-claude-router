@@ -15,6 +15,56 @@ pub fn transform_anthropic_request(request: &Value) -> Result<Value, ApiError> {
     transform_anthropic_request_with_file_map(request, &HashMap::new())
 }
 
+pub(crate) fn validate_final_outbound_request(request: &Value) -> Result<(), ApiError> {
+    if !request
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| !model.trim().is_empty())
+    {
+        return Err(invalid(
+            "model must resolve to a non-empty string after applying upstream model controls",
+        ));
+    }
+    let max_tokens = match request.get("max_tokens") {
+        Some(max_tokens) if max_tokens.as_u64().is_some() => max_tokens.as_u64().unwrap(),
+        _ => {
+            return Err(invalid("max_tokens must be a non-negative integer"));
+        }
+    };
+    if max_tokens == 0 {
+        if request.get("stream").and_then(Value::as_bool) == Some(true) {
+            return Err(invalid("max_tokens 0 cannot be combined with streaming"));
+        }
+        if request
+            .pointer("/reasoning/enabled")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return Err(invalid(
+                "max_tokens 0 cannot be combined with enabled thinking",
+            ));
+        }
+        if request
+            .get("response_format")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(invalid(
+                "max_tokens 0 cannot be combined with structured output",
+            ));
+        }
+        if matches!(
+            request.get("tool_choice"),
+            Some(Value::String(choice)) if choice == "required"
+        ) || request.pointer("/tool_choice/type").and_then(Value::as_str) == Some("function")
+        {
+            return Err(invalid(
+                "max_tokens 0 cannot be combined with forced tool choice",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn transform_anthropic_request_with_file_map(
     request: &Value,
     file_map: &HashMap<String, String>,
@@ -594,6 +644,13 @@ fn validate_request(request: &Value, file_map: &HashMap<String, String>) -> Resu
                                     "mid_conv_system.content supports only text and tool-change blocks",
                                 ));
                             }
+                            if block.get("type").and_then(Value::as_str) == Some("text")
+                                && !block.get("text").is_some_and(Value::is_string)
+                            {
+                                return Err(invalid(
+                                    "mid_conv_system text blocks require a string text field",
+                                ));
+                            }
                         }
                     }
                     "tool_addition" | "tool_removal" if role != "system" => {
@@ -665,6 +722,11 @@ fn validate_request(request: &Value, file_map: &HashMap<String, String>) -> Resu
                                 "assistant thinking blocks must include a non-empty signature",
                             ));
                         }
+                        if !part_object.get("thinking").is_some_and(Value::is_string) {
+                            return Err(invalid(
+                                "assistant thinking blocks require a string thinking field",
+                            ));
+                        }
                     }
                     "redacted_thinking" => {
                         return Err(invalid(
@@ -697,6 +759,7 @@ fn validate_request(request: &Value, file_map: &HashMap<String, String>) -> Resu
         let tools = tools
             .as_array()
             .ok_or_else(|| invalid("tools must be an array"))?;
+        let mut names = HashSet::new();
         for tool in tools {
             let tool = tool
                 .as_object()
@@ -719,12 +782,22 @@ fn validate_request(request: &Value, file_map: &HashMap<String, String>) -> Resu
                     "Anthropic typed client tools require a version-specific OpenAI function schema",
                 ));
             }
-            if !tool
+            let name = tool
                 .get("name")
                 .and_then(Value::as_str)
-                .is_some_and(|name| !name.is_empty())
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| invalid("each client tool must have a non-empty name"))?;
+            if !names.insert(name) {
+                return Err(invalid(format!(
+                    "duplicate client tool name {}",
+                    serde_json::to_string(name).unwrap()
+                )));
+            }
+            if tool
+                .get("input_schema")
+                .is_some_and(|schema| !schema.is_object())
             {
-                return Err(invalid("each client tool must have a non-empty name"));
+                return Err(invalid("tool.input_schema must be an object when provided"));
             }
             if tool.get("strict").is_some_and(|value| !value.is_boolean()) {
                 return Err(invalid("tool.strict must be a boolean when provided"));
@@ -2113,6 +2186,69 @@ mod tests {
         let error = transform_anthropic_request(&json!({"model":"m","max_tokens":1,"messages":{}}))
             .unwrap_err();
         assert_eq!(error.message, "messages must be an array");
+    }
+
+    #[test]
+    fn validates_model_and_max_tokens_after_model_controls() {
+        for body in [
+            json!({"model":"m","max_tokens":0}),
+            json!({"model":"m","max_tokens":1}),
+        ] {
+            validate_final_outbound_request(&body).unwrap();
+        }
+        for body in [
+            json!({"max_tokens":1}),
+            json!({"model":"","max_tokens":1}),
+            json!({"model":7,"max_tokens":1}),
+            json!({"model":"m"}),
+            json!({"model":"m","max_tokens":null}),
+            json!({"model":"m","max_tokens":"1"}),
+            json!({"model":"m","max_tokens":1.5}),
+            json!({"model":"m","max_tokens":-1}),
+        ] {
+            let error = validate_final_outbound_request(&body).unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(!error.retryable);
+        }
+        let overflow: Value =
+            serde_json::from_str(r#"{"model":"m","max_tokens":18446744073709551616}"#).unwrap();
+        assert!(validate_final_outbound_request(&overflow).is_err());
+    }
+
+    #[test]
+    fn zero_max_tokens_rejects_incompatible_generation_controls() {
+        for body in [
+            json!({"model":"m","max_tokens":0,"stream":true}),
+            json!({"model":"m","max_tokens":0,"reasoning":{"enabled":true}}),
+            json!({"model":"m","max_tokens":0,"response_format":{"type":"json_schema"}}),
+            json!({"model":"m","max_tokens":0,"tool_choice":"required"}),
+            json!({"model":"m","max_tokens":0,"tool_choice":{"type":"function","function":{"name":"read"}}}),
+        ] {
+            assert!(validate_final_outbound_request(&body).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_tools_non_object_schemas_and_nested_text_type_errors() {
+        for body in [
+            json!({"model":"m","max_tokens":1,"messages":[],"tools":[
+                {"name":"same","input_schema":{"type":"object"}},
+                {"name":"same","input_schema":{"type":"object"}}
+            ]}),
+            json!({"model":"m","max_tokens":1,"messages":[],"tools":[
+                {"name":"bad","input_schema":"not-an-object"}
+            ]}),
+            json!({"model":"m","max_tokens":1,"messages":[
+                {"role":"assistant","content":[{"type":"thinking","thinking":7,"signature":"sig"}]}
+            ]}),
+            json!({"model":"m","max_tokens":1,"messages":[
+                {"role":"user","content":"before"},
+                {"role":"system","content":[{"type":"mid_conv_system","content":[{"type":"text","text":7}]}]}
+            ]}),
+        ] {
+            let error = transform_anthropic_request(&body).unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        }
     }
 
     #[test]

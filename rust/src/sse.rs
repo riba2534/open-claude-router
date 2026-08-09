@@ -17,6 +17,7 @@ pub struct ParsedSse {
 #[derive(Default)]
 pub struct IncrementalSseDecoder {
     buffer: Vec<u8>,
+    scan_offset: usize,
     data_lines: Vec<String>,
     event_size: usize,
     event_lines: usize,
@@ -47,12 +48,19 @@ impl IncrementalSseDecoder {
 
     fn scan(&mut self, eof: bool) -> Result<DecodedSse, ApiError> {
         let mut output = Vec::new();
-        while let Some(index) = self
-            .buffer
-            .iter()
-            .position(|byte| *byte == b'\n' || *byte == b'\r')
-        {
+        let mut consumed = 0usize;
+        let mut scan = self.scan_offset.min(self.buffer.len());
+        loop {
+            let Some(relative) = self.buffer[scan..]
+                .iter()
+                .position(|byte| *byte == b'\n' || *byte == b'\r')
+            else {
+                scan = self.buffer.len();
+                break;
+            };
+            let index = scan + relative;
             if self.buffer[index] == b'\r' && index + 1 == self.buffer.len() && !eof {
+                scan = index;
                 break;
             }
             let consume =
@@ -61,15 +69,24 @@ impl IncrementalSseDecoder {
                 } else {
                     index + 1
                 };
-            let line = std::str::from_utf8(&self.buffer[..index])
+            let line = std::str::from_utf8(&self.buffer[consumed..index])
                 .map_err(|_| protocol_error("upstream SSE contains invalid UTF-8"))?
                 .to_owned();
-            self.buffer.drain(..consume);
             self.process_line(&line, &mut output)?;
+            consumed = consume;
+            scan = consume;
             if self.done {
-                self.buffer.clear();
                 break;
             }
+        }
+        if self.done {
+            self.buffer.clear();
+            self.scan_offset = 0;
+        } else if consumed > 0 {
+            self.buffer.drain(..consumed);
+            self.scan_offset = scan.saturating_sub(consumed);
+        } else {
+            self.scan_offset = scan;
         }
         self.ensure_pending_event_is_bounded()?;
         if eof && !self.done {
@@ -78,6 +95,7 @@ impl IncrementalSseDecoder {
                     .map_err(|_| protocol_error("upstream SSE contains invalid UTF-8"))?
                     .to_owned();
                 self.buffer.clear();
+                self.scan_offset = 0;
                 self.process_line(&line, &mut output)?;
             }
             self.dispatch(&mut output);
@@ -247,7 +265,7 @@ pub fn aggregate_chat_sse(bytes: Bytes) -> Result<Value, ApiError> {
     for raw in parsed.events {
         let event: Value = serde_json::from_str(&raw)
             .map_err(|_| protocol_error("upstream Chat SSE contains malformed JSON"))?;
-        if let Some(error) = event.get("error") {
+        if let Some(error) = event.get("error").filter(|error| !error.is_null()) {
             return Ok(json!({"error":error,"request_id":event.get("request_id").cloned()}));
         }
         if id.is_none() {
@@ -379,8 +397,13 @@ pub fn aggregate_chat_sse(bytes: Bytes) -> Result<Value, ApiError> {
                         "id":"","type":"function","function":{"name":"","arguments":""}
                     })
                 });
-                set_json_string(current, "/id", call.get("id").and_then(Value::as_str));
-                set_json_string(
+                set_stable_json_string(
+                    current,
+                    "/id",
+                    call.get("id").and_then(Value::as_str),
+                    "upstream tool call id changed during the stream",
+                )?;
+                merge_json_string_fragment(
                     current,
                     "/function/name",
                     call.pointer("/function/name").and_then(Value::as_str),
@@ -394,7 +417,7 @@ pub fn aggregate_chat_sse(bytes: Bytes) -> Result<Value, ApiError> {
         }
         if let Some(function) = delta.get("function_call") {
             has_legacy_function = true;
-            append_json_string(
+            merge_json_string_fragment(
                 &mut legacy_function,
                 "/name",
                 function.get("name").and_then(Value::as_str),
@@ -411,6 +434,15 @@ pub fn aggregate_chat_sse(bytes: Bytes) -> Result<Value, ApiError> {
     }
     if finish_reason.is_none() {
         if parsed.saw_done {
+            if content.is_empty()
+                && reasoning.is_empty()
+                && refusal.is_empty()
+                && output_blocks.is_empty()
+                && tool_calls.is_empty()
+                && !has_legacy_function
+            {
+                return Err(protocol_error("upstream Chat stream was empty"));
+            }
             finish_reason = Some(if tool_calls.is_empty() && !has_legacy_function {
                 Value::String("stop".into())
             } else {
@@ -516,8 +548,11 @@ impl ResponsesSseAggregator {
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
                 if let Some(item) = event.get("item") {
-                    let slot = self.items.entry(index).or_insert_with(|| item.clone());
-                    merge_item(slot, item);
+                    if let Some(slot) = self.items.get_mut(&index) {
+                        merge_terminal_item(slot, item)?;
+                    } else {
+                        self.items.insert(index, item.clone());
+                    }
                     register_message_snapshots(&mut self.finalized_message_parts, index, item);
                     register_reasoning_snapshots(&mut self.finalized_reasoning_parts, index, item);
                     if let Some(id) = item.get("id").and_then(Value::as_str) {
@@ -715,24 +750,35 @@ impl ResponsesSseAggregator {
                 self.terminal = Some(response.clone());
             }
             "response.failed" | "response.cancelled" => {
-                self.saw_terminal = true;
-                let mut response = event.get("response").cloned().unwrap_or_else(|| {
-                    json!({
-                        "status":if kind == "response.cancelled" { "cancelled" } else { "failed" },
-                        "error":event.get("error").cloned(),
-                        "output":[]
-                    })
-                });
-                if response.get("status").is_none_or(Value::is_null) {
-                    response["status"] = Value::String(
-                        if kind == "response.cancelled" {
-                            "cancelled"
-                        } else {
-                            "failed"
-                        }
-                        .into(),
-                    );
+                let expected = if kind == "response.cancelled" {
+                    "cancelled"
+                } else {
+                    "failed"
+                };
+                let mut response = event
+                    .get("response")
+                    .filter(|response| response.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        json!({
+                            "status":expected,
+                            "error":event.get("error").cloned(),
+                            "output":[]
+                        })
+                    });
+                if event
+                    .get("response")
+                    .is_some_and(|response| !response.is_object())
+                    || response.get("status").and_then(Value::as_str) != Some(expected)
+                {
+                    return Err(protocol_error(
+                        "upstream Responses terminal event/status mismatch",
+                    ));
                 }
+                if response.get("output").is_none() {
+                    response["output"] = Value::Array(Vec::new());
+                }
+                self.saw_terminal = true;
                 self.terminal = Some(response);
             }
             "error" => {
@@ -763,32 +809,220 @@ impl ResponsesSseAggregator {
             self.audio_omission_index,
             &self.audio_transcripts,
         );
-        for item in self.items.values_mut() {
-            normalize_stream_part_indices(item);
-        }
+        validate_terminal_functions(&self.items, terminal_output(&response)?)?;
+        merge_terminal_output(&mut response, &self.items)?;
         if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
             for item in output {
                 normalize_stream_part_indices(item);
             }
         }
-        validate_terminal_functions(
-            &self.items,
-            response
-                .get("output")
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        )?;
-        let terminal_output_empty = response
-            .get("output")
-            .and_then(Value::as_array)
-            .is_none_or(Vec::is_empty);
-        if terminal_output_empty {
-            response["output"] = Value::Array(self.items.into_values().collect());
-        }
         response["__ocr_stream_aggregated"] = Value::Bool(true);
         Ok(response)
     }
+}
+
+fn merge_terminal_output(
+    response: &mut Value,
+    streamed: &BTreeMap<u64, Value>,
+) -> Result<(), ApiError> {
+    let output = response
+        .get_mut("output")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            protocol_error("upstream Responses terminal response output must be an array")
+        })?;
+    if output.is_empty() {
+        response["output"] = Value::Array(streamed.values().cloned().collect());
+        return Ok(());
+    }
+    for (output_index, streamed_item) in streamed {
+        let index = usize::try_from(*output_index)
+            .map_err(|_| protocol_error("upstream Responses output_index is out of range"))?;
+        if index < output.len() {
+            let mut merged = streamed_item.clone();
+            merge_terminal_item(&mut merged, &output[index])?;
+            output[index] = merged;
+        } else if index == output.len() {
+            output.push(streamed_item.clone());
+        } else {
+            return Err(protocol_error(
+                "upstream Responses terminal output omitted an indexed output item",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn terminal_output(response: &Value) -> Result<&[Value], ApiError> {
+    response
+        .get("output")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| {
+            protocol_error("upstream Responses terminal response output must be an array")
+        })
+}
+
+fn merge_terminal_item(streamed: &mut Value, terminal: &Value) -> Result<(), ApiError> {
+    if let (Some(streamed_type), Some(terminal_type)) = (
+        streamed.get("type").and_then(Value::as_str),
+        terminal.get("type").and_then(Value::as_str),
+    ) && streamed_type != terminal_type
+    {
+        return Err(protocol_error(
+            "upstream Responses terminal output item type is inconsistent",
+        ));
+    }
+    let Some(terminal) = terminal.as_object() else {
+        return Err(protocol_error(
+            "upstream Responses terminal output items must be objects",
+        ));
+    };
+    let streamed_object = streamed.as_object_mut().ok_or_else(|| {
+        protocol_error("upstream Responses streamed output item must be an object")
+    })?;
+    for (key, terminal_value) in terminal {
+        if matches!(key.as_str(), "id" | "call_id" | "name")
+            && let Some(terminal_identity) =
+                terminal_value.as_str().filter(|value| !value.is_empty())
+        {
+            if let Some(streamed_identity) = streamed_object
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                && streamed_identity != terminal_identity
+            {
+                return Err(protocol_error(format!(
+                    "upstream Responses terminal output item {key} is inconsistent"
+                )));
+            }
+            streamed_object.insert(key.clone(), Value::String(terminal_identity.to_owned()));
+            continue;
+        }
+        if matches!(key.as_str(), "content" | "summary")
+            && let Some(terminal_parts) = terminal_value.as_array()
+        {
+            if terminal_parts.is_empty() {
+                continue;
+            }
+            let streamed_parts = streamed_object
+                .entry(key.clone())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| {
+                    protocol_error("upstream Responses streamed content shape is inconsistent")
+                })?;
+            merge_terminal_parts(streamed_parts, terminal_parts)?;
+            continue;
+        }
+        if key == "arguments"
+            && let Some(terminal_text) = terminal_value.as_str()
+        {
+            let streamed_text = streamed_object
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let merged = merge_snapshot_text(
+                streamed_text,
+                terminal_text,
+                "upstream Responses terminal function arguments are inconsistent",
+            )?;
+            streamed_object.insert(key.clone(), Value::String(merged));
+            continue;
+        }
+        if terminal_value.is_null()
+            || terminal_value.as_str() == Some("")
+            || terminal_value.as_array().is_some_and(Vec::is_empty)
+        {
+            continue;
+        }
+        streamed_object.insert(key.clone(), terminal_value.clone());
+    }
+    Ok(())
+}
+
+fn merge_terminal_parts(streamed: &mut Vec<Value>, terminal: &[Value]) -> Result<(), ApiError> {
+    if streamed.iter().enumerate().any(|(position, part)| {
+        part.get("__ocr_stream_part_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(position as u64)
+            >= terminal.len() as u64
+    }) {
+        return Err(protocol_error(
+            "upstream Responses terminal content omitted a streamed part index",
+        ));
+    }
+    for (index, terminal_part) in terminal.iter().enumerate() {
+        let position = streamed
+            .iter()
+            .position(|part| {
+                part.get("__ocr_stream_part_index").and_then(Value::as_u64) == Some(index as u64)
+            })
+            .or_else(|| {
+                streamed
+                    .get(index)
+                    .filter(|part| part.get("__ocr_stream_part_index").is_none())
+                    .map(|_| index)
+            });
+        let Some(position) = position else {
+            let mut terminal_part = terminal_part.clone();
+            if let Some(object) = terminal_part.as_object_mut() {
+                object.insert("__ocr_stream_part_index".into(), Value::from(index as u64));
+            }
+            streamed.push(terminal_part);
+            continue;
+        };
+        let streamed_part = &mut streamed[position];
+        if let (Some(streamed_type), Some(terminal_type)) = (
+            streamed_part.get("type").and_then(Value::as_str),
+            terminal_part.get("type").and_then(Value::as_str),
+        ) && streamed_type != terminal_type
+        {
+            return Err(protocol_error(
+                "upstream Responses terminal content part type is inconsistent",
+            ));
+        }
+        let Some(terminal_part) = terminal_part.as_object() else {
+            *streamed_part = terminal_part.clone();
+            continue;
+        };
+        let streamed_part = streamed_part.as_object_mut().ok_or_else(|| {
+            protocol_error("upstream Responses streamed content part must be an object")
+        })?;
+        for (key, terminal_value) in terminal_part {
+            if matches!(key.as_str(), "text" | "refusal" | "transcript")
+                && let Some(terminal_text) = terminal_value.as_str()
+            {
+                let streamed_text = streamed_part
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let merged = merge_snapshot_text(
+                    streamed_text,
+                    terminal_text,
+                    "upstream Responses terminal text snapshot is inconsistent",
+                )?;
+                streamed_part.insert(key.clone(), Value::String(merged));
+            } else if !terminal_value.is_null() && terminal_value.as_str() != Some("") {
+                streamed_part.insert(key.clone(), terminal_value.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_snapshot_text(
+    streamed: &str,
+    terminal: &str,
+    conflict: &'static str,
+) -> Result<String, ApiError> {
+    if terminal.is_empty() || streamed.starts_with(terminal) {
+        return Ok(streamed.to_owned());
+    }
+    if streamed.is_empty() || terminal.starts_with(streamed) {
+        return Ok(terminal.to_owned());
+    }
+    Err(protocol_error(conflict))
 }
 
 fn merge_streamed_audio_semantics(
@@ -932,12 +1166,40 @@ fn append_json_string(target: &mut Value, pointer: &str, value: Option<&str>) {
     }
 }
 
-fn set_json_string(target: &mut Value, pointer: &str, value: Option<&str>) {
+fn set_stable_json_string(
+    target: &mut Value,
+    pointer: &str,
+    value: Option<&str>,
+    conflict: &'static str,
+) -> Result<(), ApiError> {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
-        return;
+        return Ok(());
     };
     if let Some(slot) = target.pointer_mut(pointer) {
-        *slot = Value::String(value.to_owned());
+        match slot.as_str().filter(|current| !current.is_empty()) {
+            Some(current) if current != value => return Err(protocol_error(conflict)),
+            Some(_) => {}
+            None => *slot = Value::String(value.to_owned()),
+        }
+    }
+    Ok(())
+}
+
+fn merge_json_string_fragment(value: &mut Value, pointer: &str, incoming: Option<&str>) {
+    let Some(incoming) = incoming.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let Some(slot) = value.pointer_mut(pointer) else {
+        return;
+    };
+    let current = slot.as_str().unwrap_or_default();
+    if current == incoming {
+        return;
+    }
+    if incoming.starts_with(current) {
+        *slot = Value::String(incoming.to_owned());
+    } else {
+        *slot = Value::String(format!("{current}{incoming}"));
     }
 }
 
@@ -985,20 +1247,6 @@ fn merge_response_meta(target: &mut Value, source: &Value) {
     };
     for (key, value) in source {
         if key != "output" && !value.is_null() {
-            target.insert(key.clone(), value.clone());
-        }
-    }
-}
-
-fn merge_item(target: &mut Value, source: &Value) {
-    let Some(target) = target.as_object_mut() else {
-        return;
-    };
-    let Some(source) = source.as_object() else {
-        return;
-    };
-    for (key, value) in source {
-        if !value.is_null() && !(value.is_string() && value.as_str() == Some("")) {
             target.insert(key.clone(), value.clone());
         }
     }
@@ -1630,5 +1878,287 @@ mod tests {
             message.pointer("/usage/cache_creation_input_tokens"),
             Some(&json!(3))
         );
+    }
+
+    #[test]
+    fn incremental_decoder_scans_new_bytes_only_and_rechecks_trailing_cr() {
+        let mut decoder = IncrementalSseDecoder::default();
+        decoder.push(b"data: abc").unwrap();
+        assert_eq!(decoder.scan_offset, decoder.buffer.len());
+        decoder.push(b"def").unwrap();
+        assert_eq!(decoder.scan_offset, decoder.buffer.len());
+        decoder.push(b"\r").unwrap();
+        assert_eq!(decoder.scan_offset + 1, decoder.buffer.len());
+        let decoded = decoder.push(b"\n\r\n").unwrap();
+        assert_eq!(decoded.events, ["abcdef"]);
+    }
+
+    #[test]
+    fn chat_done_compatibility_requires_semantics_and_never_completes_partial_tools() {
+        let text = aggregate_chat_sse(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            text.pointer("/choices/0/finish_reason"),
+            Some(&json!("stop"))
+        );
+
+        let partial = aggregate_chat_sse(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            partial.pointer("/choices/0/finish_reason"),
+            Some(&json!("length"))
+        );
+        let message = crate::transform::transform_chat_json_response(&partial, false).unwrap();
+        assert_eq!(message["stop_reason"], "max_tokens");
+        assert!(
+            message["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block.get("type") != Some(&json!("tool_use")))
+        );
+
+        let empty = aggregate_chat_sse(Bytes::from_static(b"data: [DONE]\n\n")).unwrap_err();
+        assert_eq!(empty.message, "upstream Chat stream was empty");
+    }
+
+    #[test]
+    fn chat_aggregate_accepts_null_error_and_validates_stable_tool_identity() {
+        let success = aggregate_chat_sse(Bytes::from_static(
+            b"data: {\"error\":null,\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            success.pointer("/choices/0/message/content"),
+            Some(&json!("ok"))
+        );
+
+        let repeated = aggregate_chat_sse(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"function_call\":{\"name\":\"lookup\",\"arguments\":\"{\"}},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{\"function_call\":{\"name\":\"lookup\",\"arguments\":\"}\"}},\"finish_reason\":\"function_call\"}]}\n\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            repeated.pointer("/choices/0/message/function_call/name"),
+            Some(&json!("lookup"))
+        );
+        let legacy_delta = aggregate_chat_sse(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"function_call\":{\"name\":\"get_\",\"arguments\":\"{}\"}},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{\"function_call\":{\"name\":\"weather\"}},\"finish_reason\":\"function_call\"}]}\n\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy_delta.pointer("/choices/0/message/function_call/name"),
+            Some(&json!("get_weather"))
+        );
+
+        let modern_delta = aggregate_chat_sse(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"weather\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            modern_delta.pointer("/choices/0/message/tool_calls/0/function/name"),
+            Some(&json!("get_weather"))
+        );
+    }
+
+    #[test]
+    fn responses_failure_terminal_requires_matching_object_status() {
+        for (kind, response) in [
+            ("response.failed", json!({"status":"completed","output":[]})),
+            ("response.cancelled", json!({"status":"failed","output":[]})),
+            ("response.failed", json!("not-an-object")),
+        ] {
+            let mut aggregator = ResponsesSseAggregator::default();
+            let error = aggregator
+                .push_raw(&json!({"type":kind,"response":response}).to_string())
+                .unwrap_err();
+            assert_eq!(
+                error.message,
+                "upstream Responses terminal event/status mismatch"
+            );
+            assert!(error.retryable);
+        }
+    }
+
+    #[test]
+    fn responses_terminal_skeleton_merges_streamed_text_by_output_index() {
+        let mut aggregator = ResponsesSseAggregator::default();
+        for event in [
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}),
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hello"}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[]}]}}),
+        ] {
+            aggregator.push_raw(&event.to_string()).unwrap();
+        }
+        let response = aggregator.finish().unwrap();
+        assert_eq!(
+            response.pointer("/output/0/content/0/text"),
+            Some(&json!("hello"))
+        );
+
+        let mut conflict = ResponsesSseAggregator::default();
+        for event in [
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hello"}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"world"}]}]}}),
+        ] {
+            conflict.push_raw(&event.to_string()).unwrap();
+        }
+        assert!(conflict.finish().unwrap_err().retryable);
+    }
+
+    #[test]
+    fn responses_output_item_done_merges_streamed_snapshots_without_data_loss() {
+        let mut empty = ResponsesSseAggregator::default();
+        for event in [
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hello"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"m","content":[]}}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+        ] {
+            empty.push_raw(&event.to_string()).unwrap();
+        }
+        assert_eq!(
+            empty.finish().unwrap().pointer("/output/0/content/0/text"),
+            Some(&json!("hello"))
+        );
+
+        let mut full = ResponsesSseAggregator::default();
+        for event in [
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hel"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"m","content":[{"type":"output_text","text":"hello"}]}}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+        ] {
+            full.push_raw(&event.to_string()).unwrap();
+        }
+        assert_eq!(
+            full.finish().unwrap().pointer("/output/0/content/0/text"),
+            Some(&json!("hello"))
+        );
+
+        let mut sparse = ResponsesSseAggregator::default();
+        for event in [
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":1,"delta":"second"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[
+                {"type":"output_text","text":"first "},{"type":"output_text","text":"second"}
+            ]}}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+        ] {
+            sparse.push_raw(&event.to_string()).unwrap();
+        }
+        assert_eq!(
+            sparse.finish().unwrap().pointer("/output/0/content"),
+            Some(&json!([
+                {"type":"output_text","text":"first "},
+                {"type":"output_text","text":"second"}
+            ]))
+        );
+    }
+
+    #[test]
+    fn responses_output_item_done_rejects_conflicts_and_omitted_stream_indices() {
+        let mut text_conflict = ResponsesSseAggregator::default();
+        text_conflict
+            .push_raw(&json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hello"}).to_string())
+            .unwrap();
+        let error = text_conflict
+            .push_raw(&json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"world"}]}}).to_string())
+            .unwrap_err();
+        assert!(error.retryable);
+
+        let mut omitted = ResponsesSseAggregator::default();
+        omitted
+            .push_raw(&json!({"type":"response.output_text.delta","output_index":0,"content_index":1,"delta":"second"}).to_string())
+            .unwrap();
+        let error = omitted
+            .push_raw(&json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"first"}]}}).to_string())
+            .unwrap_err();
+        assert!(error.retryable);
+
+        let mut identity = ResponsesSseAggregator::default();
+        identity
+            .push_raw(&json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"one","content":[]}}).to_string())
+            .unwrap();
+        let error = identity
+            .push_raw(&json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"two","content":[]}}).to_string())
+            .unwrap_err();
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn responses_sparse_content_index_merges_against_populated_terminal_by_original_index() {
+        let mut aggregator = ResponsesSseAggregator::default();
+        for event in [
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":1,"delta":"second"}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[{
+                "type":"message","role":"assistant","content":[
+                    {"type":"output_text","text":"first "},
+                    {"type":"output_text","text":"second"}
+                ]
+            }]}}),
+        ] {
+            aggregator.push_raw(&event.to_string()).unwrap();
+        }
+        let response = aggregator.finish().unwrap();
+        assert_eq!(
+            response.pointer("/output/0/content"),
+            Some(&json!([
+                {"type":"output_text","text":"first "},
+                {"type":"output_text","text":"second"}
+            ]))
+        );
+        assert!(!response.to_string().contains("__ocr_stream_part_index"));
+    }
+
+    #[test]
+    fn responses_success_terminal_requires_array_output_but_empty_array_can_fallback() {
+        for (kind, status) in [
+            ("response.completed", "completed"),
+            ("response.incomplete", "incomplete"),
+        ] {
+            for response in [
+                json!({"status":status}),
+                json!({"status":status,"output":null}),
+                json!({"status":status,"output":"bad"}),
+                json!({"status":status,"output":{}}),
+            ] {
+                let mut aggregator = ResponsesSseAggregator::default();
+                aggregator
+                    .push_raw(&json!({"type":kind,"response":response}).to_string())
+                    .unwrap();
+                let error = aggregator.finish().unwrap_err();
+                assert_eq!(
+                    error.message,
+                    "upstream Responses terminal response output must be an array"
+                );
+                assert!(error.retryable);
+            }
+        }
+
+        let mut aggregator = ResponsesSseAggregator::default();
+        for event in [
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"kept"}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+        ] {
+            aggregator.push_raw(&event.to_string()).unwrap();
+        }
+        let response = aggregator.finish().unwrap();
+        assert_eq!(
+            response.pointer("/output/0/content/0/text"),
+            Some(&json!("kept"))
+        );
+
+        let mut failed = ResponsesSseAggregator::default();
+        failed
+            .push_raw(
+                &json!({
+                    "type":"response.failed",
+                    "response":{"status":"failed","error":{"message":"nope"}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        assert_eq!(failed.finish().unwrap()["output"], json!([]));
     }
 }

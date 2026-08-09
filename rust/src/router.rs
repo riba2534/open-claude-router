@@ -33,7 +33,7 @@ use crate::{
     transform::{
         anthropic_json_to_sse, prepare_chat_request_with_tool_names, transform_anthropic_request,
         transform_chat_json_response_with_tool_names, transform_responses_json,
-        transform_responses_request,
+        transform_responses_request, validate_final_outbound_request,
     },
     upstream::{call_upstream, read_upstream_body, upstream_http_error},
 };
@@ -290,6 +290,7 @@ async fn forward(
     let effort_map = parse_effort_map(&headers)?;
     let effort_levels = parse_effort_levels(&headers)?;
     apply_effort_controls(&mut outbound, &effort_map, &effort_levels);
+    validate_final_outbound_request(&outbound)?;
     let chat_tool_names = match format {
         UpstreamFormat::ChatCompletions => {
             Some(prepare_chat_request_with_tool_names(&mut outbound))

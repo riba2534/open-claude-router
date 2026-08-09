@@ -218,6 +218,7 @@ struct ResponsesProgressiveState {
     message_id: Option<String>,
     model: Option<String>,
     service_tier: Option<String>,
+    item_indices: BTreeMap<String, u64>,
     emitted_text: String,
     emitted_audio_omission: bool,
     terminal: bool,
@@ -257,6 +258,15 @@ impl ResponsesProgressiveState {
             if let Some(tier) = response.get("service_tier").and_then(Value::as_str) {
                 self.service_tier = Some(tier.to_owned());
             }
+        }
+        if matches!(
+            kind,
+            "response.output_item.added" | "response.output_item.done"
+        ) && let (Some(item_id), Some(output_index)) = (
+            event.pointer("/item/id").and_then(Value::as_str),
+            event.get("output_index").and_then(Value::as_u64),
+        ) {
+            self.item_indices.insert(item_id.to_owned(), output_index);
         }
         if !self.started {
             if matches!(
@@ -299,6 +309,23 @@ impl ResponsesProgressiveState {
         let Some(text) = text.filter(|text| !text.is_empty()) else {
             return Ok(Vec::new());
         };
+        let output_index = event
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                event
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .and_then(|item_id| self.item_indices.get(item_id).copied())
+            })
+            .unwrap_or(0);
+        let content_index = event
+            .get("content_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if output_index != 0 || content_index != 0 {
+            self.blocked_before_text = true;
+        }
         if self.blocked_before_text {
             return Ok(Vec::new());
         }
@@ -442,7 +469,7 @@ struct ChatStreamState {
     finish_reason: Option<String>,
     usage: Option<Value>,
     refusal: String,
-    saw_semantic_content: bool,
+    saw_semantic_output: bool,
     failed: bool,
 }
 
@@ -470,7 +497,7 @@ impl ChatStreamState {
             finish_reason: None,
             usage: None,
             refusal: String::new(),
-            saw_semantic_content: false,
+            saw_semantic_output: false,
             failed: false,
         }
     }
@@ -478,7 +505,7 @@ impl ChatStreamState {
     fn on_raw_event(&mut self, raw: &str) -> Result<Vec<String>, ApiError> {
         let event: Value = serde_json::from_str(raw)
             .map_err(|_| protocol_error("upstream Chat SSE contains malformed JSON"))?;
-        if let Some(error) = event.get("error") {
+        if let Some(error) = event.get("error").filter(|error| !error.is_null()) {
             self.failed = true;
             return Err(protocol_error(
                 error
@@ -499,17 +526,17 @@ impl ChatStreamState {
         if event.get("usage").is_some_and(|usage| !usage.is_null()) {
             self.usage = event.get("usage").cloned();
         }
-        let mut frames = self.ensure_started();
         if self.finish_reason.is_some() {
-            return Ok(frames);
+            return Ok(Vec::new());
         }
         let Some(choice) = event
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
         else {
-            return Ok(frames);
+            return Ok(Vec::new());
         };
+        let mut frames = self.ensure_started();
         let event_finish_reason = choice
             .get("finish_reason")
             .and_then(Value::as_str)
@@ -521,7 +548,7 @@ impl ChatStreamState {
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
-            self.saw_semantic_content = true;
+            self.saw_semantic_output = true;
             frames.extend(self.emit_thinking(text));
         }
         if let Some(signature) = delta
@@ -529,6 +556,7 @@ impl ChatStreamState {
             .or_else(|| delta.pointer("/thinking/signature"))
             .and_then(Value::as_str)
         {
+            self.saw_semantic_output = true;
             if self.defer_semantic {
                 if let Some(DeferredSemantic::Thinking {
                     signature: pending, ..
@@ -550,7 +578,7 @@ impl ChatStreamState {
         }
         match delta.get("content") {
             Some(Value::String(text)) if !text.is_empty() => {
-                self.saw_semantic_content = true;
+                self.saw_semantic_output = true;
                 frames.extend(self.emit_text(text));
             }
             Some(Value::Array(parts)) => {
@@ -568,7 +596,7 @@ impl ChatStreamState {
                         _ => bounded_stream_json(part),
                     };
                     if !text.is_empty() {
-                        self.saw_semantic_content = true;
+                        self.saw_semantic_output = true;
                         frames.extend(self.emit_text(&text));
                     }
                 }
@@ -581,11 +609,12 @@ impl ChatStreamState {
             .filter(|text| !text.is_empty())
         {
             self.refusal.push_str(text);
-            self.saw_semantic_content = true;
+            self.saw_semantic_output = true;
             frames.extend(self.emit_text(text));
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
+                self.saw_semantic_output = true;
                 let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
                 if !self.tools.contains_key(&index) {
                     self.deferred.push(DeferredSemantic::Tool(index));
@@ -597,14 +626,18 @@ impl ChatStreamState {
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                 {
-                    tool.id = id.to_owned();
+                    set_stable_identity(
+                        &mut tool.id,
+                        id,
+                        "upstream tool call id changed during the stream",
+                    )?;
                 }
                 if let Some(name) = call
                     .pointer("/function/name")
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                 {
-                    tool.name = self.tool_names.original_name(name).to_owned();
+                    merge_name_fragment(&mut tool.name, name);
                 }
                 if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
                 {
@@ -613,6 +646,7 @@ impl ChatStreamState {
             }
         }
         if let Some(function) = delta.get("function_call") {
+            self.saw_semantic_output = true;
             if !self.tools.contains_key(&0) {
                 self.deferred.push(DeferredSemantic::Tool(0));
             }
@@ -626,7 +660,7 @@ impl ChatStreamState {
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
             {
-                tool.name = self.tool_names.original_name(name).to_owned();
+                merge_name_fragment(&mut tool.name, name);
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                 tool.arguments.push_str(arguments);
@@ -645,6 +679,7 @@ impl ChatStreamState {
                 .cloned()
                 .collect::<Vec<_>>();
             if !citations.is_empty() {
+                self.saw_semantic_output = true;
                 frames.extend(self.emit_text(&bounded_stream_json(&json!({
                     "type":"openai_url_citations","annotations":citations
                 }))));
@@ -654,6 +689,7 @@ impl ChatStreamState {
             .get("response_output_block")
             .filter(|block| block.is_object())
         {
+            self.saw_semantic_output = true;
             frames.extend(self.emit_text(&bounded_stream_json(block)));
         }
         if let Some(reason) = event_finish_reason {
@@ -666,7 +702,7 @@ impl ChatStreamState {
         if self.failed {
             return Ok(Vec::new());
         }
-        if !self.started && !self.saw_semantic_content && self.tools.is_empty() {
+        if self.finish_reason.is_none() && !self.saw_semantic_output && self.tools.is_empty() {
             return Err(protocol_error("upstream Chat stream was empty"));
         }
         let mut frames = self.ensure_started();
@@ -740,12 +776,13 @@ impl ChatStreamState {
                         continue;
                     };
                     let name = if tool.name.is_empty() {
-                        "unknown"
+                        "unknown".to_owned()
                     } else {
-                        &tool.name
+                        self.tool_names.original_name(&tool.name).to_owned()
                     };
                     if !complete_tools {
-                        frames.extend(self.emit_text(&incomplete_tool_text(name, &tool.arguments)));
+                        frames
+                            .extend(self.emit_text(&incomplete_tool_text(&name, &tool.arguments)));
                         continue;
                     }
                     let input = serde_json::from_str::<Value>(if tool.arguments.is_empty() {
@@ -760,7 +797,7 @@ impl ChatStreamState {
                         "content_block_start",
                         &json!({
                             "type":"content_block_start","index":index,
-                            "content_block":{"type":"tool_use","id":tool.id,"name":tool.name,"input":{},"caller":{"type":"direct"}}
+                            "content_block":{"type":"tool_use","id":tool.id,"name":name,"input":{},"caller":{"type":"direct"}}
                         }),
                     ));
                     frames.push(format_sse_event(
@@ -926,6 +963,32 @@ impl ChatStreamState {
 fn is_router_signature(signature: &str) -> bool {
     signature.starts_with("ocr-chat-reasoning-v1:")
         || signature.starts_with("ocr-responses-reasoning-v1:")
+}
+
+fn set_stable_identity(
+    slot: &mut String,
+    incoming: &str,
+    conflict: &'static str,
+) -> Result<(), ApiError> {
+    if slot.is_empty() {
+        *slot = incoming.to_owned();
+        return Ok(());
+    }
+    if slot != incoming {
+        return Err(protocol_error(conflict));
+    }
+    Ok(())
+}
+
+fn merge_name_fragment(slot: &mut String, incoming: &str) {
+    if slot == incoming {
+        return;
+    }
+    if incoming.starts_with(slot.as_str()) {
+        *slot = incoming.to_owned();
+    } else {
+        slot.push_str(incoming);
+    }
 }
 
 fn incomplete_tool_text(name: &str, raw: &str) -> String {
@@ -1300,6 +1363,180 @@ mod tests {
                 + usage["cache_read_input_tokens"].as_u64().unwrap()
                 + usage["cache_creation_input_tokens"].as_u64().unwrap(),
             17
+        );
+    }
+
+    #[test]
+    fn live_chat_accepts_null_error_and_done_compatibility_is_non_executable() {
+        let mut text = ChatStreamState::new(false);
+        text.on_raw_event(
+            &json!({"error":null,"choices":[{"delta":{"content":"ok"},"finish_reason":null}]})
+                .to_string(),
+        )
+        .unwrap();
+        let text_payloads = payloads(&text.finish(true).unwrap());
+        assert!(
+            text_payloads.iter().any(|payload| {
+                payload.pointer("/delta/stop_reason") == Some(&json!("end_turn"))
+            })
+        );
+
+        let mut partial = ChatStreamState::new(false);
+        partial
+            .on_raw_event(
+                &json!({"choices":[{"delta":{"tool_calls":[{
+                    "index":0,"id":"call_1","function":{"name":"lookup","arguments":"{"}
+                }]},"finish_reason":null}]})
+                .to_string(),
+            )
+            .unwrap();
+        let partial_payloads = payloads(&partial.finish(true).unwrap());
+        assert!(partial_payloads.iter().any(|payload| {
+            payload.pointer("/delta/stop_reason") == Some(&json!("max_tokens"))
+        }));
+        assert!(
+            partial_payloads.iter().all(|payload| {
+                payload.pointer("/content_block/type") != Some(&json!("tool_use"))
+            })
+        );
+
+        let mut empty = ChatStreamState::new(false);
+        assert_eq!(
+            empty.finish(true).unwrap_err().message,
+            "upstream Chat stream was empty"
+        );
+
+        let mut empty_delta = ChatStreamState::new(false);
+        assert!(
+            empty_delta
+                .on_raw_event(&json!({"choices":[{"delta":{},"finish_reason":null}]}).to_string())
+                .unwrap()
+                .iter()
+                .any(|frame| frame.contains("message_start"))
+        );
+        assert_eq!(
+            empty_delta.finish(true).unwrap_err().message,
+            "upstream Chat stream was empty"
+        );
+
+        let mut signature_only = ChatStreamState::new(false);
+        signature_only
+            .on_raw_event(
+                &json!({"choices":[{"delta":{"signature":"opaque"},"finish_reason":null}]})
+                    .to_string(),
+            )
+            .unwrap();
+        let signature_payloads = payloads(&signature_only.finish(true).unwrap());
+        assert!(
+            signature_payloads.iter().any(|payload| {
+                payload.pointer("/delta/type") == Some(&json!("signature_delta"))
+            })
+        );
+
+        let mut metadata_only = ChatStreamState::new(false);
+        let metadata_frames = metadata_only
+            .on_raw_event(
+                &json!({"id":"chat-meta","model":"m","choices":[],"usage":{"prompt_tokens":1}})
+                    .to_string(),
+            )
+            .unwrap();
+        assert!(metadata_frames.is_empty());
+        assert_eq!(
+            metadata_only.finish(true).unwrap_err().message,
+            "upstream Chat stream was empty"
+        );
+
+        let mut formal_empty_stop = ChatStreamState::new(false);
+        formal_empty_stop
+            .on_raw_event(
+                &json!({"id":"chat-empty","model":"m","choices":[{"delta":{},"finish_reason":"stop"}]})
+                    .to_string(),
+            )
+            .unwrap();
+        let formal_payloads = payloads(&formal_empty_stop.finish(false).unwrap());
+        assert!(
+            formal_payloads
+                .iter()
+                .any(|payload| payload["type"] == "message_stop")
+        );
+    }
+
+    #[test]
+    fn responses_progressive_buffers_refusal_when_earlier_output_index_is_unknown() {
+        let mut aggregator = ResponsesSseAggregator::default();
+        let mut progressive = ResponsesProgressiveState::default();
+        let events = [
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"message_1","content":[]}}),
+            json!({"type":"response.refusal.delta","item_id":"message_1","content_index":0,"delta":"denied"}),
+            json!({"type":"response.output_item.added","output_index":0,"item":{
+                "type":"function_call","id":"item_0","call_id":"call_0","name":"lookup","arguments":"{}"
+            }}),
+            json!({"type":"response.completed","response":{"id":"r","model":"m","status":"completed","output":[
+                {"type":"function_call","id":"item_0","call_id":"call_0","name":"lookup","arguments":"{}"},
+                {"type":"message","id":"message_1","role":"assistant","content":[{"type":"refusal","refusal":"denied"}]}
+            ]}}),
+        ];
+        for event in events {
+            aggregator.push_raw(&event.to_string()).unwrap();
+            assert!(
+                progressive
+                    .on_raw_event(&event.to_string())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let message = transform_responses_json(&aggregator.finish().unwrap(), false).unwrap();
+        let frames = progressive.finish(&message).unwrap();
+        assert!(frames.contains("suppressed by refusal"));
+        assert!(frames.contains("denied"));
+        assert!(frames.contains("event: message_stop"));
+        assert!(!frames.contains("event: error"));
+    }
+
+    #[test]
+    fn live_chat_name_fragments_support_snapshots_and_deltas() {
+        let mut state = ChatStreamState::new(false);
+        for event in [
+            json!({"choices":[{"delta":{"function_call":{"name":"lookup","arguments":"{"}},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"function_call":{"name":"lookup","arguments":"}"}},"finish_reason":"function_call"}]}),
+        ] {
+            state.on_raw_event(&event.to_string()).unwrap();
+        }
+        let repeated_payloads = payloads(&state.finish(false).unwrap());
+        assert!(
+            repeated_payloads.iter().any(|payload| {
+                payload.pointer("/content_block/name") == Some(&json!("lookup"))
+            })
+        );
+
+        let mut legacy = ChatStreamState::new(false);
+        for event in [
+            json!({"choices":[{"delta":{"function_call":{"name":"get_","arguments":"{}"}},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"function_call":{"name":"weather"}},"finish_reason":"function_call"}]}),
+        ] {
+            legacy.on_raw_event(&event.to_string()).unwrap();
+        }
+        assert!(
+            payloads(&legacy.finish(false).unwrap())
+                .iter()
+                .any(|payload| {
+                    payload.pointer("/content_block/name") == Some(&json!("get_weather"))
+                })
+        );
+
+        let mut modern = ChatStreamState::new(false);
+        for event in [
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_","arguments":"{}"}}]},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"weather"}}]},"finish_reason":"tool_calls"}]}),
+        ] {
+            modern.on_raw_event(&event.to_string()).unwrap();
+        }
+        assert!(
+            payloads(&modern.finish(false).unwrap())
+                .iter()
+                .any(|payload| {
+                    payload.pointer("/content_block/name") == Some(&json!("get_weather"))
+                })
         );
     }
 }
