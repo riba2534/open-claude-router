@@ -1,6 +1,6 @@
 [package]
 name = "open-claude-router"
-version = "0.6.7"
+version = "0.6.8"
 edition = "2024"
 license = "MIT"
 description = "High-concurrency stateless Anthropic Messages to OpenAI protocol router"
@@ -14,6 +14,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures-util = "0.3"
 http = "1"
 http-body-util = "0.1"
+httpdate = "1"
 reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

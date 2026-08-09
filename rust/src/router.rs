@@ -25,14 +25,15 @@ use crate::{
         parse_upstream_config, parse_upstream_format, parse_upstream_headers,
         resolve_upstream_model,
     },
-    error::ApiError,
+    error::{ApiError, RetryHints},
     model_log::{ExchangeMetadata, ModelInteractionLogger, selected_headers},
     sse::{aggregate_chat_sse, aggregate_responses_sse},
-    streaming::{convert_chat_sse_stream, convert_responses_sse_stream},
+    streaming::{convert_chat_sse_stream_with_tool_names, convert_responses_sse_stream},
     tokenizer::count_anthropic_tokens,
     transform::{
-        anthropic_json_to_sse, prepare_chat_request, transform_anthropic_request,
-        transform_chat_json_response, transform_responses_json, transform_responses_request,
+        anthropic_json_to_sse, prepare_chat_request_with_tool_names, transform_anthropic_request,
+        transform_chat_json_response_with_tool_names, transform_responses_json,
+        transform_responses_request,
     },
     upstream::{call_upstream, read_upstream_body, upstream_http_error},
 };
@@ -289,10 +290,15 @@ async fn forward(
     let effort_map = parse_effort_map(&headers)?;
     let effort_levels = parse_effort_levels(&headers)?;
     apply_effort_controls(&mut outbound, &effort_map, &effort_levels);
-    match format {
-        UpstreamFormat::ChatCompletions => prepare_chat_request(&mut outbound),
-        UpstreamFormat::Responses => transform_responses_request(&mut outbound)?,
-    }
+    let chat_tool_names = match format {
+        UpstreamFormat::ChatCompletions => {
+            Some(prepare_chat_request_with_tool_names(&mut outbound))
+        }
+        UpstreamFormat::Responses => {
+            transform_responses_request(&mut outbound)?;
+            None
+        }
+    };
     let extra_headers = parse_upstream_headers(&headers)?;
     let outbound_model = outbound
         .get("model")
@@ -337,6 +343,7 @@ async fn forward(
     };
     exchange.mark_upstream_response_started();
     let response_status = upstream_response.status();
+    let retry_hints = RetryHints::from_headers(upstream_response.headers());
     let response_headers = selected_headers(upstream_response.headers());
     let is_sse = upstream_response
         .headers()
@@ -350,11 +357,14 @@ async fn forward(
             response_headers,
         );
         let body = match format {
-            UpstreamFormat::ChatCompletions => Body::from_stream(convert_chat_sse_stream(
-                upstream_response,
-                omit_thinking,
-                capture,
-            )),
+            UpstreamFormat::ChatCompletions => {
+                Body::from_stream(convert_chat_sse_stream_with_tool_names(
+                    upstream_response,
+                    omit_thinking,
+                    capture,
+                    chat_tool_names.clone().unwrap_or_default(),
+                ))
+            }
             UpstreamFormat::Responses => Body::from_stream(convert_responses_sse_stream(
                 upstream_response,
                 omit_thinking,
@@ -368,6 +378,7 @@ async fn forward(
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
+        retry_hints.apply(response.headers_mut());
         return Ok(response);
     }
     let (response_bytes, read_error) = read_upstream_body(upstream_response).await;
@@ -380,7 +391,9 @@ async fn forward(
             &error,
         );
         if !response_status.is_success() {
-            return Err(upstream_http_error(response_status, &response_bytes));
+            return Err(
+                upstream_http_error(response_status, &response_bytes).with_retry_hints(retry_hints)
+            );
         }
         return Err(ApiError::new(
             StatusCode::BAD_GATEWAY,
@@ -388,7 +401,8 @@ async fn forward(
             "upstream_stream_error",
             format!("upstream response read failed: {error}"),
         )
-        .retryable());
+        .retryable()
+        .with_retry_hints(retry_hints));
     }
     state.model_logger.response(
         &mut exchange,
@@ -398,13 +412,16 @@ async fn forward(
         true,
     );
     if !response_status.is_success() {
-        return Err(upstream_http_error(response_status, &response_bytes));
+        return Err(
+            upstream_http_error(response_status, &response_bytes).with_retry_hints(retry_hints)
+        );
     }
     let upstream_payload = if is_sse {
         match format {
-            UpstreamFormat::ChatCompletions => aggregate_chat_sse(response_bytes)?,
-            UpstreamFormat::Responses => aggregate_responses_sse(response_bytes)?,
+            UpstreamFormat::ChatCompletions => aggregate_chat_sse(response_bytes),
+            UpstreamFormat::Responses => aggregate_responses_sse(response_bytes),
         }
+        .map_err(|error| error.with_retry_hints(retry_hints.clone()))?
     } else {
         serde_json::from_slice::<Value>(&response_bytes).map_err(|error| {
             ApiError::new(
@@ -414,16 +431,24 @@ async fn forward(
                 format!("upstream response is not valid JSON: {error}"),
             )
             .retryable()
+            .with_retry_hints(retry_hints.clone())
         })?
     };
     let anthropic = match format {
-        UpstreamFormat::ChatCompletions => {
-            transform_chat_json_response(&upstream_payload, omit_thinking)?
-        }
-        UpstreamFormat::Responses => transform_responses_json(&upstream_payload, omit_thinking)?,
+        UpstreamFormat::ChatCompletions => transform_chat_json_response_with_tool_names(
+            &upstream_payload,
+            omit_thinking,
+            chat_tool_names
+                .as_ref()
+                .expect("chat tool names initialized"),
+        )
+        .map_err(|error| error.with_retry_hints(retry_hints.clone()))?,
+        UpstreamFormat::Responses => transform_responses_json(&upstream_payload, omit_thinking)
+            .map_err(|error| error.with_retry_hints(retry_hints.clone()))?,
     };
     if wants_stream {
-        let text = anthropic_json_to_sse(&anthropic)?;
+        let text = anthropic_json_to_sse(&anthropic)
+            .map_err(|error| error.with_retry_hints(retry_hints))?;
         let mut response = Response::new(Body::from(text));
         response
             .headers_mut()

@@ -1510,4 +1510,108 @@ mod tests {
         );
         assert!(!response.to_string().contains("__ocr_stream_part_index"));
     }
+
+    #[test]
+    fn responses_interleaved_out_of_order_function_calls_use_official_indices() {
+        let mut aggregator = ResponsesSseAggregator::default();
+        let terminal_output = json!([
+            {
+                "type":"function_call","id":"item_a","call_id":"call_a",
+                "name":"tool_a","arguments":"{\"a\":1}","status":"completed"
+            },
+            {
+                "type":"function_call","id":"item_b","call_id":"call_b",
+                "name":"tool_b","arguments":"{\"b\":2}","status":"completed"
+            }
+        ]);
+        let events = [
+            json!({
+                "type":"response.created","sequence_number":0,
+                "response":{"id":"resp_parallel","model":"m","status":"in_progress","output":[]}
+            }),
+            json!({
+                "type":"response.output_item.added","sequence_number":1,"output_index":1,
+                "item":{"type":"function_call","id":"item_b","call_id":"call_b",
+                    "name":"tool_b","arguments":"","status":"in_progress"}
+            }),
+            json!({
+                "type":"response.output_item.added","sequence_number":2,"output_index":0,
+                "item":{"type":"function_call","id":"item_a","call_id":"call_a",
+                    "name":"tool_a","arguments":"","status":"in_progress"}
+            }),
+            json!({
+                "type":"response.function_call_arguments.delta","sequence_number":3,
+                "output_index":1,"item_id":"item_b","delta":"{\"b\":"
+            }),
+            json!({
+                "type":"response.function_call_arguments.delta","sequence_number":4,
+                "output_index":0,"item_id":"item_a","delta":"{\"a\":"
+            }),
+            json!({
+                "type":"response.function_call_arguments.delta","sequence_number":5,
+                "output_index":1,"item_id":"item_b","delta":"2}"
+            }),
+            json!({
+                "type":"response.function_call_arguments.delta","sequence_number":6,
+                "output_index":0,"item_id":"item_a","delta":"1}"
+            }),
+            json!({
+                "type":"response.function_call_arguments.done","sequence_number":7,
+                "output_index":1,"item_id":"item_b","arguments":"{\"b\":2}"
+            }),
+            json!({
+                "type":"response.function_call_arguments.done","sequence_number":8,
+                "output_index":0,"item_id":"item_a","arguments":"{\"a\":1}"
+            }),
+            json!({
+                "type":"response.output_item.done","sequence_number":9,"output_index":1,
+                "item":terminal_output[1].clone()
+            }),
+            json!({
+                "type":"response.output_item.done","sequence_number":10,"output_index":0,
+                "item":terminal_output[0].clone()
+            }),
+            json!({
+                "type":"response.completed","sequence_number":11,
+                "response":{
+                    "id":"resp_parallel","model":"m","status":"completed",
+                    "output":terminal_output,
+                    "usage":{
+                        "input_tokens":17,"output_tokens":4,"total_tokens":21,
+                        "input_tokens_details":{"cached_tokens":5,"cache_write_tokens":3}
+                    }
+                }
+            }),
+        ];
+        for event in events {
+            aggregator.push_raw(&event.to_string()).unwrap();
+        }
+
+        let payload = aggregator.finish().unwrap();
+        assert_eq!(payload.pointer("/output/0/id"), Some(&json!("item_a")));
+        assert_eq!(
+            payload.pointer("/output/0/arguments"),
+            Some(&json!("{\"a\":1}"))
+        );
+        assert_eq!(payload.pointer("/output/1/id"), Some(&json!("item_b")));
+        assert_eq!(
+            payload.pointer("/output/1/arguments"),
+            Some(&json!("{\"b\":2}"))
+        );
+
+        let message = crate::transform::transform_responses_json(&payload, false).unwrap();
+        assert_eq!(message.pointer("/content/0/id"), Some(&json!("call_a")));
+        assert_eq!(message.pointer("/content/0/input"), Some(&json!({"a":1})));
+        assert_eq!(message.pointer("/content/1/id"), Some(&json!("call_b")));
+        assert_eq!(message.pointer("/content/1/input"), Some(&json!({"b":2})));
+        assert_eq!(message.pointer("/usage/input_tokens"), Some(&json!(9)));
+        assert_eq!(
+            message.pointer("/usage/cache_read_input_tokens"),
+            Some(&json!(5))
+        );
+        assert_eq!(
+            message.pointer("/usage/cache_creation_input_tokens"),
+            Some(&json!(3))
+        );
+    }
 }

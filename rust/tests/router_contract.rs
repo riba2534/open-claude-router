@@ -50,6 +50,52 @@ async fn chat_upstream(
     }))
 }
 
+async fn chat_tool_upstream(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let name = body
+        .pointer("/tool_choice/function/name")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+    state.count.fetch_add(1, Ordering::SeqCst);
+    state.requests.lock().await.push_back((headers, body));
+    Json(json!({
+        "id":"chatcmpl-tool","model":"upstream-chat",
+        "choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{
+            "id":"call_new","type":"function","function":{"name":name,"arguments":"{}"}
+        }]},"finish_reason":"tool_calls"}]
+    }))
+}
+
+async fn chat_tool_stream_upstream(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let name = body
+        .pointer("/tool_choice/function/name")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+    state.count.fetch_add(1, Ordering::SeqCst);
+    state.requests.lock().await.push_back((headers, body));
+    let event = json!({
+        "id":"chatcmpl-tool-stream","model":"upstream-chat",
+        "choices":[{"delta":{"tool_calls":[{
+            "index":0,"id":"call_new","type":"function",
+            "function":{"name":name,"arguments":"{}"}
+        }]},"finish_reason":"tool_calls"}]
+    });
+    let mut response = Response::new(Body::from(format!("data: {event}\n\ndata: [DONE]\n\n")));
+    response
+        .headers_mut()
+        .insert("content-type", "text/event-stream".parse().unwrap());
+    response
+}
+
 async fn echo_upstream(Json(body): Json<Value>) -> Json<Value> {
     let model = body
         .get("model")
@@ -93,6 +139,105 @@ async fn status_upstream(
     )
 }
 
+async fn retry_hint_upstream(
+    State(state): State<MockState>,
+    Path(case): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state.count.fetch_add(1, Ordering::SeqCst);
+    state.requests.lock().await.push_back((headers, body));
+    let (status, content_type, response_body) = match case.as_str() {
+        "both" | "date" | "invalid" => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "application/json",
+            Body::from(r#"{"error":{"message":"retry later"}}"#),
+        ),
+        "logical" => (
+            StatusCode::OK,
+            "application/json",
+            Body::from(r#"{"error":{"message":"logical retry","type":"invalid_request_error"}}"#),
+        ),
+        "malformed" => (StatusCode::OK, "application/json", Body::from("{not-json")),
+        "stream" => (
+            StatusCode::OK,
+            "text/event-stream",
+            Body::from(concat!(
+                "data: {\"id\":\"retry-stream\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )),
+        ),
+        _ => unreachable!("unknown retry-hint fixture"),
+    };
+    let mut response = Response::new(response_body);
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert("content-type", content_type.parse().unwrap());
+    response
+        .headers_mut()
+        .insert("authorization", "must-not-leak".parse().unwrap());
+    response
+        .headers_mut()
+        .insert("set-cookie", "secret=must-not-leak".parse().unwrap());
+    response
+        .headers_mut()
+        .insert("x-provider-secret", "must-not-leak".parse().unwrap());
+    response
+        .headers_mut()
+        .insert("x-should-retry", "false".parse().unwrap());
+    match case.as_str() {
+        "both" => {
+            response
+                .headers_mut()
+                .insert("retry-after", "17".parse().unwrap());
+            response
+                .headers_mut()
+                .insert("retry-after-ms", "250".parse().unwrap());
+        }
+        "date" => {
+            response.headers_mut().insert(
+                "retry-after",
+                "Sun, 06 Nov 1994 08:49:37 GMT".parse().unwrap(),
+            );
+        }
+        "invalid" => {
+            response
+                .headers_mut()
+                .append("retry-after", "5".parse().unwrap());
+            response
+                .headers_mut()
+                .append("retry-after", "6".parse().unwrap());
+            response
+                .headers_mut()
+                .insert("retry-after-ms", "12junk".parse().unwrap());
+        }
+        "logical" => {
+            response
+                .headers_mut()
+                .insert("retry-after", "19".parse().unwrap());
+            response
+                .headers_mut()
+                .insert("retry-after-ms", "275".parse().unwrap());
+        }
+        "malformed" => {
+            response
+                .headers_mut()
+                .insert("retry-after", "23".parse().unwrap());
+        }
+        "stream" => {
+            response
+                .headers_mut()
+                .insert("retry-after", "3".parse().unwrap());
+            response
+                .headers_mut()
+                .insert("retry-after-ms", "75".parse().unwrap());
+        }
+        _ => unreachable!("unknown retry-hint fixture"),
+    }
+    response
+}
+
 async fn truncated_status_upstream(
     State(state): State<MockState>,
     Path(status): Path<u16>,
@@ -111,6 +256,9 @@ async fn truncated_status_upstream(
     response
         .headers_mut()
         .insert("content-type", "application/json".parse().unwrap());
+    response
+        .headers_mut()
+        .insert("retry-after", "29".parse().unwrap());
     response
 }
 
@@ -227,6 +375,8 @@ async fn start_mock() -> (String, MockState) {
     let state = MockState::default();
     let app = Router::new()
         .route("/chat", post(chat_upstream))
+        .route("/chat-tool", post(chat_tool_upstream))
+        .route("/chat-tool-stream", post(chat_tool_stream_upstream))
         .route("/echo", post(echo_upstream))
         .route("/responses", post(responses_upstream))
         .route("/chat-stream", post(chat_stream_upstream))
@@ -237,6 +387,7 @@ async fn start_mock() -> (String, MockState) {
             post(truncated_responses_stream_upstream),
         )
         .route("/status/{status}", post(status_upstream))
+        .route("/retry-hint/{case}", post(retry_hint_upstream))
         .route(
             "/status-truncated/{status}",
             post(truncated_status_upstream),
@@ -417,6 +568,32 @@ fn anthropic_body(stream: bool) -> Value {
     })
 }
 
+fn long_tool_body(stream: bool) -> (Value, String, String, String) {
+    let exact_64 = "s".repeat(64);
+    let shared = "x".repeat(64);
+    let long_a = format!("{shared}A");
+    let long_b = format!("{shared}B");
+    let body = json!({
+        "model":"m","max_tokens":32,"stream":stream,
+        "tools":[
+            {"name":exact_64,"input_schema":{"type":"object"}},
+            {"name":long_a,"input_schema":{"type":"object"}},
+            {"name":long_b,"input_schema":{"type":"object"}}
+        ],
+        "tool_choice":{"type":"tool","name":long_a},
+        "messages":[
+            {"role":"user","content":"start"},
+            {"role":"assistant","content":[{
+                "type":"tool_use","id":"call_history","name":long_a,"input":{}
+            }]},
+            {"role":"user","content":[{
+                "type":"tool_result","tool_use_id":"call_history","content":"ok"
+            }]}
+        ]
+    });
+    (body, exact_64, long_a, long_b)
+}
+
 async fn send(router: Router, url: &str, upstream: &str, body: Value) -> axum::response::Response {
     router
         .oneshot(
@@ -557,6 +734,84 @@ async fn chat_route_converts_both_protocol_boundaries_and_isolates_headers() {
 }
 
 #[tokio::test]
+async fn chat_tool_names_are_consistent_and_reversible_across_the_router() {
+    let (base, mock) = start_mock().await;
+    let (body, exact_64, long_a, long_b) = long_tool_body(false);
+    let response = send(
+        test_router(),
+        "/v1/messages",
+        &format!("{base}/chat-tool"),
+        body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(result.pointer("/content/0/name"), Some(&json!(long_a)));
+
+    let (_, outbound) = mock.requests.lock().await.pop_front().unwrap();
+    let exact_wire = outbound
+        .pointer("/tools/0/function/name")
+        .and_then(Value::as_str)
+        .unwrap();
+    let wire_a = outbound
+        .pointer("/tools/1/function/name")
+        .and_then(Value::as_str)
+        .unwrap();
+    let wire_b = outbound
+        .pointer("/tools/2/function/name")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert_eq!(exact_wire, exact_64);
+    assert!(wire_a.len() <= 64);
+    assert!(wire_b.len() <= 64);
+    assert_ne!(wire_a, wire_b);
+    assert_eq!(
+        outbound
+            .pointer("/tool_choice/function/name")
+            .and_then(Value::as_str),
+        Some(wire_a)
+    );
+    assert_eq!(
+        outbound
+            .pointer("/messages/1/tool_calls/0/function/name")
+            .and_then(Value::as_str),
+        Some(wire_a)
+    );
+    assert_ne!(wire_a, long_a);
+    assert_ne!(wire_b, long_b);
+}
+
+#[tokio::test]
+async fn chat_stream_restores_the_original_tool_name_through_router_context() {
+    let (base, mock) = start_mock().await;
+    let (body, _, long_a, _) = long_tool_body(true);
+    let response = send(
+        test_router(),
+        "/v1/messages",
+        &format!("{base}/chat-tool-stream"),
+        body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let (_, outbound) = mock.requests.lock().await.pop_front().unwrap();
+    let wire = outbound
+        .pointer("/tool_choice/function/name")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert_ne!(wire, long_a);
+    assert!(text.contains(&serde_json::to_string(&long_a).unwrap()));
+    assert!(!text.contains(&serde_json::to_string(wire).unwrap()));
+}
+
+#[tokio::test]
 async fn responses_route_maps_request_and_returns_replayable_reasoning() {
     let (base, mock) = start_mock().await;
     let mut body = anthropic_body(false);
@@ -600,6 +855,66 @@ async fn responses_route_maps_request_and_returns_replayable_reasoning() {
         outbound.pointer("/input/1/content/1/type"),
         Some(&json!("input_image"))
     );
+}
+
+#[tokio::test]
+async fn responses_history_pairs_65_character_call_ids_without_renaming_tools() {
+    let (base, mock) = start_mock().await;
+    let exact_64 = "c".repeat(64);
+    let long_65 = "d".repeat(65);
+    let tool_name_128 = "t".repeat(128);
+    let body = json!({
+        "model":"m","max_tokens":32,
+        "tools":[{"name":tool_name_128,"input_schema":{"type":"object"}}],
+        "messages":[
+            {"role":"user","content":"start"},
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":exact_64,"name":tool_name_128,"input":{"n":1}},
+                {"type":"tool_use","id":long_65,"name":tool_name_128,"input":{"n":2}}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":exact_64,"content":"one"},
+                {"type":"tool_result","tool_use_id":long_65,"content":"two"}
+            ]}
+        ]
+    });
+    let response = test_router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-upstream-url", format!("{base}/responses"))
+                .header("x-upstream-authorization", "Bearer secret")
+                .header("x-upstream-format", "responses")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (_, outbound) = mock.requests.lock().await.pop_front().unwrap();
+    assert_eq!(
+        outbound.pointer("/tools/0/name"),
+        Some(&json!(tool_name_128))
+    );
+    let input = outbound.get("input").and_then(Value::as_array).unwrap();
+    let calls = input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .collect::<Vec<_>>();
+    let outputs = input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .collect::<Vec<_>>();
+    assert_eq!(calls[0].get("call_id"), Some(&json!(exact_64)));
+    assert_eq!(outputs[0].get("call_id"), calls[0].get("call_id"));
+    let long_wire = calls[1].get("call_id").and_then(Value::as_str).unwrap();
+    assert_eq!(long_wire.chars().count(), 64);
+    assert_ne!(long_wire, long_65);
+    assert_eq!(outputs[1].get("call_id"), calls[1].get("call_id"));
+    assert_eq!(calls[1].get("name"), Some(&json!(tool_name_128)));
 }
 
 #[tokio::test]
@@ -694,6 +1009,114 @@ async fn every_upstream_error_is_single_attempt_and_retryable() {
 }
 
 #[tokio::test]
+async fn retry_hints_are_allowlisted_validated_and_preserved_without_retrying() {
+    let (base, mock) = start_mock().await;
+
+    let response = send(
+        test_router(),
+        "/v1/messages",
+        &format!("{base}/retry-hint/both"),
+        anthropic_body(false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["x-should-retry"], "true");
+    assert_eq!(response.headers()["retry-after"], "17");
+    assert_eq!(response.headers()["retry-after-ms"], "250");
+    for name in [
+        "authorization",
+        "set-cookie",
+        "x-provider-secret",
+        "www-authenticate",
+    ] {
+        assert!(response.headers().get(name).is_none(), "leaked {name}");
+    }
+    assert_eq!(mock.count.load(Ordering::SeqCst), 1);
+
+    let response = send(
+        test_router(),
+        "/v1/messages",
+        &format!("{base}/retry-hint/date"),
+        anthropic_body(false),
+    )
+    .await;
+    assert_eq!(
+        response.headers()["retry-after"],
+        "Sun, 06 Nov 1994 08:49:37 GMT"
+    );
+    assert!(response.headers().get("retry-after-ms").is_none());
+    assert_eq!(mock.count.load(Ordering::SeqCst), 2);
+
+    let response = send(
+        test_router(),
+        "/v1/messages",
+        &format!("{base}/retry-hint/invalid"),
+        anthropic_body(false),
+    )
+    .await;
+    assert_eq!(response.headers()["x-should-retry"], "true");
+    assert!(response.headers().get("retry-after").is_none());
+    assert!(response.headers().get("retry-after-ms").is_none());
+    assert_eq!(mock.count.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn retry_hints_survive_logical_and_protocol_errors() {
+    let (base, mock) = start_mock().await;
+    let response = send(
+        test_router(),
+        "/v1/messages",
+        &format!("{base}/retry-hint/logical"),
+        anthropic_body(false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.headers()["x-should-retry"], "true");
+    assert_eq!(response.headers()["retry-after"], "19");
+    assert_eq!(response.headers()["retry-after-ms"], "275");
+
+    let response = send(
+        test_router(),
+        "/v1/messages",
+        &format!("{base}/retry-hint/malformed"),
+        anthropic_body(false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.headers()["x-should-retry"], "true");
+    assert_eq!(response.headers()["retry-after"], "23");
+    assert_eq!(mock.count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn live_sse_exposes_initial_retry_hints_without_forwarding_other_headers() {
+    let (base, mock) = start_mock().await;
+    let response = send(
+        test_router(),
+        "/v1/messages",
+        &format!("{base}/retry-hint/stream"),
+        anthropic_body(true),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["retry-after"], "3");
+    assert_eq!(response.headers()["retry-after-ms"], "75");
+    assert!(response.headers().get("x-should-retry").is_none());
+    assert!(response.headers().get("authorization").is_none());
+    assert!(response.headers().get("set-cookie").is_none());
+    assert!(response.headers().get("x-provider-secret").is_none());
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("event: message_stop"));
+    assert_eq!(mock.count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn truncated_non_2xx_body_keeps_status_type_retry_and_single_attempt() {
     let (base, mock) = start_mock().await;
     let response = send(
@@ -705,6 +1128,7 @@ async fn truncated_non_2xx_body_keeps_status_type_retry_and_single_attempt() {
     .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(response.headers()["x-should-retry"], "true");
+    assert_eq!(response.headers()["retry-after"], "29");
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
     assert_eq!(
@@ -726,6 +1150,7 @@ async fn successful_response_body_read_failure_is_retryable_bad_gateway() {
     .await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(response.headers()["x-should-retry"], "true");
+    assert_eq!(response.headers()["retry-after"], "29");
     assert_eq!(mock.count.load(Ordering::SeqCst), 1);
 }
 

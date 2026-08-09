@@ -1,10 +1,65 @@
 use axum::{
     Json,
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde_json::{Value, json};
 use thiserror::Error;
+
+const MAX_RETRY_HINT_LENGTH: usize = 128;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RetryHints {
+    retry_after: Option<HeaderValue>,
+    retry_after_ms: Option<HeaderValue>,
+}
+
+impl RetryHints {
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            retry_after: single_valid_header(headers, "retry-after", valid_retry_after),
+            retry_after_ms: single_valid_header(
+                headers,
+                "retry-after-ms",
+                valid_nonnegative_decimal,
+            ),
+        }
+    }
+
+    pub(crate) fn apply(&self, headers: &mut HeaderMap) {
+        if let Some(value) = &self.retry_after {
+            headers.insert("retry-after", value.clone());
+        }
+        if let Some(value) = &self.retry_after_ms {
+            headers.insert("retry-after-ms", value.clone());
+        }
+    }
+}
+
+fn single_valid_header(
+    headers: &HeaderMap,
+    name: &'static str,
+    validate: fn(&str) -> bool,
+) -> Option<HeaderValue> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let raw = value.to_str().ok()?;
+    if raw.is_empty() || raw.len() > MAX_RETRY_HINT_LENGTH || !validate(raw) {
+        return None;
+    }
+    Some(value.clone())
+}
+
+fn valid_retry_after(raw: &str) -> bool {
+    valid_nonnegative_decimal(raw) || httpdate::parse_http_date(raw).is_ok()
+}
+
+fn valid_nonnegative_decimal(raw: &str) -> bool {
+    raw.bytes().all(|byte| byte.is_ascii_digit())
+}
 
 #[derive(Debug, Error)]
 #[error("{message}")]
@@ -15,6 +70,7 @@ pub struct ApiError {
     pub message: String,
     pub retryable: bool,
     pub request_id: Option<String>,
+    retry_hints: Option<Box<RetryHints>>,
 }
 
 impl ApiError {
@@ -31,6 +87,7 @@ impl ApiError {
             message: message.into(),
             retryable: false,
             request_id: None,
+            retry_hints: None,
         }
     }
 
@@ -41,6 +98,11 @@ impl ApiError {
 
     pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
         self.request_id = request_id;
+        self
+    }
+
+    pub(crate) fn with_retry_hints(mut self, retry_hints: RetryHints) -> Self {
+        self.retry_hints = Some(Box::new(retry_hints));
         self
     }
 
@@ -62,6 +124,9 @@ impl IntoResponse for ApiError {
             response
                 .headers_mut()
                 .insert("x-should-retry", http::HeaderValue::from_static("true"));
+            if let Some(retry_hints) = &self.retry_hints {
+                retry_hints.apply(response.headers_mut());
+            }
         }
         response
     }
@@ -147,6 +212,49 @@ fn infer_status_from_openai_error_code(code: &str) -> Option<u16> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn retry_hints_accept_only_single_bounded_protocol_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("17"));
+        headers.insert("retry-after-ms", HeaderValue::from_static("250"));
+        let mut output = HeaderMap::new();
+        RetryHints::from_headers(&headers).apply(&mut output);
+        assert_eq!(output["retry-after"], "17");
+        assert_eq!(output["retry-after-ms"], "250");
+
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        let mut output = HeaderMap::new();
+        RetryHints::from_headers(&headers).apply(&mut output);
+        assert_eq!(output["retry-after"], "Sun, 06 Nov 1994 08:49:37 GMT");
+
+        headers.append("retry-after", HeaderValue::from_static("18"));
+        headers.insert("retry-after-ms", HeaderValue::from_static("12junk"));
+        let mut output = HeaderMap::new();
+        RetryHints::from_headers(&headers).apply(&mut output);
+        assert!(output.get("retry-after").is_none());
+        assert!(output.get("retry-after-ms").is_none());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after-ms",
+            HeaderValue::from_str(&"1".repeat(MAX_RETRY_HINT_LENGTH)).unwrap(),
+        );
+        let mut output = HeaderMap::new();
+        RetryHints::from_headers(&headers).apply(&mut output);
+        assert_eq!(output["retry-after-ms"], "1".repeat(MAX_RETRY_HINT_LENGTH));
+
+        headers.insert(
+            "retry-after-ms",
+            HeaderValue::from_str(&"1".repeat(MAX_RETRY_HINT_LENGTH + 1)).unwrap(),
+        );
+        let mut output = HeaderMap::new();
+        RetryHints::from_headers(&headers).apply(&mut output);
+        assert!(output.get("retry-after-ms").is_none());
+    }
 
     #[test]
     fn logical_error_uses_known_code_before_type() {

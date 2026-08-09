@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Map, Value, json};
 
-use super::protocol_error;
+use super::{identity::ResponsesCallIdMap, protocol_error};
 use crate::{
     error::{ApiError, error_type_for_status, status_from_openai_error},
     transform::request::scrub_cache_control,
@@ -13,6 +13,8 @@ const SIGNATURE_PREFIX: &str = "ocr-responses-reasoning-v1:";
 pub fn transform_responses_request(body: &mut Value) -> Result<(), ApiError> {
     scrub_cache_control(body);
     let object = body.as_object_mut().expect("unified request is object");
+    let call_ids =
+        ResponsesCallIdMap::new(collect_responses_history_call_ids(object.get("messages")));
     if let Some(max_tokens) = object.remove("max_tokens") {
         object.insert("max_output_tokens".into(), max_tokens);
     }
@@ -82,7 +84,7 @@ pub fn transform_responses_request(body: &mut Value) -> Result<(), ApiError> {
                         }
                         Some("tool_use") => input.push(json!({
                             "type":"function_call",
-                            "call_id":block.get("id").cloned().unwrap_or(Value::Null),
+                            "call_id":block.get("id").and_then(Value::as_str).map(|id| call_ids.wire_id(id)).unwrap_or_default(),
                             "name":block.get("name").cloned().unwrap_or(Value::Null),
                             "arguments":serde_json::to_string(block.get("input").unwrap_or(&json!({}))).unwrap_or_else(|_| "{}".into())
                         })),
@@ -111,9 +113,14 @@ pub fn transform_responses_request(body: &mut Value) -> Result<(), ApiError> {
             None => Value::String(String::new()),
         };
         if role == "tool" {
+            let call_id = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(|id| call_ids.wire_id(id))
+                .unwrap_or_default();
             input.push(json!({
                 "type":"function_call_output",
-                "call_id":message.get("tool_call_id").cloned().unwrap_or(Value::Null),
+                "call_id":call_id,
                 "output":normalized_content
             }));
             continue;
@@ -171,7 +178,7 @@ pub fn transform_responses_request(body: &mut Value) -> Result<(), ApiError> {
                         "type":"function_call",
                         "arguments":call.pointer("/function/arguments").cloned().unwrap_or(Value::String("{}".into())),
                         "name":call.pointer("/function/name").cloned().unwrap_or(Value::String(String::new())),
-                        "call_id":id
+                        "call_id":call_ids.wire_id(id)
                     }));
                 }
             }
@@ -226,6 +233,37 @@ pub fn transform_responses_request(body: &mut Value) -> Result<(), ApiError> {
         }
     }
     Ok(())
+}
+
+fn collect_responses_history_call_ids(messages: Option<&Value>) -> Vec<String> {
+    let mut ids = Vec::new();
+    for message in messages.and_then(Value::as_array).into_iter().flatten() {
+        if let Some(blocks) = message.get("output_blocks").and_then(Value::as_array) {
+            ids.extend(blocks.iter().filter_map(|block| {
+                (block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                    .then(|| {
+                        block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+                    .flatten()
+            }));
+        }
+        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+            ids.extend(calls.iter().filter_map(|call| {
+                call.get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            }));
+        }
+        if message.get("role").and_then(Value::as_str) == Some("tool")
+            && let Some(id) = message.get("tool_call_id").and_then(Value::as_str)
+        {
+            ids.push(id.to_owned());
+        }
+    }
+    ids
 }
 
 pub fn transform_responses_json(payload: &Value, omit_reasoning: bool) -> Result<Value, ApiError> {
@@ -760,6 +798,50 @@ mod tests {
     }
 
     #[test]
+    fn request_pairs_long_history_call_ids_and_keeps_responses_tool_names() {
+        let exact_64 = "c".repeat(64);
+        let long_65 = "d".repeat(65);
+        let tool_name_128 = "t".repeat(128);
+        let mut body = crate::transform::transform_anthropic_request(&json!({
+            "model":"m","max_tokens":32,
+            "tools":[{"name":tool_name_128,"input_schema":{"type":"object"}}],
+            "messages":[
+                {"role":"user","content":"start"},
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":exact_64,"name":tool_name_128,"input":{"n":1}},
+                    {"type":"tool_use","id":long_65,"name":tool_name_128,"input":{"n":2}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":exact_64,"content":"one"},
+                    {"type":"tool_result","tool_use_id":long_65,"content":"two"}
+                ]}
+            ]
+        }))
+        .unwrap();
+
+        transform_responses_request(&mut body).unwrap();
+        assert_eq!(body.pointer("/tools/0/name"), Some(&json!(tool_name_128)));
+        let input = body.get("input").and_then(Value::as_array).unwrap();
+        let calls = input
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .collect::<Vec<_>>();
+        let outputs = input
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(calls[0].get("call_id"), Some(&json!(exact_64)));
+        assert_eq!(outputs[0].get("call_id"), Some(&json!(exact_64)));
+        assert_eq!(calls[0].get("name"), Some(&json!(tool_name_128)));
+        let long_wire = calls[1].get("call_id").and_then(Value::as_str).unwrap();
+        assert_ne!(long_wire, long_65);
+        assert_eq!(long_wire.chars().count(), 64);
+        assert_eq!(outputs[1].get("call_id"), calls[1].get("call_id"));
+    }
+
+    #[test]
     fn json_response_rejects_null_or_non_string_status() {
         for status in [Value::Null, json!(7)] {
             let error =
@@ -883,5 +965,36 @@ mod tests {
         assert_eq!(result.pointer("/content/0/type"), Some(&json!("thinking")));
         assert_eq!(result.pointer("/content/1/type"), Some(&json!("tool_use")));
         assert_eq!(result["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn responses_usage_separates_cache_read_and_write_from_input() {
+        let result = transform_responses_json(
+            &json!({
+                "id":"resp_usage","model":"m","status":"completed","output":[],
+                "usage":{
+                    "input_tokens":17,"output_tokens":4,"total_tokens":21,
+                    "input_tokens_details":{"cached_tokens":5,"cache_write_tokens":3},
+                    "output_tokens_details":{"reasoning_tokens":2}
+                }
+            }),
+            false,
+        )
+        .unwrap();
+        let usage = &result["usage"];
+        assert_eq!(usage["input_tokens"], 9);
+        assert_eq!(usage["cache_read_input_tokens"], 5);
+        assert_eq!(usage["cache_creation_input_tokens"], 3);
+        assert_eq!(usage["output_tokens"], 4);
+        assert_eq!(
+            usage.pointer("/output_tokens_details/thinking_tokens"),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            usage["input_tokens"].as_u64().unwrap()
+                + usage["cache_read_input_tokens"].as_u64().unwrap()
+                + usage["cache_creation_input_tokens"].as_u64().unwrap(),
+            17
+        );
     }
 }

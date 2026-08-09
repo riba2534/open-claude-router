@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value, json};
 
-use super::{bounded_json, invalid};
+use super::{ChatToolNameMap, bounded_json, invalid};
 use crate::error::ApiError;
 
 const TOOL_RESULT_ERROR_MARKER: &str =
@@ -322,6 +322,12 @@ fn transform_anthropic_request_with_file_map(
 }
 
 pub fn prepare_chat_request(body: &mut Value) {
+    let _ = prepare_chat_request_with_tool_names(body);
+}
+
+pub(crate) fn prepare_chat_request_with_tool_names(body: &mut Value) -> ChatToolNameMap {
+    let tool_names = ChatToolNameMap::new(collect_chat_tool_names(body));
+    apply_chat_tool_names(body, &tool_names);
     scrub_cache_control(body);
     let reasoning_enabled =
         body.pointer("/reasoning/enabled").and_then(Value::as_bool) == Some(true);
@@ -339,6 +345,82 @@ pub fn prepare_chat_request(body: &mut Value) {
                 object.remove("output_blocks");
             }
         }
+    }
+    tool_names
+}
+
+fn collect_chat_tool_names(body: &Value) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        names.extend(tools.iter().filter_map(|tool| {
+            tool.pointer("/function/name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        }));
+    }
+    if let Some(name) = body
+        .pointer("/tool_choice/function/name")
+        .and_then(Value::as_str)
+    {
+        names.push(name.to_owned());
+    }
+    for message in body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+            names.extend(calls.iter().filter_map(|call| {
+                call.pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            }));
+        }
+        if let Some(name) = message
+            .pointer("/function_call/name")
+            .and_then(Value::as_str)
+        {
+            names.push(name.to_owned());
+        }
+    }
+    names
+}
+
+fn apply_chat_tool_names(body: &mut Value, names: &ChatToolNameMap) {
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            replace_name_at_pointer(tool, "/function/name", names);
+        }
+    }
+    if let Some(choice) = body.get_mut("tool_choice") {
+        replace_name_at_pointer(choice, "/function/name", names);
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for call in calls {
+                    replace_name_at_pointer(call, "/function/name", names);
+                }
+            }
+            replace_name_at_pointer(message, "/function_call/name", names);
+        }
+    }
+}
+
+fn replace_name_at_pointer(value: &mut Value, pointer: &str, names: &ChatToolNameMap) {
+    let Some(original) = value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    else {
+        return;
+    };
+    let wire = names.wire_name(&original);
+    if wire != original
+        && let Some(slot) = value.pointer_mut(pointer)
+    {
+        *slot = Value::String(wire.to_owned());
     }
 }
 
@@ -2080,5 +2162,339 @@ mod tests {
             result.pointer("/messages/0/content/0/image_url/url"),
             Some(&json!("DATA:image/png;BASE64,AA=="))
         );
+    }
+
+    #[test]
+    fn chat_tool_aliases_cover_declarations_choice_and_assistant_history() {
+        let exact_64 = "s".repeat(64);
+        let shared = "x".repeat(64);
+        let long_a = format!("{shared}A");
+        let long_b = format!("{shared}B");
+        let long_128 = "z".repeat(128);
+        let mut body = transform_anthropic_request(&json!({
+            "model":"m","max_tokens":32,
+            "tools":[
+                {"name":exact_64,"input_schema":{"type":"object"}},
+                {"name":long_a,"input_schema":{"type":"object"}},
+                {"name":long_b,"input_schema":{"type":"object"}},
+                {"name":long_128,"input_schema":{"type":"object"}},
+                {"name":"Read","input_schema":{"type":"object"}},
+                {"name":"read","input_schema":{"type":"object"}},
+                {"name":"_foo","input_schema":{"type":"object"}},
+                {"name":"-foo","input_schema":{"type":"object"}}
+            ],
+            "tool_choice":{"type":"tool","name":long_a},
+            "messages":[
+                {"role":"user","content":"start"},
+                {"role":"assistant","content":[{
+                    "type":"tool_use","id":"call_1","name":long_a,"input":{}
+                }]},
+                {"role":"user","content":[{
+                    "type":"tool_result","tool_use_id":"call_1","content":"ok"
+                }]}
+            ]
+        }))
+        .unwrap();
+
+        let names = prepare_chat_request_with_tool_names(&mut body);
+        let wire_a = names.wire_name(&long_a);
+        let wire_b = names.wire_name(&long_b);
+        let wire_128 = names.wire_name(&long_128);
+
+        assert_eq!(names.wire_name(&exact_64), exact_64);
+        for legal in ["Read", "read", "_foo", "-foo"] {
+            assert_eq!(names.wire_name(legal), legal);
+        }
+        for wire in [wire_a, wire_b, wire_128] {
+            assert!(wire.len() <= 64);
+        }
+        assert_ne!(wire_a, wire_b);
+        assert_eq!(body.pointer("/tools/1/function/name"), Some(&json!(wire_a)));
+        assert_eq!(body.pointer("/tools/2/function/name"), Some(&json!(wire_b)));
+        assert_eq!(
+            body.pointer("/tool_choice/function/name"),
+            Some(&json!(wire_a))
+        );
+        assert_eq!(
+            body.pointer("/messages/1/tool_calls/0/function/name"),
+            Some(&json!(wire_a))
+        );
+    }
+
+    #[test]
+    fn output_config_json_schema_maps_to_each_openai_protocol() {
+        let request = json!({
+            "model":"m","max_tokens":32,"messages":[{"role":"user","content":"json"}],
+            "output_config":{"format":{
+                "type":"json_schema",
+                "schema":{
+                    "type":"object",
+                    "properties":{"answer":{"type":"string"}},
+                    "required":["answer"],
+                    "additionalProperties":false
+                }
+            }}
+        });
+        let unified = transform_anthropic_request(&request).unwrap();
+
+        let mut chat = unified.clone();
+        prepare_chat_request(&mut chat);
+        assert_eq!(
+            chat.pointer("/response_format"),
+            Some(&json!({
+                "type":"json_schema",
+                "json_schema":{
+                    "name":"anthropic_output",
+                    "schema":{
+                        "type":"object",
+                        "properties":{"answer":{"type":"string"}},
+                        "required":["answer"],
+                        "additionalProperties":false
+                    },
+                    "strict":true
+                }
+            }))
+        );
+
+        let mut responses = unified;
+        crate::transform::transform_responses_request(&mut responses).unwrap();
+        assert!(responses.get("response_format").is_none());
+        assert_eq!(
+            responses.pointer("/text/format"),
+            Some(&json!({
+                "type":"json_schema",
+                "name":"anthropic_output",
+                "schema":{
+                    "type":"object",
+                    "properties":{"answer":{"type":"string"}},
+                    "required":["answer"],
+                    "additionalProperties":false
+                },
+                "strict":true
+            }))
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_text_keeps_turn_order_for_both_protocols() {
+        let request = json!({
+            "model":"m","max_tokens":32,
+            "messages":[
+                {"role":"user","content":"before"},
+                {"role":"system","content":[{"type":"mid_conv_system","content":[
+                    {"type":"text","text":"temporary rule"}
+                ]}]},
+                {"role":"assistant","content":"ack"},
+                {"role":"user","content":"after"}
+            ]
+        });
+        let unified = transform_anthropic_request(&request).unwrap();
+
+        let mut chat = unified.clone();
+        prepare_chat_request(&mut chat);
+        assert_eq!(
+            chat["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["user", "system", "assistant", "user"]
+        );
+        assert_eq!(
+            chat.pointer("/messages/1/content"),
+            Some(&json!([{"type":"text","text":"temporary rule"}]))
+        );
+
+        let mut responses = unified;
+        crate::transform::transform_responses_request(&mut responses).unwrap();
+        assert_eq!(
+            responses["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["user", "system", "assistant", "user"]
+        );
+        assert_eq!(
+            responses.pointer("/input/1/content"),
+            Some(&json!([{"type":"input_text","text":"temporary rule"}]))
+        );
+    }
+
+    #[test]
+    fn documents_preserve_supported_bytes_and_bound_chat_url_degradation() {
+        let request = json!({
+            "model":"m","max_tokens":32,
+            "messages":[{"role":"user","content":[
+                {"type":"document","title":"base.pdf","source":{
+                    "type":"base64","media_type":"application/pdf","data":"AA=="
+                }},
+                {"type":"document","title":"notes.txt","source":{
+                    "type":"text","media_type":"text/plain","data":"hello"
+                }},
+                {"type":"document","title":"remote.pdf","source":{
+                    "type":"url","url":"https://example.com/remote.pdf"
+                }}
+            ]}]
+        });
+        let unified = transform_anthropic_request(&request).unwrap();
+
+        let mut chat = unified.clone();
+        prepare_chat_request(&mut chat);
+        assert_eq!(
+            chat.pointer("/messages/0/content/0"),
+            Some(&json!({"type":"file","file":{
+                "filename":"base.pdf","file_data":"data:application/pdf;base64,AA=="
+            }}))
+        );
+        assert_eq!(
+            chat.pointer("/messages/0/content/1"),
+            Some(&json!({"type":"file","file":{
+                "filename":"notes.txt","file_data":"data:text/plain;base64,aGVsbG8="
+            }}))
+        );
+        assert_eq!(
+            chat.pointer("/messages/0/content/2"),
+            Some(&json!({
+                "type":"text",
+                "text":"[document \"remote.pdf\": https://example.com/remote.pdf]"
+            }))
+        );
+
+        let mut responses = unified;
+        crate::transform::transform_responses_request(&mut responses).unwrap();
+        assert_eq!(
+            responses.pointer("/input/0/content"),
+            Some(&json!([
+                {"type":"input_file","filename":"base.pdf","file_data":"data:application/pdf;base64,AA=="},
+                {"type":"input_file","filename":"notes.txt","file_data":"data:text/plain;base64,aGVsbG8="},
+                {"type":"input_file","filename":"remote.pdf","file_url":"https://example.com/remote.pdf"}
+            ]))
+        );
+    }
+
+    #[test]
+    fn multimodal_tool_result_uses_chat_sidecar_and_responses_typed_output() {
+        let request = json!({
+            "model":"m","max_tokens":32,
+            "messages":[
+                {"role":"user","content":"run"},
+                {"role":"assistant","content":[{
+                    "type":"tool_use","id":"call_1","name":"inspect","input":{}
+                }]},
+                {"role":"user","content":[{
+                    "type":"tool_result","tool_use_id":"call_1","content":[
+                        {"type":"text","text":"text result"},
+                        {"type":"image","source":{
+                            "type":"base64","media_type":"image/png","data":"AA=="
+                        }},
+                        {"type":"document","title":"result.pdf","source":{
+                            "type":"base64","media_type":"application/pdf","data":"AQ=="
+                        }}
+                    ]
+                }]}
+            ]
+        });
+        let unified = transform_anthropic_request(&request).unwrap();
+
+        let mut chat = unified.clone();
+        prepare_chat_request(&mut chat);
+        assert_eq!(chat.pointer("/messages/2/role"), Some(&json!("tool")));
+        assert_eq!(
+            chat.pointer("/messages/2/content"),
+            Some(&json!("text result"))
+        );
+        assert_eq!(chat.pointer("/messages/3/role"), Some(&json!("user")));
+        assert_eq!(
+            chat.pointer("/messages/3/content"),
+            Some(&json!([
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}},
+                {"type":"file","file":{
+                    "filename":"result.pdf","file_data":"data:application/pdf;base64,AQ=="
+                }}
+            ]))
+        );
+
+        let mut responses = unified;
+        crate::transform::transform_responses_request(&mut responses).unwrap();
+        let output = responses["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(output["call_id"], "call_1");
+        assert_eq!(
+            output["output"],
+            json!([
+                {"type":"input_text","text":"text result"},
+                {"type":"input_image","image_url":"data:image/png;base64,AA=="},
+                {"type":"input_file","filename":"result.pdf","file_data":"data:application/pdf;base64,AQ=="}
+            ])
+        );
+    }
+
+    #[test]
+    fn citations_and_server_tools_fail_locally_instead_of_silent_conversion() {
+        let fixtures = [
+            (
+                json!({"model":"m","max_tokens":32,"messages":[{"role":"user","content":[{
+                    "type":"text","text":"quoted","citations":[{"type":"char_location"}]
+                }]}]}),
+                "citations have no OpenAI protocol equivalent",
+            ),
+            (
+                json!({"model":"m","max_tokens":32,"messages":[{"role":"user","content":[{
+                    "type":"document","source":{"type":"text","data":"doc"},
+                    "citations":{"enabled":true}
+                }]}]}),
+                "document and search_result citations have no OpenAI protocol equivalent",
+            ),
+            (
+                json!({"model":"m","max_tokens":32,"messages":[],"tools":[{
+                    "type":"web_search_20250305","name":"web_search"
+                }]}),
+                "Anthropic server-side tools have no OpenAI function-tool equivalent",
+            ),
+            (
+                json!({"model":"m","max_tokens":32,"messages":[{"role":"assistant","content":[{
+                    "type":"server_tool_use","id":"server_1","name":"web_search","input":{}
+                }]}]}),
+                "Anthropic server-tool history has no OpenAI function-tool equivalent",
+            ),
+        ];
+        for (fixture, expected) in fixtures {
+            let error = transform_anthropic_request(&fixture).unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(
+                error.message.contains(expected),
+                "expected {expected:?} in {:?}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_omitted_thinking_requests_encrypted_responses_state_without_summary() {
+        let request = json!({
+            "model":"m","max_tokens":32,"messages":[{"role":"user","content":"solve"}],
+            "thinking":{"type":"adaptive","display":"omitted"},
+            "output_config":{"effort":"high"}
+        });
+        let mut body = transform_anthropic_request(&request).unwrap();
+        assert_eq!(
+            body.pointer("/reasoning"),
+            Some(&json!({"enabled":true,"effort":"high","display":"omitted"}))
+        );
+
+        crate::transform::transform_responses_request(&mut body).unwrap();
+        assert_eq!(body.pointer("/reasoning"), Some(&json!({"effort":"high"})));
+        assert_eq!(
+            body.pointer("/include"),
+            Some(&json!(["reasoning.encrypted_content"]))
+        );
+        assert!(body.pointer("/reasoning/summary").is_none());
     }
 }

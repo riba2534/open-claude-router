@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{bounded_json, protocol_error};
+use super::{ChatToolNameMap, bounded_json, protocol_error};
 use crate::{
     error::{ApiError, error_type_for_status, status_from_openai_error},
     sse::format_sse_event,
@@ -13,6 +13,18 @@ const CHAT_SIGNATURE_PREFIX: &str = "ocr-chat-reasoning-v1:";
 pub fn transform_chat_json_response(
     payload: &Value,
     omit_thinking: bool,
+) -> Result<Value, ApiError> {
+    transform_chat_json_response_with_tool_names(
+        payload,
+        omit_thinking,
+        &ChatToolNameMap::default(),
+    )
+}
+
+pub(crate) fn transform_chat_json_response_with_tool_names(
+    payload: &Value,
+    omit_thinking: bool,
+    tool_names: &ChatToolNameMap,
 ) -> Result<Value, ApiError> {
     if let Some(error) = payload.get("error") {
         let status = status_from_openai_error(error, axum::http::StatusCode::OK);
@@ -71,10 +83,11 @@ pub fn transform_chat_json_response(
                 }
                 Some("text") => content.push(json!({"type":"text","text":block.get("text").and_then(Value::as_str).unwrap_or_default()})),
                 Some("tool_use") => {
-                    let name = block
+                    let wire_name = block
                         .get("name")
                         .and_then(Value::as_str)
                         .unwrap_or("unknown");
+                    let name = tool_names.original_name(wire_name);
                     if incomplete {
                         content.push(incomplete_tool_diagnostic(name, block.get("input")));
                         continue;
@@ -210,13 +223,14 @@ pub fn transform_chat_json_response(
                     .ok_or_else(|| {
                         protocol_error("upstream tool call is missing id or function name")
                     })?;
-                let name = call
+                let wire_name = call
                     .pointer("/function/name")
                     .and_then(Value::as_str)
                     .filter(|name| !name.is_empty())
                     .ok_or_else(|| {
                         protocol_error("upstream tool call is missing id or function name")
                     })?;
+                let name = tool_names.original_name(wire_name);
                 if let Some(reasoning) = thinking_by_call.remove(id) {
                     content.extend(reasoning);
                 }
@@ -237,10 +251,11 @@ pub fn transform_chat_json_response(
                     }));
                 }
             }
-        } else if let Some(name) = message
+        } else if let Some(wire_name) = message
             .pointer("/function_call/name")
             .and_then(Value::as_str)
         {
+            let name = tool_names.original_name(wire_name);
             let arguments = message.pointer("/function_call/arguments").cloned();
             if incomplete {
                 content.push(incomplete_tool_diagnostic(name, arguments.as_ref()));
@@ -624,6 +639,62 @@ mod tests {
                 .pointer("/content/0/signature")
                 .and_then(Value::as_str)
                 .is_some_and(|signature| signature.starts_with(CHAT_SIGNATURE_PREFIX))
+        );
+    }
+
+    #[test]
+    fn chat_json_restores_only_request_local_tool_aliases() {
+        let original = "tool".repeat(32);
+        let names = ChatToolNameMap::new([original.clone()]);
+        let wire = names.wire_name(&original).to_owned();
+        let result = transform_chat_json_response_with_tool_names(
+            &json!({
+                "choices":[{"message":{"role":"assistant","tool_calls":[
+                    {"id":"call_1","type":"function","function":{"name":wire,"arguments":"{}"}},
+                    {"id":"call_2","type":"function","function":{"name":"unknown_alias","arguments":"{}"}}
+                ]},"finish_reason":"tool_calls"}]
+            }),
+            false,
+            &names,
+        )
+        .unwrap();
+
+        assert_eq!(result.pointer("/content/0/name"), Some(&json!(original)));
+        assert_eq!(
+            result.pointer("/content/1/name"),
+            Some(&json!("unknown_alias"))
+        );
+    }
+
+    #[test]
+    fn chat_json_usage_separates_cache_read_and_write_from_input() {
+        let result = transform_chat_json_response(
+            &json!({
+                "id":"c1","model":"m",
+                "choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+                "usage":{
+                    "prompt_tokens":17,"completion_tokens":4,
+                    "prompt_tokens_details":{"cached_tokens":5,"cache_write_tokens":3},
+                    "completion_tokens_details":{"reasoning_tokens":2}
+                }
+            }),
+            false,
+        )
+        .unwrap();
+        let usage = &result["usage"];
+        assert_eq!(usage["input_tokens"], 9);
+        assert_eq!(usage["cache_read_input_tokens"], 5);
+        assert_eq!(usage["cache_creation_input_tokens"], 3);
+        assert_eq!(usage["output_tokens"], 4);
+        assert_eq!(
+            usage.pointer("/output_tokens_details/thinking_tokens"),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            usage["input_tokens"].as_u64().unwrap()
+                + usage["cache_read_input_tokens"].as_u64().unwrap()
+                + usage["cache_creation_input_tokens"].as_u64().unwrap(),
+            17
         );
     }
 }

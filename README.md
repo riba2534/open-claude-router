@@ -111,7 +111,7 @@ Linux / macOS：
 
 ```bash
 # 把版本和平台替换成 Release 页面中的实际值
-VERSION=v0.6.7
+VERSION=v0.6.8
 PLATFORM=linux-amd64
 ARCHIVE="open-claude-router-${VERSION}-${PLATFORM}.tar.gz"
 
@@ -128,7 +128,7 @@ cd "open-claude-router-${VERSION}-${PLATFORM}"
 Windows PowerShell：
 
 ```powershell
-$Version = "v0.6.7"
+$Version = "v0.6.8"
 $Platform = "windows-amd64" # Windows on ARM 使用 windows-arm64
 $Archive = "open-claude-router-$Version-$Platform.zip"
 
@@ -235,7 +235,7 @@ header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`�
 | 能力 | 默认（Chat Completions） | Responses API |
 |---|---|---|
 | 文本流式 SSE | ✅ 正式处理 multi-data、LF/CRLF/CR 与跨 chunk UTF-8；兼容 EOF trailing event | 同左 |
-| 工具调用（`tool_use` / `tool_result` 双向增量） | ✅ 含现代 `tool_calls` 并行工具；流式工具增量会先按调用缓冲，再输出合法的顺序 block；普通 OpenAI function call 返回为正式 `caller:{type:"direct"}`。完整终态中的参数若不是 JSON object，按上游协议错误返回 retryable 502 | ✅ 含并行工具；历史 thinking/text/tool block 通过内部有序表示保真回放为 Responses items。`program` / `program_output`、programmatic/未知 caller，以及响应侧 `compaction` / `function_call_output` 都依赖无法映射的 hosted-runtime 状态，明确返回 502；caller 缺省或 `direct` 正常转换 |
+| 工具调用（`tool_use` / `tool_result` 双向增量） | ✅ 含现代 `tool_calls` 并行工具；流式工具增量会先按调用缓冲，再输出合法的顺序 block；普通 OpenAI function call 返回为正式 `caller:{type:"direct"}`。Anthropic 合法但超过 Chat 64 字符限制的工具名会在单次请求内做稳定、无碰撞、双向透明映射。完整终态中的参数若不是 JSON object，按上游协议错误返回 retryable 502 | ✅ 含并行工具；历史 thinking/text/tool block 通过内部有序表示保真回放为 Responses items，超过 Responses 64 字符限制的历史 `call_id` 会稳定缩短并保持调用/结果严格配对。`program` / `program_output`、programmatic/未知 caller，以及响应侧 `compaction` / `function_call_output` 都依赖无法映射的 hosted-runtime 状态，明确返回 502；caller 缺省或 `direct` 正常转换 |
 | 顶层多模态图片（base64 / URL / file） | ✅ base64 / URL 精确映射为标准 `image_url`；provider-owned `file_id` 无法跨上游安全复用，因此本地 400；已知但畸形的 source 返回 400，未来未知 source 有界文本降级；自描述 data URL 保留 | ✅ URL 转标准 `input_image.image_url`；provider-owned `file_id` 同样不跨 provider 盲传，不按模型名猜视觉能力 |
 | `tool_result` 中的图片 / 文件 | ⚠️ Chat 的 tool message 只能放文本；base64/URL 图片及可表示为 `file_data` 的文件会在整组 tool message 后转成标准 user 多模态 sidecar。单个多模态 tool result 依靠相邻顺序归属，不增加模型可见 marker；同批合并多个并行结果时，才在各组附件之后追加通用 provenance marker（工具序号 + 完整 ID 的可逆 UTF-16BE/base64url 编码）。视觉/文件输入得以保留，但 text/image 原始交错顺序仍会降级。URL-only 文件转有界文本；`is_error:true` 以前置的稳定 Router metadata marker 保留，false/缺省不改变内容 | ✅ `function_call_output.output` 原生保留 `input_text` / `input_image` / `input_file` 多 block 数组的顺序与归属；`is_error:true` marker 同样保留；纯文本保持 string 以兼容旧端点 |
 | 中途 `system` / 工具变更 | ✅ 普通 `messages[].role:"system"` 按正式位置规则保留为 system；direct block 与正式 `mid_conv_system` wrapper 都会展开；`defer_loading`、自定义客户端工具在 `tool_result` 返回的 `tool_reference`，以及 direct `tool_reference` 的 `tool_addition` / `tool_removal` 按历史顺序投影成当前生成应看到的最终工具子集，不把结构指令改成模型可见文本 | 同左；system content part 转正式 `input_text`。Anthropic server-owned tools（web search/fetch、code execution、advisor、tool search、MCP）及其历史块、MCP tool-change reference 没有通用 OpenAI function-tool 同构，明确返回协议错误而不伪造执行责任；内置 typed client tools（bash/computer/memory/text-editor）在实现版本化 schema 映射前同样明确报错，不伪造空 schema；`compaction` / `fallback` / `container_upload` 等 opaque replay block 不会泄漏为模型可见 JSON，而是明确报错 |
@@ -248,7 +248,7 @@ header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`�
 | 严格工具 / 结构化输出 | ✅ `tools[].strict` 保真；`output_config.format` → `response_format.json_schema` | ✅ 未声明 strict 时显式发送 `strict:false`；`output_config.format` → `text.format` |
 | citations / search result | ⚠️ Anthropic `search_result` 的 title/source metadata 与全部非空 text block 按顺序保留；按 Anthropic 正式规则，`tool_result` 一旦含 search result 就不能混入其他可见 block。启用 document/search-result citations，或回放带非空 citations 的 text block 时，因 OpenAI 请求协议无可逆同构，本地 400；`citations:null` / 空数组为 no-op。若同时请求 structured output，优先返回 Anthropic 的 citations/structured-output 冲突 400 | ⚠️ 同左。响应侧 `web_search_call` 与 citation 按有界 typed JSON 文本保留 id/action/query/URL/range；Responses citation 没有 search-call 归属字段，Router 不猜测配对关系 |
 | 音频输出 | ⚠️ Chat 非流式 `message.audio.transcript` 转 text；原始音频字节只产生一次 `[generated audio omitted]`，不泄漏 base64 | ⚠️ SSE transcript delta 转 text；audio delta 只产生一次相同占位符，done 不重复 |
-| usage / 错误 | ✅ 输出当前 Anthropic Message/Usage nullable 字段，并映射 reasoning tokens 与可从流式首帧确定的 service tier；错误 envelope 含 nullable `request_id` | ✅ Responses reasoning tokens 保留到 Anthropic `thinking_tokens`。402/409/413/504/529 分别映射 `billing_error` / `conflict_error` / `request_too_large` / `timeout_error` / `overloaded_error`；所有上游非 2xx 均标记可重试且 Router 保持单次上游调用 |
+| usage / 错误 | ✅ 输出当前 Anthropic Message/Usage nullable 字段，并映射 reasoning tokens 与可从流式首帧确定的 service tier；错误 envelope 含 nullable `request_id` | ✅ Responses reasoning tokens 保留到 Anthropic `thinking_tokens`。402/409/413/504/529 分别映射 `billing_error` / `conflict_error` / `request_too_large` / `timeout_error` / `overloaded_error`；所有上游非 2xx 均标记可重试且 Router 保持单次上游调用。上游合法且单值的 `Retry-After` / `Retry-After-Ms` 会原值返回，其他响应头不会随之透传 |
 | refusal / content filter | ✅ refusal 文本保留为普通 assistant 文本；`content_filter` 映射 `stop_reason:"refusal"`，并返回 `{type:"refusal",category:null,explanation}` 形式的 `stop_details` | 同左；流式与非流式、SSE 聚合保持一致 |
 | incomplete / 截断工具调用 | ✅ Chat `length` 映射 `max_tokens`；调用名/参数原始字节以有界文本诊断保留，不生成可执行 `tool_use` | ✅ response 或 function item 明确标记 incomplete 时同样以有界文本保留原始字节并返回 `max_tokens`；完整终态中的畸形参数返回 retryable 502 |
 | stop sequence | ⚠️ 请求侧 `stop_sequences` 转 Chat `stop`；Chat 响应只报告通用 `finish_reason:"stop"`，无法恢复命中的具体分隔符 | ⚠️ Responses 没有 stop sequence 请求参数，沿用 TS 行为，在转换时省略该字段 |
@@ -414,7 +414,7 @@ OCR_MODEL_LOG_MODE=off cargo run --manifest-path rust/Cargo.toml
 
 ## 常见问题
 
-- **上游错误会重试吗**：会上报为可重试。上游返回任意非 2xx、连接/读取超时，或已请求上游后发现 JSON/SSE 畸形、截断、缺少正式终态时，服务保留/映射状态与 Anthropic 错误体，并增加 `X-Should-Retry: true`。本地请求校验 400 不带该 header；只有明确的客户端断开返回 499 且不标记重试。具体次数和退避由 Claude Code 决定，Router 自身始终只请求上游一次。
+- **上游错误会重试吗**：会上报为可重试。上游返回任意非 2xx、连接/读取超时，或已请求上游后发现 JSON/SSE 畸形、截断、缺少正式终态时，服务保留/映射状态与 Anthropic 错误体，并增加 `X-Should-Retry: true`。合法、单值的 `Retry-After`（非负秒数或 HTTP-date）和 `Retry-After-Ms`（非负毫秒数）会保持原值返回；重复或畸形值会被丢弃，不会连带透传其他上游响应头。实时 SSE 只能在初始 HTTP 响应已有这些提示时返回，因为流开始后 HTTP header 已不可修改。本地请求校验 400 不带该 header；只有明确的客户端断开返回 499 且不标记重试。具体次数和退避由 Claude Code 决定，Router 自身始终只请求上游一次。
 - **上游报 401 / 403**：先确认 `ANTHROPIC_AUTH_TOKEN` 没填反——path 模式里它是**上游凭证**、服务鉴权走 `X-OCR-Token`；header 模式里它是**服务鉴权 token**、上游凭证走 `X-Upstream-Authorization`（见[两个独立选择：接入模式与上游协议](#两个独立选择接入模式与上游协议)）。另外启用了 `OCR_ACCESS_TOKENS` 却没带对应 token 也会被服务拒绝。
 - **连不通 / `upstream_unreachable`（502）**：检查上游 URL 是否写全（path 模式要拼到 `/chat/completions` 或 `/responses` 这一级）；Docker 下不要在容器内设 `HOST=127.0.0.1`（见[自定义监听地址](#自定义监听地址)的警告）。
 - **上游报 `thinking is enabled but reasoning_content is missing in assistant tool call message`**：部分 DeepSeek / Kimi 式上游在开启 thinking 时，要求带工具调用的 assistant 消息必须携带 `reasoning_content`。服务已自动把 Anthropic `thinking` 转成 `reasoning_content`，并对缺失的历史工具调用消息兜底补全；若仍遇到，请确认运行的是最新版本。

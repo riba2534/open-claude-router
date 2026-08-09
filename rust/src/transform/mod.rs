@@ -1,3 +1,4 @@
+mod identity;
 mod request;
 mod response;
 mod responses;
@@ -8,6 +9,10 @@ pub use response::{
     transform_chat_json_response,
 };
 pub use responses::{transform_responses_json, transform_responses_request};
+
+pub(crate) use identity::ChatToolNameMap;
+pub(crate) use request::prepare_chat_request_with_tool_names;
+pub(crate) use response::transform_chat_json_response_with_tool_names;
 
 use axum::http::StatusCode;
 

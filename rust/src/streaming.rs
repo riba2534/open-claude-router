@@ -10,20 +10,34 @@ use crate::{
     model_log::StreamingCapture,
     sse::{IncrementalSseDecoder, ResponsesSseAggregator, format_sse_event},
     transform::{
-        anthropic_content_block_to_sse, anthropic_json_to_sse, anthropic_terminal_to_sse,
-        protocol_error, transform_responses_json,
+        ChatToolNameMap, anthropic_content_block_to_sse, anthropic_json_to_sse,
+        anthropic_terminal_to_sse, protocol_error, transform_responses_json,
     },
 };
 
 pub fn convert_chat_sse_stream(
     response: reqwest::Response,
     omit_thinking: bool,
+    capture: StreamingCapture,
+) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    convert_chat_sse_stream_with_tool_names(
+        response,
+        omit_thinking,
+        capture,
+        ChatToolNameMap::default(),
+    )
+}
+
+pub(crate) fn convert_chat_sse_stream_with_tool_names(
+    response: reqwest::Response,
+    omit_thinking: bool,
     mut capture: StreamingCapture,
+    tool_names: ChatToolNameMap,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let mut upstream = response.bytes_stream();
     async_stream::stream! {
         let mut decoder = IncrementalSseDecoder::default();
-        let mut state = ChatStreamState::new(omit_thinking);
+        let mut state = ChatStreamState::with_tool_names(omit_thinking, tool_names);
         let mut stopped_at_done = false;
         while let Some(next) = upstream.next().await {
             match next {
@@ -413,6 +427,7 @@ enum DeferredSemantic {
 
 struct ChatStreamState {
     omit_thinking: bool,
+    tool_names: ChatToolNameMap,
     started: bool,
     message_id: String,
     model: String,
@@ -432,9 +447,15 @@ struct ChatStreamState {
 }
 
 impl ChatStreamState {
+    #[cfg(test)]
     fn new(omit_thinking: bool) -> Self {
+        Self::with_tool_names(omit_thinking, ChatToolNameMap::default())
+    }
+
+    fn with_tool_names(omit_thinking: bool, tool_names: ChatToolNameMap) -> Self {
         Self {
             omit_thinking,
+            tool_names,
             started: false,
             message_id: format!("msg_{}", uuid::Uuid::new_v4()),
             model: "unknown".into(),
@@ -575,7 +596,7 @@ impl ChatStreamState {
                     tool.id = id.to_owned();
                 }
                 if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
-                    tool.name = name.to_owned();
+                    tool.name = self.tool_names.original_name(name).to_owned();
                 }
                 if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
                 {
@@ -593,7 +614,7 @@ impl ChatStreamState {
                 tool.id = format!("call_{}", uuid::Uuid::new_v4());
             }
             if let Some(name) = function.get("name").and_then(Value::as_str) {
-                tool.name = name.to_owned();
+                tool.name = self.tool_names.original_name(name).to_owned();
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                 tool.arguments.push_str(arguments);
@@ -1074,6 +1095,29 @@ mod tests {
     }
 
     #[test]
+    fn chat_stream_restores_request_local_tool_alias() {
+        let original = "tool".repeat(32);
+        let names = ChatToolNameMap::new([original.clone()]);
+        let wire = names.wire_name(&original).to_owned();
+        let mut state = ChatStreamState::with_tool_names(false, names);
+        for event in [
+            json!({"choices":[{"delta":{"tool_calls":[{
+                "index":0,"id":"call_1",
+                "function":{"name":wire,"arguments":"{}"}
+            }]},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ] {
+            state.on_raw_event(&event.to_string()).unwrap();
+        }
+        let payloads = payloads(&state.finish(false).unwrap());
+        let tool = payloads
+            .iter()
+            .find(|payload| payload.pointer("/content_block/type") == Some(&json!("tool_use")))
+            .unwrap();
+        assert_eq!(tool.pointer("/content_block/name"), Some(&json!(original)));
+    }
+
+    #[test]
     fn chat_stream_supports_structured_thinking_and_omitted_replay() {
         let mut state = ChatStreamState::new(true);
         let events = [
@@ -1160,5 +1204,50 @@ mod tests {
             .filter_map(|payload| payload.pointer("/delta/text").and_then(Value::as_str))
             .collect::<String>();
         assert_eq!(text, "before");
+    }
+
+    #[test]
+    fn chat_stream_usage_separates_cache_read_and_write_from_input() {
+        let mut state = ChatStreamState::new(false);
+        let mut frames = Vec::new();
+        for event in [
+            json!({
+                "id":"chat_usage","model":"m",
+                "choices":[{"delta":{"content":"ok"},"finish_reason":null}]
+            }),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            json!({
+                "choices":[],
+                "usage":{
+                    "prompt_tokens":17,"completion_tokens":4,
+                    "prompt_tokens_details":{"cached_tokens":5,"cache_write_tokens":3},
+                    "completion_tokens_details":{"reasoning_tokens":2}
+                }
+            }),
+        ] {
+            frames.extend(state.on_raw_event(&event.to_string()).unwrap());
+        }
+        frames.extend(state.finish(false).unwrap());
+        let payloads = payloads(&frames);
+        let usage = payloads
+            .iter()
+            .find(|payload| payload["type"] == "message_delta")
+            .unwrap()
+            .get("usage")
+            .unwrap();
+        assert_eq!(usage["input_tokens"], 9);
+        assert_eq!(usage["cache_read_input_tokens"], 5);
+        assert_eq!(usage["cache_creation_input_tokens"], 3);
+        assert_eq!(usage["output_tokens"], 4);
+        assert_eq!(
+            usage.pointer("/output_tokens_details/thinking_tokens"),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            usage["input_tokens"].as_u64().unwrap()
+                + usage["cache_read_input_tokens"].as_u64().unwrap()
+                + usage["cache_creation_input_tokens"].as_u64().unwrap(),
+            17
+        );
     }
 }
