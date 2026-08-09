@@ -1,10 +1,15 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    convert::Infallible,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, State, rejection::BytesRejection},
-    http::{HeaderMap, Method, StatusCode, Uri, header},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, State, rejection::BytesRejection},
+    http::{HeaderMap, Method, StatusCode, Uri, header, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -21,7 +26,7 @@ use crate::{
         resolve_upstream_model,
     },
     error::ApiError,
-    model_log::{ModelInteractionLogger, selected_headers},
+    model_log::{ExchangeMetadata, ModelInteractionLogger, selected_headers},
     sse::{aggregate_chat_sse, aggregate_responses_sse},
     streaming::{convert_chat_sse_stream, convert_responses_sse_stream},
     tokenizer::count_anthropic_tokens,
@@ -82,7 +87,38 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// The production server injects `ConnectInfo<SocketAddr>` per TCP
+/// connection. Keeping this extractor infallible preserves direct Router
+/// unit tests and non-socket service use, where the audit field is `null`.
+struct ClientPeer(Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for ClientPeer
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|connect_info| connect_info.0),
+        ))
+    }
+}
+
+fn canonical_client_ip(peer: Option<SocketAddr>) -> Option<String> {
+    match peer?.ip() {
+        IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some() => {
+            ip.to_ipv4_mapped().map(|ip| ip.to_string())
+        }
+        ip => Some(ip.to_string()),
+    }
+}
+
 async fn header_messages(
+    ClientPeer(peer): ClientPeer,
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
@@ -99,7 +135,16 @@ async fn header_messages(
         upstream.model.as_deref(),
         &model_map,
     );
-    forward(state, headers, payload, format, upstream).await
+    forward(
+        state,
+        headers,
+        payload,
+        format,
+        upstream,
+        canonical_client_ip(peer),
+        "header",
+    )
+    .await
 }
 
 async fn header_count_tokens(
@@ -115,6 +160,7 @@ async fn header_count_tokens(
 }
 
 async fn fallback(
+    ClientPeer(peer): ClientPeer,
     State(state): State<Arc<AppState>>,
     method: Method,
     uri: Uri,
@@ -144,7 +190,16 @@ async fn fallback(
         upstream.model.as_deref(),
         &model_map,
     );
-    forward(state, headers, payload, format, upstream).await
+    forward(
+        state,
+        headers,
+        payload,
+        format,
+        upstream,
+        canonical_client_ip(peer),
+        "embedded-path",
+    )
+    .await
 }
 
 fn extract_body(body: Result<Bytes, BytesRejection>) -> Result<Bytes, ApiError> {
@@ -221,6 +276,8 @@ async fn forward(
     payload: Value,
     format: UpstreamFormat,
     upstream: UpstreamConfig,
+    client_ip: Option<String>,
+    route_mode: &str,
 ) -> Result<Response, ApiError> {
     let wants_stream = payload.get("stream").and_then(Value::as_bool) == Some(true);
     let omit_thinking =
@@ -249,12 +306,16 @@ async fn forward(
         format = format.as_str(),
         "forwarding"
     );
-    let exchange = state.model_logger.begin(
-        request_id,
-        &upstream.url,
-        format.as_str(),
-        outbound.get("model").cloned(),
-        wants_stream,
+    let mut exchange = state.model_logger.begin(
+        ExchangeMetadata {
+            request_id,
+            upstream_url: upstream.url.clone(),
+            format: format.as_str().to_owned(),
+            model: outbound.get("model").cloned(),
+            stream: wants_stream,
+            client_ip,
+            route_mode: route_mode.to_owned(),
+        },
         &outbound,
     );
     let upstream_response = match call_upstream(
@@ -270,10 +331,11 @@ async fn forward(
         Err(error) => {
             state
                 .model_logger
-                .transport_error(&exchange, &error.message);
+                .transport_error(&mut exchange, &error.message);
             return Err(error);
         }
     };
+    exchange.mark_upstream_response_started();
     let response_status = upstream_response.status();
     let response_headers = selected_headers(upstream_response.headers());
     let is_sse = upstream_response
@@ -311,7 +373,7 @@ async fn forward(
     let (response_bytes, read_error) = read_upstream_body(upstream_response).await;
     if let Some(error) = read_error {
         state.model_logger.response_read_error(
-            &exchange,
+            &mut exchange,
             response_status.as_u16(),
             response_headers,
             &response_bytes,
@@ -329,7 +391,7 @@ async fn forward(
         .retryable());
     }
     state.model_logger.response(
-        &exchange,
+        &mut exchange,
         response_status.as_u16(),
         response_headers,
         &response_bytes,
@@ -387,6 +449,19 @@ mod tests {
             access_tokens: HashSet::new(),
             model_logger: ModelInteractionLogger::disabled(),
         })
+    }
+
+    #[test]
+    fn client_ip_is_canonicalized_from_socket_peer() {
+        assert_eq!(
+            canonical_client_ip(Some("192.0.2.10:1234".parse().unwrap())),
+            Some("192.0.2.10".into())
+        );
+        assert_eq!(
+            canonical_client_ip(Some("[::ffff:192.0.2.11]:1234".parse().unwrap())),
+            Some("192.0.2.11".into())
+        );
+        assert_eq!(canonical_client_ip(None), None);
     }
 
     #[tokio::test]

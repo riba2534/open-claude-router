@@ -26,7 +26,7 @@
 Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(OpenAI Chat Completions / Responses)──▶  上游
 ```
 
-跟其他类似工具最大的差异：**路由和会话无状态**。所有上游信息（URL、Authorization、模型名）由客户端逐请求通过 HTTP header 或 URL path 传入——服务端不读 provider 配置、不存任何 API Key、不维护会话状态。一份部署可以同时服务任意客户端、任意上游。为了排查协议兼容问题，服务会把模型侧请求/响应写入本地审计日志（默认保留 7 天，可配置或关闭；Authorization 不写入日志）。
+跟其他类似工具最大的差异：**路由和会话无状态**。所有上游信息（URL、Authorization、模型名）由客户端逐请求通过 HTTP header 或 URL path 传入——服务端不读 provider 配置、不存任何 API Key、不维护会话状态。一份部署可以同时服务任意客户端、任意上游。为了排查协议兼容问题，服务会把模型侧请求/响应及直接客户端 IP 写入本地审计日志（默认保留 7 天，可配置或关闭；Authorization 不写入日志）。
 
 典型场景：
 
@@ -41,7 +41,7 @@ Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(Ope
 ## 特性
 
 - **路由和会话无状态**：服务侧不存任何 API Key、不读 provider 配置、不维护会话状态；上游信息全部由客户端逐请求传入（配置都在客户端 alias 里）
-- **模型交互日志**：按请求 ID 记录转换后实际发给上游的 JSON 和上游原始 JSON/SSE，默认按 UTC 天轮转并保留 7 天；正文模式、保留期、目录和单条上限均可配置
+- **模型交互日志**：按请求 ID 记录直接客户端 IP、接入模式、转换后实际发给上游的 JSON、上游原始 JSON/SSE 和取消阶段，默认按 UTC 天轮转并保留 7 天；正文模式、保留期、目录和单条上限均可配置
 - **任意 Authorization 格式**：标准 `Bearer sk-...`、企业网关常见的非 Bearer 自定义协议头都能原样透传
 - **完整覆盖 Claude Code 协议**：流式 SSE、工具调用（`tool_use` / `tool_result` 双向增量）、多模态图片、`thinking` 块（覆盖范围与限制见下方["协议覆盖与边界"](#协议覆盖与边界)表）
 - **同时支持 OpenAI 两套协议**：默认走 Chat Completions（兼容 OpenAI 官方、OpenRouter、各类 OpenAI 兼容网关 / Kimi / DeepSeek 等），通过 `X-Upstream-Format: responses` opt-in 切到 Responses API（OpenAI o-series / gpt-5 原生协议，含 reasoning summary 转 Anthropic `thinking` 块）
@@ -111,7 +111,7 @@ Linux / macOS：
 
 ```bash
 # 把版本和平台替换成 Release 页面中的实际值
-VERSION=v0.6.6
+VERSION=v0.6.7
 PLATFORM=linux-amd64
 ARCHIVE="open-claude-router-${VERSION}-${PLATFORM}.tar.gz"
 
@@ -128,7 +128,7 @@ cd "open-claude-router-${VERSION}-${PLATFORM}"
 Windows PowerShell：
 
 ```powershell
-$Version = "v0.6.6"
+$Version = "v0.6.7"
 $Platform = "windows-amd64" # Windows on ARM 使用 windows-arm64
 $Archive = "open-claude-router-$Version-$Platform.zip"
 
@@ -350,13 +350,31 @@ Claude Code 会自动追加 `/v1/messages`，服务端识别并砍掉这个后�
 
 ### 模型交互日志
 
-模型交互日志用于直接核对 Router 的协议边界：`model_request` 是 Anthropic 请求完成转换后、实际发给模型方的 OpenAI JSON；`model_response` 是任何响应转换发生前的上游原始 JSON 或 SSE。二者通过 `request_id` 关联，另含上游 URL（已移除 userinfo、query、fragment）、协议格式、模型、HTTP 状态、耗时、正文 byte 数和是否读到 EOF/因上限截断。SSE transformer 读到协议终态后可以主动停止底层读取，此时会标记 `complete:false, body_cancelled:true`，不代表转换失败；连接上游失败时会写 `model_transport_error`。
+模型交互日志用于直接核对 Router 的协议边界：`model_request` 是 Anthropic 请求完成转换后、实际发给模型方的 OpenAI JSON；`model_response` 是任何响应转换发生前的上游原始 JSON 或 SSE。二者通过 `request_id` 关联，另含以下追溯字段：
+
+- `client_ip`：TCP 直连客户端 IP，不含临时端口；不信任也不读取客户端可伪造的 `X-Forwarded-For` / `X-Real-IP`。部署在反向代理后时这里记录代理 IP，应由代理单独保留真实来源日志。
+- `route_mode`：`header` 或 `embedded-path`，用于区分两种接入方式。
+- 上游 URL（已移除 userinfo、query、fragment）、协议格式、模型、HTTP 状态、耗时和正文 byte 数。
+- `complete` 表示原始 HTTP body 是否读到 EOF；`protocol_complete` 表示流中是否已经出现 `[DONE]` 或正式 Responses 终态。两者分开后，可以区分“协议已完成后取消底层读取”和真正的半途断开。
+- 客户端在上游响应完成前断开时写 `model_cancelled`，并用 `stage` 区分 `waiting_for_upstream_response` 与 `reading_upstream_response`；连接上游失败则写 `model_transport_error`。正常运行且日志存储可写时，每个已发往上游的 `model_request` 都会留下可关联的终态；进程被强杀或日志 fail-open 丢弃时仍可能缺失。
 
 日志文件名为 `model-interactions-YYYY-MM-DD.ndjson`，按 UTC 日期切分。服务启动时及运行中每小时清理过期文件；默认保留当天和前 6 个 UTC 日期。修改保留期示例：
 
 ```bash
 # 查看官方 Docker 示例当前日期的日志
 docker exec ocr sh -c 'tail -n 20 /app/logs/model-interactions-$(date -u +%F).ndjson'
+
+# 在宿主机按直接客户端 IP 汇总当天实际转发次数
+jq -s '
+  map(select(.event == "model_request"))
+  | group_by(.client_ip)
+  | map({client_ip: .[0].client_ip, requests: length})
+  | sort_by(-.requests)
+' ./logs/model-interactions-$(date -u +%F).ndjson
+
+# 用 request_id 还原同一次转发的请求、响应 / 错误 / 取消终态
+jq -c --arg id 'YOUR_REQUEST_ID' 'select(.request_id == $id)' \
+  ./logs/model-interactions-*.ndjson
 ```
 
 ```bash
@@ -366,6 +384,9 @@ docker run -d --name ocr --restart unless-stopped -p 3457:3457 \
   -e OCR_MODEL_LOG_MAX_BODY_BYTES=4194304 \
   -v ocr-model-logs:/app/logs \
   riba2534/open-claude-router:latest
+
+# 二进制运行同样可自定义；不设置时保留 7 天
+OCR_MODEL_LOG_RETENTION_DAYS=30 ./open-claude-router
 
 # 只看元数据，或完全关闭
 OCR_MODEL_LOG_MODE=metadata cargo run --manifest-path rust/Cargo.toml
@@ -405,8 +426,8 @@ OCR_MODEL_LOG_MODE=off cargo run --manifest-path rust/Cargo.toml
 
 - 这是**透明转发**服务：上游凭证经服务转发，**务必走 HTTPS**
 - 公网部署强烈建议设置 `OCR_ACCESS_TOKENS` 防止扫描滥用
-- JSON 运行日志不记录请求 header；模型交互日志只接收转换后的正文和脱敏 URL
-- 模型交互日志不记录请求 header，但 `full` 模式会记录提示词、工具内容和模型输出；敏感场景请改用 `OCR_MODEL_LOG_MODE=metadata` 或 `off`
+- JSON 运行日志不记录请求 header；模型交互日志只接收直接客户端 IP、接入模式、转换后的正文和脱敏 URL
+- 模型交互日志不记录请求 header，但 `client_ip` 属于访问来源数据，`full` 模式还会记录提示词、工具内容和模型输出；敏感场景请缩短 `OCR_MODEL_LOG_RETENTION_DAYS`，或改用 `OCR_MODEL_LOG_MODE=metadata` / `off`
 - 不要把上游凭证写入版本控制的文件，用 `~/.zshrc` 或 1Password CLI 等工具按需注入
 
 ## Star History

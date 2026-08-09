@@ -63,10 +63,19 @@ impl ModelLogConfig {
 }
 
 fn parse_integer(name: &str, default: u64, minimum: u64) -> Result<u64, String> {
-    let Some(raw) = std::env::var(name)
+    let raw = std::env::var(name)
         .ok()
-        .filter(|value| !value.trim().is_empty())
-    else {
+        .filter(|value| !value.trim().is_empty());
+    parse_integer_value(name, raw.as_deref(), default, minimum)
+}
+
+fn parse_integer_value(
+    name: &str,
+    raw: Option<&str>,
+    default: u64,
+    minimum: u64,
+) -> Result<u64, String> {
+    let Some(raw) = raw else {
         return Ok(default);
     };
     raw.trim()
@@ -86,7 +95,16 @@ pub struct ModelInteractionLogger {
     suppressed_errors: Arc<AtomicUsize>,
 }
 
-#[derive(Clone, Debug)]
+pub struct ExchangeMetadata {
+    pub request_id: String,
+    pub upstream_url: String,
+    pub format: String,
+    pub model: Option<Value>,
+    pub stream: bool,
+    pub client_ip: Option<String>,
+    pub route_mode: String,
+}
+
 pub struct Exchange {
     pub request_id: String,
     pub upstream_url: String,
@@ -94,34 +112,55 @@ pub struct Exchange {
     pub model: Option<Value>,
     pub stream: bool,
     pub started_at: Instant,
+    client_ip: Option<String>,
+    route_mode: String,
+    phase: &'static str,
+    terminal_recorded: bool,
+    logger: ModelInteractionLogger,
+}
+
+impl Exchange {
+    pub fn mark_upstream_response_started(&mut self) {
+        self.phase = "reading_upstream_response";
+    }
+}
+
+impl Drop for Exchange {
+    fn drop(&mut self) {
+        if self.terminal_recorded || !self.logger.config.enabled() {
+            return;
+        }
+        let mut entry = base_entry(self, "model_cancelled");
+        entry["duration_ms"] = json!(self.started_at.elapsed().as_millis() as u64);
+        entry["stage"] = json!(self.phase);
+        self.logger.append(entry);
+        self.terminal_recorded = true;
+    }
 }
 
 impl ModelInteractionLogger {
     pub fn from_env() -> Result<Self, String> {
-        Ok(Self {
-            config: Arc::new(ModelLogConfig::from_env()?),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            pending_writes: Arc::new(AtomicUsize::new(0)),
-            writes_drained: Arc::new(tokio::sync::Notify::new()),
-            last_error_log_second: Arc::new(AtomicU64::new(0)),
-            suppressed_errors: Arc::new(AtomicUsize::new(0)),
-        })
+        Ok(Self::new(ModelLogConfig::from_env()?))
     }
 
-    pub fn disabled() -> Self {
+    pub fn new(config: ModelLogConfig) -> Self {
         Self {
-            config: Arc::new(ModelLogConfig {
-                mode: LogMode::Off,
-                directory: PathBuf::from("logs"),
-                retention_days: 0,
-                max_body_bytes: 1024 * 1024,
-            }),
+            config: Arc::new(config),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             pending_writes: Arc::new(AtomicUsize::new(0)),
             writes_drained: Arc::new(tokio::sync::Notify::new()),
             last_error_log_second: Arc::new(AtomicU64::new(0)),
             suppressed_errors: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub fn disabled() -> Self {
+        Self::new(ModelLogConfig {
+            mode: LogMode::Off,
+            directory: PathBuf::from("logs"),
+            retention_days: 0,
+            max_body_bytes: 1024 * 1024,
+        })
     }
 
     pub async fn start(&self) {
@@ -150,22 +189,19 @@ impl ModelInteractionLogger {
         );
     }
 
-    pub fn begin(
-        &self,
-        request_id: String,
-        upstream_url: &str,
-        format: &str,
-        model: Option<Value>,
-        stream: bool,
-        outbound: &Value,
-    ) -> Exchange {
+    pub fn begin(&self, metadata: ExchangeMetadata, outbound: &Value) -> Exchange {
         let exchange = Exchange {
-            request_id,
-            upstream_url: sanitize_url(upstream_url),
-            format: format.to_owned(),
-            model,
-            stream,
+            request_id: metadata.request_id,
+            upstream_url: sanitize_url(&metadata.upstream_url),
+            format: metadata.format,
+            model: metadata.model,
+            stream: metadata.stream,
             started_at: Instant::now(),
+            client_ip: metadata.client_ip,
+            route_mode: metadata.route_mode,
+            phase: "waiting_for_upstream_response",
+            terminal_recorded: false,
+            logger: self.clone(),
         };
         if self.config.enabled() {
             let serialized = serde_json::to_vec(outbound).unwrap_or_else(|error| {
@@ -186,7 +222,7 @@ impl ModelInteractionLogger {
 
     pub fn response(
         &self,
-        exchange: &Exchange,
+        exchange: &mut Exchange,
         status: u16,
         headers: Value,
         bytes: &[u8],
@@ -197,7 +233,7 @@ impl ModelInteractionLogger {
 
     pub fn response_read_error(
         &self,
-        exchange: &Exchange,
+        exchange: &mut Exchange,
         status: u16,
         headers: Value,
         bytes: &[u8],
@@ -208,7 +244,7 @@ impl ModelInteractionLogger {
 
     fn response_with_read_error(
         &self,
-        exchange: &Exchange,
+        exchange: &mut Exchange,
         status: u16,
         headers: Value,
         bytes: &[u8],
@@ -216,6 +252,7 @@ impl ModelInteractionLogger {
         read_error: Option<&str>,
     ) {
         if !self.config.enabled() {
+            exchange.terminal_recorded = true;
             return;
         }
         let content_type = headers
@@ -236,6 +273,7 @@ impl ModelInteractionLogger {
         }
         add_body(&mut entry, bytes, bytes.len(), &content_type, &self.config);
         self.append(entry);
+        exchange.terminal_recorded = true;
     }
 
     pub fn streaming_capture(
@@ -253,17 +291,20 @@ impl ModelInteractionLogger {
             total: 0,
             finished: false,
             body_read_error: None,
+            protocol_complete: false,
         }
     }
 
-    pub fn transport_error(&self, exchange: &Exchange, message: &str) {
+    pub fn transport_error(&self, exchange: &mut Exchange, message: &str) {
         if !self.config.enabled() {
+            exchange.terminal_recorded = true;
             return;
         }
         let mut entry = base_entry(exchange, "model_transport_error");
         entry["duration_ms"] = json!(exchange.started_at.elapsed().as_millis() as u64);
         entry["error"] = json!({"name":"Error","message":message});
         self.append(entry);
+        exchange.terminal_recorded = true;
     }
 
     fn append(&self, entry: Value) {
@@ -376,6 +417,7 @@ pub struct StreamingCapture {
     total: usize,
     finished: bool,
     body_read_error: Option<String>,
+    protocol_complete: bool,
 }
 
 impl StreamingCapture {
@@ -402,8 +444,16 @@ impl StreamingCapture {
         self.body_read_error = Some(bound_body_read_error(message));
     }
 
-    fn record(&self, complete: bool) {
+    /// Marks a formal upstream protocol terminal such as Chat `[DONE]` or a
+    /// Responses terminal event. The HTTP body may still be cancelled after
+    /// this point, so this remains separate from `complete` (body EOF).
+    pub fn mark_protocol_complete(&mut self) {
+        self.protocol_complete = true;
+    }
+
+    fn record(&mut self, complete: bool) {
         if !self.logger.config.enabled() {
+            self.exchange.terminal_recorded = true;
             return;
         }
         let content_type = self
@@ -416,6 +466,7 @@ impl StreamingCapture {
         entry["headers"] = self.headers.clone();
         entry["duration_ms"] = json!(self.exchange.started_at.elapsed().as_millis() as u64);
         entry["complete"] = json!(complete);
+        entry["protocol_complete"] = json!(self.protocol_complete);
         if !complete {
             if let Some(error) = self.body_read_error.as_ref() {
                 entry["read_error"] = json!({"name":"Error","message":error});
@@ -431,6 +482,7 @@ impl StreamingCapture {
             &self.logger.config,
         );
         self.logger.append(entry);
+        self.exchange.terminal_recorded = true;
     }
 }
 
@@ -463,7 +515,9 @@ fn base_entry(exchange: &Exchange, event: &str) -> Value {
         "upstream_url":exchange.upstream_url,
         "format":exchange.format,
         "model":exchange.model,
-        "stream":exchange.stream
+        "stream":exchange.stream,
+        "client_ip":exchange.client_ip,
+        "route_mode":exchange.route_mode
     })
 }
 
@@ -550,19 +604,12 @@ mod tests {
         mode: LogMode,
         retention_days: u64,
     ) -> ModelInteractionLogger {
-        ModelInteractionLogger {
-            config: Arc::new(ModelLogConfig {
-                mode,
-                directory,
-                retention_days,
-                max_body_bytes: 8,
-            }),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            pending_writes: Arc::new(AtomicUsize::new(0)),
-            writes_drained: Arc::new(tokio::sync::Notify::new()),
-            last_error_log_second: Arc::new(AtomicU64::new(0)),
-            suppressed_errors: Arc::new(AtomicUsize::new(0)),
-        }
+        ModelInteractionLogger::new(ModelLogConfig {
+            mode,
+            directory,
+            retention_days,
+            max_body_bytes: 8,
+        })
     }
 
     #[test]
@@ -571,6 +618,23 @@ mod tests {
             sanitize_url("https://user:pass@upstream.example.com/v1?a=secret#x"),
             "https://upstream.example.com/v1"
         );
+    }
+
+    #[test]
+    fn retention_days_default_to_seven_and_accept_user_override() {
+        assert_eq!(
+            parse_integer_value("OCR_MODEL_LOG_RETENTION_DAYS", None, 7, 0).unwrap(),
+            7
+        );
+        assert_eq!(
+            parse_integer_value("OCR_MODEL_LOG_RETENTION_DAYS", Some("30"), 7, 0).unwrap(),
+            30
+        );
+        assert_eq!(
+            parse_integer_value("OCR_MODEL_LOG_RETENTION_DAYS", Some("0"), 7, 0).unwrap(),
+            0
+        );
+        assert!(parse_integer_value("OCR_MODEL_LOG_RETENTION_DAYS", Some("-1"), 7, 0).is_err());
     }
 
     #[test]
@@ -698,14 +762,18 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("ocr-model-log-{}", uuid::Uuid::new_v4()));
         let logger = test_logger(directory.clone(), LogMode::Metadata, 7);
-        let exchange = Exchange {
-            request_id: "read-error".into(),
-            upstream_url: "https://upstream.example.com/v1".into(),
-            format: "responses".into(),
-            model: None,
-            stream: true,
-            started_at: Instant::now(),
-        };
+        let exchange = logger.begin(
+            ExchangeMetadata {
+                request_id: "read-error".into(),
+                upstream_url: "https://upstream.example.com/v1".into(),
+                format: "responses".into(),
+                model: None,
+                stream: true,
+                client_ip: Some("203.0.113.8".into()),
+                route_mode: "header".into(),
+            },
+            &json!({}),
+        );
         let mut capture = logger.streaming_capture(exchange, 200, json!({}));
         capture.push(b"partial");
         capture.mark_read_error(&"x".repeat(MAX_BODY_READ_ERROR_CHARS + 100));
@@ -716,12 +784,108 @@ mod tests {
             "model-interactions-{}.ndjson",
             Utc::now().format("%Y-%m-%d")
         ));
-        let entry: Value = serde_json::from_str(&fs::read_to_string(path).await.unwrap()).unwrap();
+        let text = fs::read_to_string(path).await.unwrap();
+        let entry: Value = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|entry| entry["event"] == "model_response")
+            .unwrap();
         assert_eq!(entry["complete"], false);
+        assert_eq!(entry["protocol_complete"], false);
+        assert_eq!(entry["client_ip"], "203.0.113.8");
+        assert_eq!(entry["route_mode"], "header");
         assert!(entry.get("body_cancelled").is_none());
         let read_error = entry["read_error"]["message"].as_str().unwrap();
         assert_eq!(read_error.chars().count(), MAX_BODY_READ_ERROR_CHARS);
         assert!(read_error.ends_with('…'));
+        fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_exchange_records_client_ip_route_and_cancellation_stage() {
+        let directory =
+            std::env::temp_dir().join(format!("ocr-model-log-{}", uuid::Uuid::new_v4()));
+        let logger = test_logger(directory.clone(), LogMode::Metadata, 7);
+        let exchange = logger.begin(
+            ExchangeMetadata {
+                request_id: "cancelled-before-headers".into(),
+                upstream_url: "https://upstream.example.com/v1".into(),
+                format: "chat-completions".into(),
+                model: Some(json!("model-a")),
+                stream: true,
+                client_ip: Some("198.51.100.24".into()),
+                route_mode: "embedded-path".into(),
+            },
+            &json!({"model":"model-a","messages":[]}),
+        );
+        drop(exchange);
+        logger.flush().await;
+
+        let path = directory.join(format!(
+            "model-interactions-{}.ndjson",
+            Utc::now().format("%Y-%m-%d")
+        ));
+        let entries = fs::read_to_string(path)
+            .await
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["event"] == "model_request")
+        );
+        let cancelled = entries
+            .iter()
+            .find(|entry| entry["event"] == "model_cancelled")
+            .unwrap();
+        assert_eq!(cancelled["stage"], "waiting_for_upstream_response");
+        for entry in &entries {
+            assert_eq!(entry["client_ip"], "198.51.100.24");
+            assert_eq!(entry["route_mode"], "embedded-path");
+            assert_eq!(entry["request_id"], "cancelled-before-headers");
+        }
+        fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn protocol_terminal_is_distinct_from_http_body_eof() {
+        let directory =
+            std::env::temp_dir().join(format!("ocr-model-log-{}", uuid::Uuid::new_v4()));
+        let logger = test_logger(directory.clone(), LogMode::Metadata, 7);
+        let exchange = logger.begin(
+            ExchangeMetadata {
+                request_id: "protocol-terminal".into(),
+                upstream_url: "https://upstream.example.com/v1".into(),
+                format: "chat-completions".into(),
+                model: None,
+                stream: true,
+                client_ip: None,
+                route_mode: "header".into(),
+            },
+            &json!({}),
+        );
+        let mut capture = logger.streaming_capture(exchange, 200, json!({}));
+        capture.mark_protocol_complete();
+        drop(capture);
+        logger.flush().await;
+
+        let path = directory.join(format!(
+            "model-interactions-{}.ndjson",
+            Utc::now().format("%Y-%m-%d")
+        ));
+        let response = fs::read_to_string(path)
+            .await
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|entry| entry["event"] == "model_response")
+            .unwrap();
+        assert_eq!(response["complete"], false);
+        assert_eq!(response["protocol_complete"], true);
+        assert_eq!(response["body_cancelled"], true);
         fs::remove_dir_all(&directory).await.unwrap();
     }
 }

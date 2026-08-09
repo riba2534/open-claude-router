@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use open_claude_router::{AppState, build_app};
 use reqwest::redirect::Policy;
@@ -44,9 +44,12 @@ async fn main() {
         .unwrap_or_else(|error| panic!("read bound address: {error}"));
     info!(%addr, "open-claude-router Rust server listening");
 
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await;
     model_logger.flush().await;
     if let Err(error) = result {
         error!(%error, "server stopped with error");

@@ -1,6 +1,7 @@
 use std::{
     collections::{HashSet, VecDeque},
     convert::Infallible,
+    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -16,7 +17,10 @@ use axum::{
     routing::post,
 };
 use futures_util::StreamExt;
-use open_claude_router::{AppState, build_app, model_log::ModelInteractionLogger};
+use open_claude_router::{
+    AppState, build_app,
+    model_log::{LogMode, ModelInteractionLogger, ModelLogConfig},
+};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -378,6 +382,17 @@ fn test_router_with_client(client: reqwest::Client) -> Router {
     }))
 }
 
+fn test_router_with_model_logger(model_logger: ModelInteractionLogger) -> Router {
+    build_app(Arc::new(AppState {
+        client: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+        access_tokens: HashSet::new(),
+        model_logger,
+    }))
+}
+
 fn authenticated_test_router() -> Router {
     build_app(Arc::new(AppState {
         client: reqwest::Client::builder()
@@ -416,6 +431,81 @@ async fn send(router: Router, url: &str, upstream: &str, body: Value) -> axum::r
         )
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn socket_peer_ip_and_route_mode_are_written_to_audit_log() {
+    let (base, _) = start_mock().await;
+    let directory = std::env::temp_dir().join(format!("ocr-router-audit-{}", uuid::Uuid::new_v4()));
+    let model_logger = ModelInteractionLogger::new(ModelLogConfig {
+        mode: LogMode::Metadata,
+        directory: directory.clone(),
+        retention_days: 7,
+        max_body_bytes: 1024,
+    });
+    model_logger.start().await;
+    let app = build_app(Arc::new(AppState {
+        client: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+        access_tokens: HashSet::new(),
+        model_logger: model_logger.clone(),
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-upstream-url", format!("{base}/chat"))
+        .header("x-upstream-authorization", "Bearer secret")
+        .body(serde_json::to_vec(&anthropic_body(false)).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.bytes().await.unwrap();
+    model_logger.flush().await;
+
+    let path = directory.join(format!(
+        "model-interactions-{}.ndjson",
+        chrono::Utc::now().format("%Y-%m-%d")
+    ));
+    let entries = tokio::fs::read_to_string(path)
+        .await
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["event"] == "model_request")
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["event"] == "model_response")
+    );
+    let request_id = entries[0]["request_id"].clone();
+    for entry in entries {
+        assert_eq!(entry["client_ip"], "127.0.0.1");
+        assert_eq!(entry["route_mode"], "header");
+        assert_eq!(entry["request_id"], request_id);
+    }
+
+    server.abort();
+    tokio::fs::remove_dir_all(directory).await.unwrap();
 }
 
 #[tokio::test]
@@ -867,10 +957,23 @@ async fn count_tokens_keeps_typescript_route_validation_in_both_access_modes() {
 #[tokio::test]
 async fn downstream_disconnect_before_headers_cancels_upstream_request() {
     let (upstream, started, closed) = start_hanging_upstream().await;
+    let directory = std::env::temp_dir().join(format!("ocr-cancel-audit-{}", uuid::Uuid::new_v4()));
+    let model_logger = ModelInteractionLogger::new(ModelLogConfig {
+        mode: LogMode::Metadata,
+        directory: directory.clone(),
+        retention_days: 7,
+        max_body_bytes: 1024,
+    });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let app = test_router_with_model_logger(model_logger.clone());
     let server = tokio::spawn(async move {
-        axum::serve(listener, test_router()).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let payload = serde_json::to_vec(&anthropic_body(false)).unwrap();
@@ -890,7 +993,31 @@ async fn downstream_disconnect_before_headers_cancels_upstream_request() {
         .await
         .expect("dropping the downstream connection must cancel the pending reqwest future")
         .unwrap();
+    tokio::task::yield_now().await;
+    model_logger.flush().await;
+    let path = directory.join(format!(
+        "model-interactions-{}.ndjson",
+        chrono::Utc::now().format("%Y-%m-%d")
+    ));
+    let entries = tokio::fs::read_to_string(path)
+        .await
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["event"] == "model_request")
+    );
+    let cancelled = entries
+        .iter()
+        .find(|entry| entry["event"] == "model_cancelled")
+        .expect("disconnect before headers must leave an audit terminal");
+    assert_eq!(cancelled["stage"], "waiting_for_upstream_response");
+    assert_eq!(cancelled["client_ip"], "127.0.0.1");
     server.abort();
+    tokio::fs::remove_dir_all(directory).await.unwrap();
 }
 
 #[tokio::test]

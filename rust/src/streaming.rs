@@ -80,6 +80,9 @@ pub fn convert_chat_sse_stream(
                 }
             }
         }
+        if stopped_at_done {
+            capture.mark_protocol_complete();
+        }
         match state.finish(stopped_at_done) {
             Ok(frames) => for frame in frames { yield Ok(Bytes::from(frame)); },
             Err(error) => yield Ok(Bytes::from(error_frame(&error))),
@@ -179,6 +182,9 @@ pub fn convert_responses_sse_stream(
             .finish()
             .and_then(|payload| transform_responses_json(&payload, omit_thinking))
             .and_then(|message| progressive.finish(&message));
+        if result.is_ok() {
+            capture.mark_protocol_complete();
+        }
         // A protocol `[DONE]` can precede unread HTTP bytes. Only mark the raw
         // body complete when the reqwest stream itself reached EOF.
         if should_mark_capture_complete(stopped_at_done) {
