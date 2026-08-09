@@ -933,7 +933,9 @@ fn append_json_string(target: &mut Value, pointer: &str, value: Option<&str>) {
 }
 
 fn set_json_string(target: &mut Value, pointer: &str, value: Option<&str>) {
-    let Some(value) = value else { return };
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return;
+    };
     if let Some(slot) = target.pointer_mut(pointer) {
         *slot = Value::String(value.to_owned());
     }
@@ -1330,6 +1332,21 @@ mod tests {
         assert_eq!(
             result.pointer("/choices/0/message/tool_calls/0/function/name"),
             Some(&json!("lookup"))
+        );
+    }
+
+    #[test]
+    fn chat_aggregate_keeps_tool_identity_across_empty_continuation_snapshots() {
+        let bytes = Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a\"}},{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"run_shell\",\"arguments\":\"{\\\"cmd\\\":\\\"p\"}}]},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"\",\"function\":{\"name\":\"\",\"arguments\":\"wd\\\"}\"}},{\"index\":0,\"id\":\"\",\"function\":{\"name\":\"\",\"arguments\":\".txt\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let result = aggregate_chat_sse(bytes).unwrap();
+        assert_eq!(
+            result.pointer("/choices/0/message/tool_calls"),
+            Some(&json!([
+                {"id":"call_a","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}},
+                {"id":"call_b","type":"function","function":{"name":"run_shell","arguments":"{\"cmd\":\"pwd\"}"}}
+            ]))
         );
     }
 

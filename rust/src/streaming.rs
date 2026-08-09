@@ -592,10 +592,18 @@ impl ChatStreamState {
                 }
                 self.defer_semantic = true;
                 let tool = self.tools.entry(index).or_default();
-                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                if let Some(id) = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
                     tool.id = id.to_owned();
                 }
-                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                if let Some(name) = call
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
                     tool.name = self.tool_names.original_name(name).to_owned();
                 }
                 if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
@@ -613,7 +621,11 @@ impl ChatStreamState {
             if tool.id.is_empty() {
                 tool.id = format!("call_{}", uuid::Uuid::new_v4());
             }
-            if let Some(name) = function.get("name").and_then(Value::as_str) {
+            if let Some(name) = function
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
                 tool.name = self.tool_names.original_name(name).to_owned();
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
@@ -1092,6 +1104,46 @@ mod tests {
             .unwrap();
         assert_eq!(tool.pointer("/content_block/id"), Some(&json!("call_1")));
         assert_eq!(tool.pointer("/content_block/name"), Some(&json!("lookup")));
+    }
+
+    #[test]
+    fn chat_stream_keeps_tool_identity_across_empty_continuation_snapshots() {
+        let mut state = ChatStreamState::new(false);
+        let events = [
+            json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"call_a","function":{"name":"read_file","arguments":"{\"path\":\"a"}},
+                {"index":1,"id":"call_b","function":{"name":"run_shell","arguments":"{\"cmd\":\"p"}}
+            ]},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"tool_calls":[
+                {"index":1,"id":"","function":{"name":"","arguments":"wd\"}"}},
+                {"index":0,"id":"","function":{"name":"","arguments":".txt\"}"}}
+            ]},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ];
+        for event in events {
+            state.on_raw_event(&event.to_string()).unwrap();
+        }
+
+        let payloads = payloads(&state.finish(false).unwrap());
+        let tools = payloads
+            .iter()
+            .filter_map(|payload| payload.get("content_block"))
+            .filter(|block| block.get("type") == Some(&json!("tool_use")))
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].get("id"), Some(&json!("call_a")));
+        assert_eq!(tools[0].get("name"), Some(&json!("read_file")));
+        assert_eq!(tools[1].get("id"), Some(&json!("call_b")));
+        assert_eq!(tools[1].get("name"), Some(&json!("run_shell")));
+        let arguments = payloads
+            .iter()
+            .filter_map(|payload| {
+                payload
+                    .pointer("/delta/partial_json")
+                    .and_then(Value::as_str)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(arguments, ["{\"path\":\"a.txt\"}", "{\"cmd\":\"pwd\"}"]);
     }
 
     #[test]
