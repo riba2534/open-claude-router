@@ -54,7 +54,10 @@ pub(crate) fn transform_chat_json_response_with_tool_names(
     let message = choice
         .get("message")
         .ok_or_else(|| protocol_error("upstream Chat response contains no choice message"))?;
-    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty());
     let refusal_text = message
         .get("refusal")
         .and_then(Value::as_str)
@@ -653,6 +656,27 @@ mod tests {
         let error = transform_chat_json_response(&json!({"choices":[]}), false).unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
         assert!(error.retryable);
+    }
+
+    #[test]
+    fn chat_json_empty_finish_reason_is_equivalent_to_missing_terminal_reason() {
+        let empty = transform_chat_json_response(
+            &json!({
+                "choices":[{"message":{"role":"assistant","content":"partial"},"finish_reason":""}]
+            }),
+            false,
+        )
+        .unwrap_err();
+        let missing = transform_chat_json_response(
+            &json!({
+                "choices":[{"message":{"role":"assistant","content":"partial"},"finish_reason":null}]
+            }),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(empty.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert!(empty.retryable);
+        assert_eq!(empty.message, missing.message);
     }
 
     #[test]

@@ -290,10 +290,12 @@ pub fn aggregate_chat_sse(bytes: Bytes) -> Result<Value, ApiError> {
         else {
             continue;
         };
-        if choice
-            .get("finish_reason")
-            .is_some_and(|value| !value.is_null())
-        {
+        let has_terminal_finish_reason = match choice.get("finish_reason") {
+            Some(Value::String(reason)) => !reason.is_empty(),
+            Some(Value::Null) | None => false,
+            Some(_) => true,
+        };
+        if has_terminal_finish_reason {
             finish_reason = choice.get("finish_reason").cloned();
         }
         let delta = choice.get("delta").unwrap_or(&Value::Null);
@@ -428,9 +430,7 @@ pub fn aggregate_chat_sse(bytes: Bytes) -> Result<Value, ApiError> {
                 function.get("arguments").and_then(Value::as_str),
             );
         }
-        saw_terminal = choice
-            .get("finish_reason")
-            .is_some_and(|value| !value.is_null());
+        saw_terminal = has_terminal_finish_reason;
     }
     if finish_reason.is_none() {
         if parsed.saw_done {
@@ -1596,6 +1596,46 @@ mod tests {
                 {"id":"call_b","type":"function","function":{"name":"run_shell","arguments":"{\"cmd\":\"pwd\"}"}}
             ]))
         );
+    }
+
+    #[test]
+    fn chat_aggregate_treats_empty_finish_reason_as_non_terminal_for_parallel_tools() {
+        let bytes = Bytes::from_static(
+            b"data: {\"id\":\"chat-empty-reason\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]},\"finish_reason\":\"\"}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"run_shell\",\"arguments\":\"{\\\"cmd\\\":\\\"pwd\\\"}\"}}]},\"finish_reason\":\"\"}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let aggregated = aggregate_chat_sse(bytes).unwrap();
+        assert_eq!(
+            aggregated.pointer("/choices/0/finish_reason"),
+            Some(&json!("tool_calls"))
+        );
+
+        let message = crate::transform::transform_chat_json_response(&aggregated, false).unwrap();
+        assert_eq!(message["stop_reason"], "tool_use");
+        let tools = message["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|block| block.get("type") == Some(&json!("tool_use")))
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].get("id"), Some(&json!("call_a")));
+        assert_eq!(tools[1].get("id"), Some(&json!("call_b")));
+    }
+
+    #[test]
+    fn chat_aggregate_preserves_unknown_nonempty_finish_reason_for_validation() {
+        let aggregated = aggregate_chat_sse(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"future_reason\"}]}\n\ndata: [DONE]\n\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            aggregated.pointer("/choices/0/finish_reason"),
+            Some(&json!("future_reason"))
+        );
+        let error = crate::transform::transform_chat_json_response(&aggregated, false).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert!(error.retryable);
+        assert!(error.message.contains("future_reason"));
     }
 
     #[test]

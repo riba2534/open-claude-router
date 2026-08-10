@@ -398,6 +398,12 @@ async fn protocol_stream_upstream(
             "data: {\"id\":\"chat-partial\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{partial\"}}]},\"finish_reason\":\"length\"}]}\n\n",
             "data: [DONE]\n\n"
         )),
+        "chat-empty-finish-reason-tools" => Body::from(concat!(
+            "data: {\"id\":\"chat-empty-reason\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]},\"finish_reason\":\"\"}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"run_shell\",\"arguments\":\"{\\\"cmd\\\":\\\"pwd\\\"}\"}}]},\"finish_reason\":\"\"}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )),
         "responses-done-skeleton" => Body::from(concat!(
             "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
             "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m\",\"content\":[]}}\n\n",
@@ -1178,6 +1184,65 @@ async fn chat_metadata_only_done_is_retryable_stream_error_contract() {
     assert!(!body.contains("event: message_start"));
     assert!(!body.contains("event: message_stop"));
     assert_eq!(mock.count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn chat_empty_finish_reason_does_not_preempt_parallel_tool_terminal_contract() {
+    let (base, mock) = start_mock().await;
+    let upstream = format!("{base}/protocol-stream/chat-empty-finish-reason-tools");
+
+    let buffered = send(
+        test_router(),
+        "/v1/messages",
+        &upstream,
+        anthropic_body(false),
+    )
+    .await;
+    assert_eq!(buffered.status(), StatusCode::OK);
+    let buffered: Value =
+        serde_json::from_slice(&to_bytes(buffered.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(buffered["stop_reason"], "tool_use");
+    let buffered_tools = buffered["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|block| block.get("type") == Some(&json!("tool_use")))
+        .collect::<Vec<_>>();
+    assert_eq!(buffered_tools.len(), 2);
+    assert_eq!(buffered_tools[0].get("id"), Some(&json!("call_a")));
+    assert_eq!(buffered_tools[1].get("id"), Some(&json!("call_b")));
+
+    let live = send(
+        test_router(),
+        "/v1/messages",
+        &upstream,
+        anthropic_body(true),
+    )
+    .await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let live =
+        String::from_utf8(to_bytes(live.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+    let live_payloads = live
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    let live_tools = live_payloads
+        .iter()
+        .filter_map(|payload| payload.get("content_block"))
+        .filter(|block| block.get("type") == Some(&json!("tool_use")))
+        .collect::<Vec<_>>();
+    assert_eq!(live_tools.len(), 2);
+    assert_eq!(live_tools[0].get("id"), Some(&json!("call_a")));
+    assert_eq!(live_tools[1].get("id"), Some(&json!("call_b")));
+    assert!(
+        live_payloads
+            .iter()
+            .any(|payload| { payload.pointer("/delta/stop_reason") == Some(&json!("tool_use")) })
+    );
+    assert!(live.contains("event: message_stop"));
+    assert!(!live.contains("event: error"));
+    assert_eq!(mock.count.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

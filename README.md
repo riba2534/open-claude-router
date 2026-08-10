@@ -284,7 +284,7 @@ header 模式使用 Responses 时，把 `X-Upstream-Url` 改为 `/v1/responses`�
 
 | 能力 | 默认（Chat Completions） | Responses API |
 |---|---|---|
-| 文本流式 SSE | ✅ 正式处理 multi-data、LF/CRLF/CR 与跨 chunk UTF-8；兼容 EOF trailing event | 同左 |
+| 文本流式 SSE | ✅ 正式处理 multi-data、LF/CRLF/CR 与跨 chunk UTF-8；兼容 EOF trailing event。Chat 兼容端点在中间 delta 返回空 `finish_reason:""` 时按 `null`（非终态）处理并等待正式终态；未知的非空 reason 仍按上游协议错误关闭 | 同左 |
 | 工具调用（`tool_use` / `tool_result` 双向增量） | ✅ 含现代 `tool_calls` 并行工具；流式工具增量会先按调用缓冲，再输出合法的顺序 block；普通 OpenAI function call 返回为正式 `caller:{type:"direct"}`。Anthropic 合法但超过 Chat 64 字符限制的工具名会在单次请求内做稳定、无碰撞、双向透明映射。完整终态中的参数若不是 JSON object，按上游协议错误返回 retryable 502 | ✅ 含并行工具；历史 thinking/text/tool block 通过内部有序表示保真回放为 Responses items，超过 Responses 64 字符限制的历史 `call_id` 会稳定缩短并保持调用/结果严格配对。`program` / `program_output`、programmatic/未知 caller，以及响应侧 `compaction` / `function_call_output` 都依赖无法映射的 hosted-runtime 状态，明确返回 502；caller 缺省或 `direct` 正常转换 |
 | 顶层多模态图片（base64 / URL / file） | ✅ base64 / URL 精确映射为标准 `image_url`；provider-owned `file_id` 无法跨上游安全复用，因此本地 400；已知但畸形的 source 返回 400，未来未知 source 有界文本降级；自描述 data URL 保留 | ✅ URL 转标准 `input_image.image_url`；provider-owned `file_id` 同样不跨 provider 盲传，不按模型名猜视觉能力 |
 | `tool_result` 中的图片 / 文件 | ⚠️ Chat 的 tool message 只能放文本；base64/URL 图片及可表示为 `file_data` 的文件会在整组 tool message 后转成标准 user 多模态 sidecar。单个多模态 tool result 依靠相邻顺序归属，不增加模型可见 marker；同批合并多个并行结果时，才在各组附件之后追加通用 provenance marker（工具序号 + 完整 ID 的可逆 UTF-16BE/base64url 编码）。视觉/文件输入得以保留，但 text/image 原始交错顺序仍会降级。URL-only 文件转有界文本；`is_error:true` 以前置的稳定 Router metadata marker 保留，false/缺省不改变内容 | ✅ `function_call_output.output` 原生保留 `input_text` / `input_image` / `input_file` 多 block 数组的顺序与归属；`is_error:true` marker 同样保留；纯文本保持 string 以兼容旧端点 |

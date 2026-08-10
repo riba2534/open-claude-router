@@ -540,6 +540,7 @@ impl ChatStreamState {
         let event_finish_reason = choice
             .get("finish_reason")
             .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
             .map(ToOwned::to_owned);
         let delta = choice.get("delta").unwrap_or(&Value::Null);
         if let Some(text) = delta
@@ -1207,6 +1208,55 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(arguments, ["{\"path\":\"a.txt\"}", "{\"cmd\":\"pwd\"}"]);
+    }
+
+    #[test]
+    fn chat_stream_treats_empty_finish_reason_as_non_terminal_for_parallel_tools() {
+        let mut state = ChatStreamState::new(false);
+        let events = [
+            json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"call_a","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}
+            ]},"finish_reason":""}]}),
+            json!({"choices":[{"delta":{"tool_calls":[
+                {"index":1,"id":"call_b","function":{"name":"run_shell","arguments":"{\"cmd\":\"pwd\"}"}}
+            ]},"finish_reason":""}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ];
+        for event in events {
+            state.on_raw_event(&event.to_string()).unwrap();
+        }
+
+        let payloads = payloads(&state.finish(false).unwrap());
+        let tools = payloads
+            .iter()
+            .filter_map(|payload| payload.get("content_block"))
+            .filter(|block| block.get("type") == Some(&json!("tool_use")))
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].get("id"), Some(&json!("call_a")));
+        assert_eq!(tools[0].get("name"), Some(&json!("read_file")));
+        assert_eq!(tools[1].get("id"), Some(&json!("call_b")));
+        assert_eq!(tools[1].get("name"), Some(&json!("run_shell")));
+        assert!(
+            payloads.iter().any(|payload| {
+                payload.pointer("/delta/stop_reason") == Some(&json!("tool_use"))
+            })
+        );
+    }
+
+    #[test]
+    fn chat_stream_rejects_unknown_nonempty_finish_reason() {
+        let mut state = ChatStreamState::new(false);
+        state
+            .on_raw_event(
+                &json!({"choices":[{"delta":{"content":"partial"},"finish_reason":"future_reason"}]})
+                    .to_string(),
+            )
+            .unwrap();
+        let error = state.finish(false).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+        assert!(error.retryable);
+        assert!(error.message.contains("future_reason"));
     }
 
     #[test]
