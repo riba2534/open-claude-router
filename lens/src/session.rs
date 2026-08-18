@@ -18,6 +18,59 @@ pub struct SessionInfo {
     pub hint: Option<String>,
 }
 
+/// Strict grouping for Claude Code traffic: the client reports its own
+/// session id in `metadata.user_id` on every request (JSON form
+/// `{"device_id":…,"session_id":…}` from the Agent SDK runtime, or the legacy
+/// concatenated `…_session_<uuid>` string from interactive Claude Code).
+/// When present it is authoritative — compaction and identical opening
+/// messages no longer split or merge sessions. Returns None for clients that
+/// do not report one, so callers fall back to the heuristic hash.
+pub fn derive_from_client(payload: &Value) -> Option<SessionInfo> {
+    let user_id = payload.pointer("/metadata/user_id")?.as_str()?;
+    let session_id = extract_session_id(user_id)?;
+    let first_user = anthropic_first_user_text(payload);
+    Some(SessionInfo {
+        key: session_id,
+        hint: make_hint(&first_user),
+    })
+}
+
+fn extract_session_id(user_id: &str) -> Option<String> {
+    if let Ok(parsed) = serde_json::from_str::<Value>(user_id)
+        && let Some(id) = parsed.get("session_id").and_then(Value::as_str)
+        && !id.trim().is_empty()
+    {
+        return Some(id.trim().to_owned());
+    }
+    let (_, tail) = user_id.rsplit_once("session_")?;
+    let id = tail.trim();
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+/// First user-message text of an Anthropic Messages payload (string content
+/// or text blocks), for session display hints.
+fn anthropic_first_user_text(payload: &Value) -> String {
+    let Some(messages) = payload.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        return match message.get("content") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+    }
+    String::new()
+}
+
 pub fn derive(format: &str, client_ip: Option<&str>, payload: &Value) -> SessionInfo {
     let (system, first_user) = match format {
         "responses" => responses_parts(payload),
@@ -34,29 +87,32 @@ pub fn derive(format: &str, client_ip: Option<&str>, payload: &Value) -> Session
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let hint = {
-        // Claude Code 会把注入的 <system-reminder> 块放在首条用户消息前面，
-        // 作为展示提示时跳过它们，取真正的用户内容。
-        let trimmed = first_user.trim();
-        let trimmed = match trimmed.rfind("</system-reminder>") {
-            Some(pos) => {
-                let after = trimmed[pos + "</system-reminder>".len()..].trim();
-                if after.is_empty() { trimmed } else { after }
-            }
-            None => trimmed,
-        };
-        if trimmed.is_empty() {
-            None
-        } else {
-            let mut chars = trimmed.chars();
-            let mut hint = chars.by_ref().take(HINT_CHARS).collect::<String>();
-            if chars.next().is_some() {
-                hint.push('…');
-            }
-            Some(hint)
+    SessionInfo {
+        key,
+        hint: make_hint(&first_user),
+    }
+}
+
+/// Claude Code 会把注入的 <system-reminder> 块放在首条用户消息前面，
+/// 作为展示提示时跳过它们，取真正的用户内容。
+fn make_hint(first_user: &str) -> Option<String> {
+    let trimmed = first_user.trim();
+    let trimmed = match trimmed.rfind("</system-reminder>") {
+        Some(pos) => {
+            let after = trimmed[pos + "</system-reminder>".len()..].trim();
+            if after.is_empty() { trimmed } else { after }
         }
+        None => trimmed,
     };
-    SessionInfo { key, hint }
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut chars = trimmed.chars();
+    let mut hint = chars.by_ref().take(HINT_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        hint.push('…');
+    }
+    Some(hint)
 }
 
 fn chat_parts(payload: &Value) -> (String, String) {
@@ -170,6 +226,32 @@ mod tests {
             derive("chat-completions", Some("10.0.0.1"), &base).key,
             derive("chat-completions", Some("10.0.0.2"), &base).key,
         );
+    }
+
+    #[test]
+    fn client_session_id_wins_in_both_metadata_formats() {
+        let sdk = json!({
+            "metadata": {"user_id": "{\"device_id\":\"d1\",\"account_uuid\":\"\",\"session_id\":\"b1ce1a9c-afd1-5131-a5fd-98dfc763240a\"}"},
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "<system-reminder>ctx</system-reminder>"},
+                    {"type": "text", "text": "结算周期是几天"}
+                ]}
+            ]
+        });
+        let info = derive_from_client(&sdk).expect("sdk format");
+        assert_eq!(info.key, "b1ce1a9c-afd1-5131-a5fd-98dfc763240a");
+        assert_eq!(info.hint.as_deref(), Some("结算周期是几天"));
+
+        let legacy = json!({
+            "metadata": {"user_id": "user_abc_account_x_session_0f0e0d0c-1111-4222-8333-444455556666"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let info = derive_from_client(&legacy).expect("legacy format");
+        assert_eq!(info.key, "0f0e0d0c-1111-4222-8333-444455556666");
+
+        let none = json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert!(derive_from_client(&none).is_none());
     }
 
     #[test]

@@ -184,10 +184,35 @@ fn apply_entry(db: &Db, entry: &Value) -> Result<(), String> {
 /// The original Anthropic Messages payload as the client sent it (router
 /// v0.6.13+ logs it as its own event ahead of the converted request).
 fn apply_client_request(db: &Db, request_id: &str, entry: &Value) -> Result<(), String> {
+    let body = body_string(entry);
+    let payload = entry.get("body").cloned().or_else(|| {
+        body.as_deref()
+            .and_then(|text| serde_json::from_str(text).ok())
+    });
+    // 客户端自报的 Claude Code session_id 是权威会话键；本事件先于
+    // model_request 落盘，后者的启发式键只在此处未命中时补位。
+    // session_id 只在单个客户端内唯一（框架的确定性派生会让不同容器算出
+    // 相同 id），所以键上拼调用方标识防止跨调用方合并。
+    let session = payload
+        .as_ref()
+        .and_then(session::derive_from_client)
+        .map(|mut session| {
+            session.key = format!("{}:{}", client_ident(entry), session.key);
+            session
+        });
     db.with(|conn| {
         conn.execute(
-            "UPDATE exchanges SET client_req_body = ?2, updated_at = ?3 WHERE request_id = ?1",
-            params![request_id, body_string(entry), now_unix()],
+            "UPDATE exchanges SET client_req_body = ?2, updated_at = ?3,
+                    session_key = COALESCE(?4, session_key),
+                    session_hint = COALESCE(?5, session_hint)
+             WHERE request_id = ?1",
+            params![
+                request_id,
+                body,
+                now_unix(),
+                session.as_ref().map(|session| session.key.clone()),
+                session.as_ref().and_then(|session| session.hint.clone()),
+            ],
         )
     })
     .map_err(|error| error.to_string())?;
@@ -210,7 +235,8 @@ fn apply_request(db: &Db, request_id: &str, entry: &Value) -> Result<(), String>
     db.with(|conn| {
         conn.execute(
             "UPDATE exchanges SET req_body = ?2, req_bytes = ?3, req_truncated = ?4,
-                    session_key = ?5, session_hint = ?6, updated_at = ?7
+                    session_key = COALESCE(session_key, ?5),
+                    session_hint = COALESCE(session_hint, ?6), updated_at = ?7
              WHERE request_id = ?1",
             params![
                 request_id,
@@ -258,7 +284,7 @@ fn backfill_sessions(db: &Db) {
         let session = session::derive(&format, client_ip.as_deref(), &payload);
         let result = db.with(|conn| {
             conn.execute(
-                "UPDATE exchanges SET session_key = ?2, session_hint = ?3 WHERE request_id = ?1",
+                "UPDATE exchanges SET session_key = COALESCE(session_key, ?2), session_hint = ?3 WHERE request_id = ?1",
                 params![request_id, session.key, session.hint],
             )
         });
@@ -270,7 +296,74 @@ fn backfill_sessions(db: &Db) {
     if updated > 0 {
         info!(updated, "backfilled session keys");
     }
+    backfill_client_sessions(db);
     backfill_anthropic(db);
+}
+
+/// Re-keys rows recorded before Claude Code session ids became the
+/// authoritative grouping: any exchange with a stored client request whose
+/// metadata carries a session_id is moved onto that key.
+fn backfill_client_sessions(db: &Db) {
+    type Row = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = match db.with(|conn| {
+        conn.prepare(
+            "SELECT request_id, client_req_body, session_key, client_tag, client_ip FROM exchanges
+             WHERE client_req_body IS NOT NULL",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect()
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(%error, "client session backfill scan failed");
+            return;
+        }
+    };
+    let mut updated = 0usize;
+    for (request_id, body, current, tag, ip) in rows {
+        let Ok(payload) = serde_json::from_str::<Value>(&body) else {
+            continue;
+        };
+        let Some(mut session) = session::derive_from_client(&payload) else {
+            continue;
+        };
+        let ident = tag
+            .filter(|tag| !tag.is_empty())
+            .or(ip)
+            .unwrap_or_else(|| "unknown".into());
+        session.key = format!("{ident}:{}", session.key);
+        if current.as_deref() == Some(session.key.as_str()) {
+            continue;
+        }
+        let result = db.with(|conn| {
+            conn.execute(
+                "UPDATE exchanges SET session_key = ?2, session_hint = COALESCE(?3, session_hint)
+                 WHERE request_id = ?1",
+                params![request_id, session.key, session.hint],
+            )
+        });
+        match result {
+            Ok(_) => updated += 1,
+            Err(error) => warn!(%error, "client session backfill update failed"),
+        }
+    }
+    if updated > 0 {
+        info!(updated, "re-keyed exchanges onto Claude Code session ids");
+    }
 }
 
 /// Replays the Anthropic-view response for rows ingested before dual-view
@@ -404,6 +497,18 @@ fn apply_terminal(
     })
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+/// Caller identity for scoping client-reported session ids: self-reported
+/// tag first, source IP otherwise.
+fn client_ident(entry: &Value) -> String {
+    entry
+        .get("client_tag")
+        .and_then(Value::as_str)
+        .filter(|tag| !tag.is_empty())
+        .or_else(|| entry.get("client_ip").and_then(Value::as_str))
+        .unwrap_or("unknown")
+        .to_owned()
 }
 
 /// The router logs bodies either as parsed JSON (`body`) or as raw text

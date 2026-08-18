@@ -30,6 +30,7 @@ pub fn build_app(state: Arc<LensState>) -> Router {
         .route("/api/requests", get(list_requests))
         .route("/api/requests/{id}", get(request_detail))
         .route("/api/sessions", get(list_sessions))
+        .route("/api/clients", get(list_clients))
         .route("/api/stream", get(stream))
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state.clone());
@@ -88,6 +89,20 @@ async fn index() -> Response {
 #[derive(Deserialize)]
 struct OverviewParams {
     hours: Option<i64>,
+    client: Option<String>,
+}
+
+/// 展示与筛选用的统一调用方标识：自报 tag 优先，缺省回退来源 IP。
+const CLIENT_EXPR: &str = "COALESCE(NULLIF(client_tag,''), client_ip, '(unknown)')";
+
+fn client_filter(client: Option<&str>) -> (String, Vec<SqlValue>) {
+    match client.filter(|value| !value.is_empty()) {
+        Some(value) => (
+            format!(" AND {CLIENT_EXPR} = ?"),
+            vec![SqlValue::from(value.to_owned())],
+        ),
+        None => (String::new(), Vec::new()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -98,6 +113,7 @@ struct ListParams {
     model: Option<String>,
     outcome: Option<String>,
     session: Option<String>,
+    client: Option<String>,
     q: Option<String>,
 }
 
@@ -107,7 +123,7 @@ async fn overview(
 ) -> Result<Json<Value>, ApiFailure> {
     let hours = params.hours.unwrap_or(24).clamp(1, 24 * 90);
     run_query(state.clone(), move |conn, pricing| {
-        build_overview(conn, pricing, hours)
+        build_overview(conn, pricing, hours, params.client.as_deref())
     })
     .await
 }
@@ -128,7 +144,24 @@ async fn list_sessions(
 ) -> Result<Json<Value>, ApiFailure> {
     let hours = params.hours.unwrap_or(24).clamp(1, 24 * 90);
     run_query(state.clone(), move |conn, pricing| {
-        build_sessions(conn, pricing, hours)
+        build_sessions(conn, pricing, hours, params.client.as_deref())
+    })
+    .await
+}
+
+async fn list_clients(
+    State(state): State<Arc<LensState>>,
+    Query(params): Query<OverviewParams>,
+) -> Result<Json<Value>, ApiFailure> {
+    let hours = params.hours.unwrap_or(24).clamp(1, 24 * 90);
+    run_query(state.clone(), move |conn, _| {
+        let clients = collect_rows(
+            conn,
+            &format!("SELECT DISTINCT {CLIENT_EXPR} FROM exchanges WHERE ts_unix >= ? ORDER BY 1"),
+            &[SqlValue::from(since_unix(hours))],
+            |row| Ok(Value::String(row.get::<_, String>(0)?)),
+        )?;
+        Ok(json!({"clients": clients}))
     })
     .await
 }
@@ -304,8 +337,10 @@ fn build_overview(
     conn: &Connection,
     pricing: &PricingTable,
     hours: i64,
+    client: Option<&str>,
 ) -> rusqlite::Result<Value> {
     let since = since_unix(hours);
+    let (cf, cf_values) = client_filter(client);
     let bucket: i64 = match hours {
         ..=2 => 60,
         3..=6 => 300,
@@ -313,14 +348,18 @@ fn build_overview(
         _ => 3600,
     };
 
+    let mut base_values: Vec<SqlValue> = vec![SqlValue::from(since)];
+    base_values.extend(cf_values.iter().cloned());
     let mut totals = conn.query_row(
-        "SELECT COUNT(*),
+        &format!(
+            "SELECT COUNT(*),
                 SUM(outcome = 'ok'), SUM(outcome = 'http_error'),
                 SUM(outcome = 'transport_error'), SUM(outcome = 'cancelled'), SUM(outcome = 'pending'),
                 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                 COALESCE(SUM(cached_tokens),0), COALESCE(SUM(reasoning_tokens),0)
-         FROM exchanges WHERE ts_unix >= ?1",
-        [since],
+         FROM exchanges WHERE ts_unix >= ?{cf}"
+        ),
+        params_from_iter(base_values.iter()),
         |row| {
             Ok(json!({
                 "count": row.get::<_, i64>(0)?,
@@ -338,11 +377,11 @@ fn build_overview(
     )?;
 
     let mut durations: Vec<i64> = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT duration_ms FROM exchanges
-             WHERE ts_unix >= ?1 AND outcome = 'ok' AND duration_ms IS NOT NULL",
-        )?
-        .query_map([since], |row| row.get(0))?
+             WHERE ts_unix >= ? AND outcome = 'ok' AND duration_ms IS NOT NULL{cf}"
+        ))?
+        .query_map(params_from_iter(base_values.iter()), |row| row.get(0))?
         .collect::<Result<_, _>>()?;
     durations.sort_unstable();
     let percentile = |fraction: f64| -> Value {
@@ -359,15 +398,19 @@ fn build_overview(
         "max": durations.last().copied().map(Value::from).unwrap_or(Value::Null),
     });
 
+    let mut series_values: Vec<SqlValue> = vec![SqlValue::from(since), SqlValue::from(bucket)];
+    series_values.extend(cf_values.iter().cloned());
     let series = collect_rows(
         conn,
-        "SELECT (ts_unix / ?2) * ?2 AS bucket,
+        &format!(
+            "SELECT (ts_unix / ?2) * ?2 AS bucket,
                 SUM(outcome = 'ok'),
                 SUM(outcome IN ('http_error','transport_error')),
                 SUM(outcome = 'cancelled'),
                 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)
-         FROM exchanges WHERE ts_unix >= ?1 GROUP BY bucket ORDER BY bucket",
-        &[SqlValue::from(since), SqlValue::from(bucket)],
+         FROM exchanges WHERE ts_unix >= ?1{cf} GROUP BY bucket ORDER BY bucket"
+        ),
+        &series_values,
         |row| {
             Ok(json!({
                 "t": row.get::<_, i64>(0)?,
@@ -383,17 +426,17 @@ fn build_overview(
     let mut total_cost = 0.0;
     let mut total_savings = 0.0;
     let by_model = {
-        let mut statement = conn.prepare(
+        let mut statement = conn.prepare(&format!(
             "SELECT COALESCE(model,'(unknown)'), COUNT(*),
                     COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                     COALESCE(SUM(cached_tokens),0), COALESCE(SUM(reasoning_tokens),0),
                     CAST(AVG(CASE WHEN outcome='ok' THEN duration_ms END) AS INTEGER),
                     SUM(outcome IN ('http_error','transport_error')),
                     SUM(outcome = 'cancelled')
-             FROM exchanges WHERE ts_unix >= ?1 GROUP BY 1 ORDER BY 2 DESC LIMIT 20",
-        )?;
+             FROM exchanges WHERE ts_unix >= ?{cf} GROUP BY 1 ORDER BY 2 DESC LIMIT 20"
+        ))?;
         let rows = statement
-            .query_map([since], |row| {
+            .query_map(params_from_iter(base_values.iter()), |row| {
                 let model: String = row.get(0)?;
                 let input: i64 = row.get(2)?;
                 let output: i64 = row.get(3)?;
@@ -428,10 +471,12 @@ fn build_overview(
 
     let by_status = collect_rows(
         conn,
-        "SELECT COALESCE(status, 0), COUNT(*) FROM exchanges
-         WHERE ts_unix >= ?1 AND outcome IN ('ok','http_error')
-         GROUP BY 1 ORDER BY 2 DESC",
-        &[SqlValue::from(since)],
+        &format!(
+            "SELECT COALESCE(status, 0), COUNT(*) FROM exchanges
+         WHERE ts_unix >= ? AND outcome IN ('ok','http_error'){cf}
+         GROUP BY 1 ORDER BY 2 DESC"
+        ),
+        &base_values,
         |row| {
             Ok(json!({
                 "status": row.get::<_, i64>(0)?,
@@ -442,9 +487,11 @@ fn build_overview(
 
     let by_client = collect_rows(
         conn,
-        "SELECT COALESCE(NULLIF(client_tag,''), client_ip, '(unknown)') AS client, COUNT(*) FROM exchanges
-         WHERE ts_unix >= ?1 GROUP BY 1 ORDER BY 2 DESC LIMIT 10",
-        &[SqlValue::from(since)],
+        &format!(
+            "SELECT {CLIENT_EXPR} AS client, COUNT(*) FROM exchanges
+         WHERE ts_unix >= ?{cf} GROUP BY 1 ORDER BY 2 DESC LIMIT 10"
+        ),
+        &base_values,
         |row| {
             Ok(json!({
                 "client": row.get::<_, String>(0)?,
@@ -488,6 +535,10 @@ fn build_list(
         clauses.push("session_key = ?".into());
         values.push(SqlValue::from(session.to_owned()));
     }
+    if let Some(client) = params.client.as_deref().filter(|value| !value.is_empty()) {
+        clauses.push(format!("{CLIENT_EXPR} = ?"));
+        values.push(SqlValue::from(client.to_owned()));
+    }
     if let Some(term) = params.q.as_deref().filter(|value| !value.is_empty()) {
         clauses.push("(request_id LIKE ? OR preview LIKE ? OR req_body LIKE ?)".into());
         let pattern = format!("%{term}%");
@@ -529,20 +580,24 @@ fn build_sessions(
     conn: &Connection,
     pricing: &PricingTable,
     hours: i64,
+    client: Option<&str>,
 ) -> rusqlite::Result<Value> {
     let since = since_unix(hours);
+    let (cf, cf_values) = client_filter(client);
+    let mut base_values: Vec<SqlValue> = vec![SqlValue::from(since)];
+    base_values.extend(cf_values.iter().cloned());
     // Sessions can mix models (main model plus background helpers), so cost is
     // priced per (session, model) split and then summed, reference-style.
     let mut costs: HashMap<String, f64> = HashMap::new();
     {
-        let mut statement = conn.prepare(
+        let mut statement = conn.prepare(&format!(
             "SELECT session_key, COALESCE(model,''),
                     COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                     COALESCE(SUM(cached_tokens),0), COALESCE(SUM(reasoning_tokens),0)
-             FROM exchanges WHERE ts_unix >= ?1 AND session_key IS NOT NULL
-             GROUP BY session_key, model",
-        )?;
-        let rows = statement.query_map([since], |row| {
+             FROM exchanges WHERE ts_unix >= ?1 AND session_key IS NOT NULL{cf}
+             GROUP BY session_key, model"
+        ))?;
+        let rows = statement.query_map(params_from_iter(base_values.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -559,17 +614,17 @@ fn build_sessions(
         }
     }
 
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare(&format!(
         "SELECT session_key, MIN(ts_unix), MAX(ts_unix), MIN(ts), MAX(ts), COUNT(*),
                 SUM(outcome = 'ok'), SUM(outcome IN ('http_error','transport_error')), SUM(outcome = 'cancelled'),
                 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                 COALESCE(SUM(duration_ms),0),
                 MAX(session_hint), MAX(client_ip), GROUP_CONCAT(DISTINCT model), MAX(client_tag)
-         FROM exchanges WHERE ts_unix >= ?1 AND session_key IS NOT NULL
-         GROUP BY session_key ORDER BY MAX(ts_unix) DESC LIMIT 200",
-    )?;
+         FROM exchanges WHERE ts_unix >= ?1 AND session_key IS NOT NULL{cf}
+         GROUP BY session_key ORDER BY MAX(ts_unix) DESC LIMIT 200"
+    ))?;
     let rows = statement
-        .query_map([since], |row| {
+        .query_map(params_from_iter(base_values.iter()), |row| {
             let key: String = row.get(0)?;
             let cost = costs.get(&key).copied();
             Ok(json!({

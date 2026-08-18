@@ -189,6 +189,8 @@ pre.code { background:var(--code-bg); border:1px solid var(--line); border-radiu
 .jt-node.jt-collapsed > .jt-badge { display:inline; }
 .jt-more { color:var(--accent-ink); cursor:pointer; font-size:11px; white-space:nowrap; }
 
+.clickable { cursor:pointer; }
+.clickable:hover { color:var(--accent-ink); text-decoration:underline; }
 .live-dot { width:8px; height:8px; border-radius:50%; background:var(--muted); display:inline-block; transition:background .3s; }
 .live-dot.on { background:var(--good); box-shadow:0 0 0 3px var(--good-soft); }
 .overlay { position:fixed; inset:0; background:rgba(23,35,46,.45); display:flex; align-items:center; justify-content:center; z-index:50; }
@@ -213,6 +215,9 @@ h2.vh { font-size:18px; margin:6px 0 14px; }
   </nav>
   <span class="spacer"></span>
   <span class="live-dot" id="live-dot" title="实时流连接状态"></span>
+  <label>调用方
+    <select id="client-f"><option value="">全部</option></select>
+  </label>
   <label>时间窗
     <select id="hours">
       <option value="1">1 小时</option>
@@ -231,6 +236,22 @@ h2.vh { font-size:18px; margin:6px 0 14px; }
 "use strict";
 const $view = document.getElementById("view");
 const $hours = document.getElementById("hours");
+const $clientF = document.getElementById("client-f");
+let clientFilter = "";
+const clientQS = () => clientFilter ? `&client=${encodeURIComponent(clientFilter)}` : "";
+async function refreshClients(){
+  try {
+    const d = await api(`/api/clients?hours=${$hours.value}`);
+    const current = $clientF.value;
+    $clientF.innerHTML = `<option value="">全部</option>` +
+      d.clients.map(c => `<option value="${esc(c)}"${c === current ? " selected" : ""}>${esc(c)}</option>`).join("");
+    if(current && !d.clients.includes(current)){
+      const opt = document.createElement("option");
+      opt.value = current; opt.textContent = current; opt.selected = true;
+      $clientF.appendChild(opt);
+    }
+  } catch {}
+}
 const $auto = document.getElementById("auto");
 let timer = null;
 
@@ -496,7 +517,7 @@ function stackChart(series, keys, colors, height, hours){
 /* ---------- overview ---------- */
 async function renderOverview(){
   const hours = $hours.value;
-  const d = await api(`/api/overview?hours=${hours}`);
+  const d = await api(`/api/overview?hours=${hours}${clientQS()}`);
   const t = d.totals, okRate = t.count ? (100 * t.ok / t.count).toFixed(1) + "%" : "–";
   const css = getComputedStyle(document.documentElement);
   const cGood = css.getPropertyValue("--good").trim(), cBad = css.getPropertyValue("--bad").trim(),
@@ -530,7 +551,7 @@ async function renderOverview(){
       </table>
       <table class="data" style="margin-top:14px">
         <tr><th>client</th><th>次数</th></tr>
-        ${d.by_client.map(c => `<tr><td class="mono">${esc(c.client)}</td><td class="num">${fmtInt(c.count)}</td></tr>`).join("")}
+        ${d.by_client.map(c => `<tr><td class="mono clickable" data-setclient="${esc(c.client)}">${esc(c.client)}</td><td class="num">${fmtInt(c.count)}</td></tr>`).join("")}
       </table></div></div>
     </div>`;
 }
@@ -540,6 +561,7 @@ const listState = { offset: 0, model: "", outcome: "", q: "" };
 async function renderList(){
   const hours = $hours.value;
   const qs = new URLSearchParams({hours, limit: 50, offset: listState.offset});
+  if(clientFilter) qs.set("client", clientFilter);
   if(listState.model) qs.set("model", listState.model);
   if(listState.outcome) qs.set("outcome", listState.outcome);
   if(listState.q) qs.set("q", listState.q);
@@ -560,7 +582,7 @@ async function renderList(){
         <td class="num" style="white-space:nowrap">${fmtTime(r.ts)}</td>
         <td class="mono">${shortId(r.request_id)}</td>
         <td class="mono">${esc(r.model || "–")}</td>
-        <td class="mono">${esc(clientLabel(r))}</td>
+        <td class="mono clickable" data-setclient="${esc(clientLabel(r))}">${esc(clientLabel(r))}</td>
         <td>${fmtChip(r.format)}${streamChip(r.stream)}</td>
         <td>${outcomeChip(r)}</td>
         <td class="num">${fmtMs(r.duration_ms)}</td>
@@ -586,7 +608,7 @@ async function renderList(){
 /* ---------- sessions ---------- */
 async function renderSessions(){
   const hours = $hours.value;
-  const d = await api(`/api/sessions?hours=${hours}`);
+  const d = await api(`/api/sessions?hours=${hours}${clientQS()}`);
   $view.innerHTML = `
     <div class="panel" style="padding:6px 10px"><div class="tbl-scroll"><table class="data">
       <tr><th>最近活动</th><th>首条消息</th><th>请求</th><th>结果</th><th>时长</th><th>in/out tk</th><th>费用</th><th>模型</th><th>client</th></tr>
@@ -601,11 +623,11 @@ async function renderSessions(){
           <td class="num">${fmtInt(s.input_tokens)} / ${fmtInt(s.output_tokens)}</td>
           <td class="num">${fmtUSD(s.cost_usd)}</td>
           <td class="mono" style="font-size:11.5px">${esc(s.models || "–")}</td>
-          <td class="mono">${esc(s.client_tag || s.client_ip || "–")}</td>
+          <td class="mono clickable" data-setclient="${esc(s.client_tag || s.client_ip || "–")}">${esc(s.client_tag || s.client_ip || "–")}</td>
         </tr>`;
       }).join("") || `<tr><td colspan="9"><div class="empty">窗口内没有会话。同一客户端、同一 system 提示词、同一开场消息的连续请求会被归为一个会话。</div></td></tr>`}
     </table></div></div>
-    <p class="muted" style="font-size:12.5px">会话按（client_ip + system 提示词 + 首条 user 消息）哈希归并——一次 Claude Code 任务的几十个连续请求会聚成一行。</p>`;
+    <p class="muted" style="font-size:12.5px">会话优先按客户端自报的 Claude Code session_id 聚合（同一 session 的主 loop 与 subagent 归为一行）；未上报 session_id 的客户端回退为（调用方 + system 提示词 + 首条 user 消息）哈希归并。</p>`;
   $view.querySelectorAll("tr.row").forEach(tr => tr.onclick = () => { location.hash = "#/s/" + tr.dataset.key; });
 }
 
@@ -1072,9 +1094,24 @@ function schedule(){
   }, 15000);
 }
 window.addEventListener("hashchange", route);
-$hours.addEventListener("change", route);
+$hours.addEventListener("change", () => { refreshClients(); route(); });
+$clientF.addEventListener("change", () => { clientFilter = $clientF.value; listState.offset = 0; route(); });
+document.addEventListener("click", e => {
+  const cell = e.target.closest("[data-setclient]");
+  if(!cell) return;
+  e.stopPropagation();
+  clientFilter = cell.dataset.setclient;
+  $clientF.value = clientFilter;
+  if(![...$clientF.options].some(o => o.value === clientFilter)){
+    const opt = document.createElement("option");
+    opt.value = clientFilter; opt.textContent = clientFilter; opt.selected = true;
+    $clientF.appendChild(opt);
+  }
+  listState.offset = 0;
+  route();
+}, true);
 document.getElementById("refresh").addEventListener("click", route);
-route(); schedule(); connectStream();
+refreshClients(); route(); schedule(); connectStream();
 </script>
 </body>
 </html>
