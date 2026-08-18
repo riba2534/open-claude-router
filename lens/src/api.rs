@@ -298,12 +298,15 @@ fn cost_for(
     if input.is_none() && output.is_none() {
         return None;
     }
+    // OpenAI-protocol usage carries no cache-write counter; the fifth bucket
+    // is always 0 here (see `PricingTable::estimate_usd`).
     Some(pricing.estimate_usd(
         model.unwrap_or_default(),
         input.unwrap_or(0),
         output.unwrap_or(0),
         cached.unwrap_or(0),
         reasoning.unwrap_or(0),
+        0,
     ))
 }
 
@@ -461,7 +464,7 @@ fn build_overview(
         })?;
         for row in rows {
             let (model, input, output, cached, reasoning) = row?;
-            total_cost += pricing.estimate_usd(&model, input, output, cached, reasoning);
+            total_cost += pricing.estimate_usd(&model, input, output, cached, reasoning, 0);
             total_savings += pricing.cache_savings_usd(&model, cached);
         }
     }
@@ -482,7 +485,7 @@ fn build_overview(
                 let output: i64 = row.get(3)?;
                 let cached: i64 = row.get(4)?;
                 let reasoning: i64 = row.get(5)?;
-                let cost = pricing.estimate_usd(&model, input, output, cached, reasoning);
+                let cost = pricing.estimate_usd(&model, input, output, cached, reasoning, 0);
                 let savings = pricing.cache_savings_usd(&model, cached);
                 Ok(json!({
                     "model": model,
@@ -643,7 +646,7 @@ fn build_sessions(
         for row in rows {
             let (key, model, input, output, cached, reasoning) = row?;
             *costs.entry(key).or_default() +=
-                pricing.estimate_usd(&model, input, output, cached, reasoning);
+                pricing.estimate_usd(&model, input, output, cached, reasoning, 0);
         }
     }
 

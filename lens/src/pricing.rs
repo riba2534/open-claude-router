@@ -8,6 +8,10 @@
 //! table entry with reasoning price 0 while the model emits reasoning tokens)
 //! is priced at the model's output rate so the total matches what the vendor
 //! actually bills for `completion_tokens`.
+//!
+//! Price list source: aligned with the reference `model_pricing` migration
+//! end-state (published vendor price sheets); gpt-5.5/5.4/5.2 use the
+//! current list prices rather than their older rows.
 
 use serde::{Deserialize, Serialize};
 
@@ -42,9 +46,8 @@ pub struct PricingTable {
 }
 
 impl PricingTable {
-    /// Defaults mirror reference's `000002_seed_pricing` seed, extended with the
-    /// gpt-5.6 tier (same rates as its gpt-5.x siblings, reasoning priced at
-    /// the output rate because the vendor folds reasoning into output).
+    /// Defaults mirror the reference `model_pricing` migration end-state (see the
+    /// module header for the exact migration lineage).
     pub fn from_env() -> Self {
         let mut entries = default_entries();
         if let Ok(raw) = std::env::var("LENS_PRICING_JSON")
@@ -81,6 +84,11 @@ impl PricingTable {
 
     /// Estimated cost in USD from the raw OpenAI-style counters
     /// (`input` includes `cached`; `output` includes `reasoning`).
+    /// `cache_creation` is the fifth, disjoint bucket — it is never part of
+    /// `input`, so it is not deducted from it. Upstream OpenAI-protocol usage
+    /// does not report a cache-write count, so lens currently always passes 0;
+    /// the term exists to keep the formula complete against reference's
+    /// five-bucket accounting.
     pub fn estimate_usd(
         &self,
         model: &str,
@@ -88,10 +96,12 @@ impl PricingTable {
         output: i64,
         cached: i64,
         reasoning: i64,
+        cache_creation: i64,
     ) -> f64 {
         let price = self.matched(model).unwrap_or(&FALLBACK);
         let cached = cached.clamp(0, input.max(0));
         let reasoning = reasoning.clamp(0, output.max(0));
+        let cache_creation = cache_creation.max(0);
         let input_uncached = input.max(0) - cached;
         let output_plain = output.max(0) - reasoning;
         let reasoning_rate = if price.reasoning > 0.0 {
@@ -101,6 +111,7 @@ impl PricingTable {
         };
         (input_uncached as f64 * price.input
             + cached as f64 * price.cache_read
+            + cache_creation as f64 * price.cache_creation
             + output_plain as f64 * price.output
             + reasoning as f64 * reasoning_rate)
             / 1e6
@@ -136,7 +147,71 @@ fn entry(
 
 fn default_entries() -> Vec<ModelPrice> {
     vec![
-        // Anthropic (cache write = 1.25x input, reference fallback convention)
+        // Anthropic (cache write = 1.25x input; reasoning shadow-priced at the
+        // output rate, reference convention)
+        entry(
+            "claude-opus-4-5",
+            "Claude Opus 4.5",
+            5.0,
+            25.0,
+            0.5,
+            6.25,
+            25.0,
+        ),
+        entry(
+            "claude-opus-4-6",
+            "Claude Opus 4.6",
+            5.0,
+            25.0,
+            0.5,
+            6.25,
+            25.0,
+        ),
+        entry(
+            "claude-opus-4-7",
+            "Claude Opus 4.7",
+            5.0,
+            25.0,
+            0.5,
+            6.25,
+            25.0,
+        ),
+        entry(
+            "claude-opus-4-8",
+            "Claude Opus 4.8",
+            5.0,
+            25.0,
+            0.5,
+            6.25,
+            25.0,
+        ),
+        entry(
+            "claude-sonnet-4-5",
+            "Claude Sonnet 4.5",
+            3.0,
+            15.0,
+            0.3,
+            3.75,
+            15.0,
+        ),
+        entry(
+            "claude-sonnet-4-6",
+            "Claude Sonnet 4.6",
+            3.0,
+            15.0,
+            0.3,
+            3.75,
+            15.0,
+        ),
+        entry(
+            "claude-haiku-4-5",
+            "Claude Haiku 4.5",
+            1.0,
+            5.0,
+            0.1,
+            1.25,
+            5.0,
+        ),
         entry(
             "claude-3-5-sonnet",
             "Claude 3.5 Sonnet",
@@ -144,7 +219,7 @@ fn default_entries() -> Vec<ModelPrice> {
             15.0,
             0.3,
             3.75,
-            0.0,
+            15.0,
         ),
         entry(
             "claude-3-5-haiku",
@@ -153,7 +228,7 @@ fn default_entries() -> Vec<ModelPrice> {
             4.0,
             0.08,
             1.0,
-            0.0,
+            4.0,
         ),
         entry(
             "claude-3-opus",
@@ -162,7 +237,7 @@ fn default_entries() -> Vec<ModelPrice> {
             75.0,
             1.5,
             18.75,
-            0.0,
+            75.0,
         ),
         entry(
             "claude-sonnet-4",
@@ -171,7 +246,7 @@ fn default_entries() -> Vec<ModelPrice> {
             15.0,
             0.3,
             3.75,
-            0.0,
+            15.0,
         ),
         entry(
             "claude-opus-4",
@@ -180,9 +255,9 @@ fn default_entries() -> Vec<ModelPrice> {
             75.0,
             1.5,
             18.75,
-            0.0,
+            75.0,
         ),
-        entry("claude-haiku-4", "Claude Haiku 4", 1.0, 5.0, 0.1, 1.25, 0.0),
+        entry("claude-haiku-4", "Claude Haiku 4", 1.0, 5.0, 0.1, 1.25, 5.0),
         // OpenAI GPT
         entry("gpt-4o", "GPT-4o", 2.5, 10.0, 0.0, 0.0, 0.0),
         entry("gpt-4o-mini", "GPT-4o Mini", 0.15, 0.6, 0.0, 0.0, 0.0),
@@ -190,16 +265,22 @@ fn default_entries() -> Vec<ModelPrice> {
         entry("gpt-4.1", "GPT-4.1", 2.0, 8.0, 0.0, 0.0, 0.0),
         entry("gpt-4.1-mini", "GPT-4.1 Mini", 0.4, 1.6, 0.0, 0.0, 0.0),
         entry("gpt-4.1-nano", "GPT-4.1 Nano", 0.1, 0.4, 0.0, 0.0, 0.0),
-        entry("gpt-5.6", "GPT-5.6", 2.0, 8.0, 0.0, 0.0, 8.0),
-        entry("gpt-5.5", "GPT-5.5", 2.0, 8.0, 0.0, 0.0, 8.0),
-        entry("gpt-5.4", "GPT-5.4", 2.0, 8.0, 0.0, 0.0, 8.0),
-        entry("gpt-5.2", "GPT-5.2", 2.0, 8.0, 0.0, 0.0, 8.0),
+        entry("gpt-5.6", "GPT-5.6", 5.0, 30.0, 0.5, 0.0, 30.0),
+        entry("gpt-5.5", "GPT-5.5", 5.0, 30.0, 0.5, 0.0, 30.0),
+        entry("gpt-5.4", "GPT-5.4", 2.5, 15.0, 0.25, 0.0, 15.0),
+        entry("gpt-5.3", "GPT-5.3", 1.75, 14.0, 0.175, 0.0, 14.0),
+        entry("gpt-5.2", "GPT-5.2", 1.75, 14.0, 0.175, 0.0, 14.0),
+        entry("gpt-5.1", "GPT-5.1", 1.25, 10.0, 0.125, 0.0, 10.0),
+        entry("gpt-5-codex", "GPT-5 Codex", 1.25, 10.0, 0.125, 0.0, 10.0),
+        entry("gpt-5-mini", "GPT-5 Mini", 0.25, 2.0, 0.025, 0.0, 2.0),
+        entry("gpt-5-nano", "GPT-5 Nano", 0.05, 0.4, 0.005, 0.0, 0.4),
+        entry("gpt-5", "GPT-5", 1.25, 10.0, 0.125, 0.0, 10.0),
         // OpenAI reasoning family
+        entry("o1", "o1", 15.0, 60.0, 0.0, 0.0, 60.0),
         entry("o1-mini", "o1 Mini", 1.1, 4.4, 0.0, 0.0, 4.4),
         entry("o1-pro", "o1 Pro", 150.0, 600.0, 0.0, 0.0, 600.0),
-        entry("o1", "o1", 15.0, 60.0, 0.0, 0.0, 60.0),
-        entry("o3-mini", "o3 Mini", 1.1, 4.4, 0.0, 0.0, 4.4),
         entry("o3", "o3", 2.0, 8.0, 0.0, 0.0, 8.0),
+        entry("o3-mini", "o3 Mini", 1.1, 4.4, 0.0, 0.0, 4.4),
         entry("o4-mini", "o4 Mini", 1.1, 4.4, 0.0, 0.0, 4.4),
         // Google
         entry(
@@ -229,11 +310,42 @@ fn default_entries() -> Vec<ModelPrice> {
             0.0,
             0.0,
         ),
+        entry("gemini-3-pro", "Gemini 3 Pro", 2.0, 12.0, 0.2, 0.0, 0.0),
+        entry("gemini-3-flash", "Gemini 3 Flash", 0.5, 3.0, 0.05, 0.0, 0.0),
         // xAI
         entry("grok-3", "Grok 3", 3.0, 15.0, 0.0, 0.0, 0.0),
         // DeepSeek
         entry("deepseek-v3", "DeepSeek V3", 0.27, 1.1, 0.0, 0.0, 0.0),
         entry("deepseek-r1", "DeepSeek R1", 0.55, 2.19, 0.0, 0.0, 2.19),
+        // Moonshot
+        entry(
+            "kimi-k2.7-code-highspeed",
+            "Kimi K2.7 Code Highspeed",
+            0.95,
+            4.0,
+            0.19,
+            0.0,
+            4.0,
+        ),
+        entry(
+            "kimi-k2.7-code",
+            "Kimi K2.7 Code",
+            0.95,
+            4.0,
+            0.19,
+            0.0,
+            4.0,
+        ),
+        entry(
+            "kimi-for-coding",
+            "Kimi For Coding",
+            0.95,
+            4.0,
+            0.19,
+            0.0,
+            4.0,
+        ),
+        entry("kimi-code", "Kimi Code", 0.95, 4.0, 0.19, 0.0, 4.0),
     ]
 }
 
@@ -258,28 +370,62 @@ mod tests {
             table.matched("deployment-gpt-5.6-2026").unwrap().display,
             "GPT-5.6"
         );
+        assert_eq!(table.matched("gpt-5-mini-x").unwrap().display, "GPT-5 Mini");
         assert_eq!(table.matched("o1-pro-high").unwrap().display, "o1 Pro");
+        let opus = table.matched("claude-opus-4-5-20260101").unwrap();
+        assert_eq!(opus.display, "Claude Opus 4.5");
+        assert!((opus.input - 5.0).abs() < 1e-9);
+        assert!((opus.output - 25.0).abs() < 1e-9);
+        let kimi = table.matched("kimi-k2.7-code-highspeed").unwrap();
+        assert_eq!(kimi.display, "Kimi K2.7 Code Highspeed");
+        assert!((kimi.input - 0.95).abs() < 1e-9);
+        assert!((kimi.output - 4.0).abs() < 1e-9);
+        assert!((kimi.cache_read - 0.19).abs() < 1e-9);
+        assert!((kimi.reasoning - 4.0).abs() < 1e-9);
         assert!(table.matched("totally-unknown").is_none());
     }
 
     #[test]
     fn buckets_are_normalized_before_pricing() {
         let table = table();
-        // gpt-5.6: in 2.0, out 8.0, cache_read 0, reasoning folded at output rate.
+        // gpt-5.6: in 5.0, out 30.0, cache_read 0.5, reasoning 30.0.
         // 1M prompt (400k cached) + 500k completion (100k reasoning):
-        // uncached 600k*2 + cached 400k*0 + plain 400k*8 + reasoning 100k*8
-        let usd = table.estimate_usd("gpt-5.6-2026", 1_000_000, 500_000, 400_000, 100_000);
-        assert!((usd - (0.6 * 2.0 + 0.4 * 8.0 + 0.1 * 8.0)).abs() < 1e-9);
-        // Folded-reasoning rule keeps the total equal to completion*output.
-        let folded = table.estimate_usd("gpt-5.6-2026", 0, 500_000, 0, 100_000);
-        let flat = table.estimate_usd("gpt-5.6-2026", 0, 500_000, 0, 0);
+        // uncached 600k*5 + cached 400k*0.5 + plain 400k*30 + reasoning 100k*30
+        let usd = table.estimate_usd("gpt-5.6-2026", 1_000_000, 500_000, 400_000, 100_000, 0);
+        assert!((usd - (0.6 * 5.0 + 0.4 * 0.5 + 0.4 * 30.0 + 0.1 * 30.0)).abs() < 1e-9);
+        // Folded-reasoning rule (table reasoning price 0, e.g. gpt-4o) keeps
+        // the total equal to completion*output.
+        let folded = table.estimate_usd("gpt-4o-2024", 0, 500_000, 0, 100_000, 0);
+        let flat = table.estimate_usd("gpt-4o-2024", 0, 500_000, 0, 0, 0);
         assert!((folded - flat).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cache_creation_is_a_disjoint_fifth_bucket() {
+        let table = table();
+        // claude-opus-4-5: in 5, out 25, cache_read 0.5, cache_write 6.25,
+        // reasoning 25. cache_creation is not deducted from input:
+        // uncached 800k*5 + cached 200k*0.5 + write 300k*6.25
+        //   + plain 300k*25 + reasoning 100k*25
+        let usd = table.estimate_usd(
+            "claude-opus-4-5",
+            1_000_000,
+            400_000,
+            200_000,
+            100_000,
+            300_000,
+        );
+        let expected = 0.8 * 5.0 + 0.2 * 0.5 + 0.3 * 6.25 + 0.3 * 25.0 + 0.1 * 25.0;
+        assert!((usd - expected).abs() < 1e-9);
+        // Negative cache-write counts clamp to zero like the other buckets.
+        let clamped = table.estimate_usd("claude-opus-4-5", 1_000_000, 0, 0, 0, -5);
+        assert!((clamped - 5.0).abs() < 1e-9);
     }
 
     #[test]
     fn unknown_model_uses_sonnet_class_fallback() {
         let table = table();
-        let usd = table.estimate_usd("mystery-model", 1_000_000, 0, 0, 0);
+        let usd = table.estimate_usd("mystery-model", 1_000_000, 0, 0, 0, 0);
         assert!((usd - 3.0).abs() < 1e-9);
     }
 
