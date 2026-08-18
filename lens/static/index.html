@@ -138,9 +138,15 @@ pre.code { background:var(--code-bg); border:1px solid var(--line); border-radiu
 
 /* rendered/raw 切换容器（markdown 与 JSON 树共用） */
 .tb { position:relative; min-height:20px; }
-.tb > .tb-toggle { position:absolute; top:0; right:0; z-index:2; font-family:var(--mono); font-size:10px; padding:1px 9px; border-radius:999px; border:1px solid var(--line); background:var(--surface-2); color:var(--muted); cursor:pointer; opacity:.45; transition:opacity .15s; }
-.tb:hover > .tb-toggle { opacity:1; }
+.tb > .tb-toggle { position:absolute; top:0; right:0; z-index:2; font-family:var(--mono); font-size:10px; font-weight:600; padding:1px 9px; border-radius:999px; border:1px solid var(--line); background:var(--surface); color:var(--muted); cursor:pointer; opacity:.75; transition:all .15s; box-shadow:0 1px 2px rgba(23,35,46,.06); }
+.tb:hover > .tb-toggle { opacity:1; border-color:var(--accent); color:var(--accent-ink); }
 .tb > .tb-a, .tb > .tb-b { padding-right:52px; }
+.tb.clamp > .tb-a, .tb.clamp > .tb-b { position:relative; }
+.tb.clamp:not(.open) > .tb-a, .tb.clamp:not(.open) > .tb-b { max-height:250px; overflow:hidden; }
+.tb.clamp:not(.open) > .tb-a::after { content:""; position:absolute; bottom:0; left:0; right:0; height:56px; background:linear-gradient(rgba(255,255,255,0), var(--surface)); pointer-events:none; }
+.tb.clamp:not(.open) > .tb-b::after { content:""; position:absolute; bottom:0; left:0; right:0; height:56px; background:linear-gradient(rgba(244,246,249,0), var(--code-bg)); pointer-events:none; }
+.clamp-more { display:block; text-align:center; font-family:var(--mono); font-size:11.5px; color:var(--accent-ink); cursor:pointer; padding:6px 0 2px; user-select:none; }
+.clamp-more:hover { text-decoration:underline; }
 
 /* markdown 渲染 */
 .md { line-height:1.65; overflow-wrap:anywhere; }
@@ -416,6 +422,12 @@ document.addEventListener("click", e => {
     if(!more.dataset.label) more.dataset.label = "展开";
     return;
   }
+  const clampMore = e.target.closest(".clamp-more");
+  if(clampMore){
+    const open = clampMore.parentElement.classList.toggle("open");
+    clampMore.textContent = open ? "收起 ▴" : clampMore.dataset.label;
+    return;
+  }
   const toggle = e.target.closest(".tb-toggle");
   if(toggle){
     const tb = toggle.parentElement;
@@ -427,10 +439,9 @@ document.addEventListener("click", e => {
 });
 
 function textBlock(text, limit){
-  limit = limit || 600;
   const t = String(text ?? "");
-  if(t.length <= limit) return mdBlock(t);
-  return `<details class="fold"><summary>展开全文 · ${fmtInt(t.length)} 字符</summary>${mdBlock(t)}</details><div class="muted">${esc(t.slice(0, limit))}…</div>`;
+  const clamp = t.length > (limit || 700);
+  return `<div class="tb${clamp ? " clamp" : ""}"><button class="tb-toggle">RAW</button><div class="tb-a md">${renderMd(t)}</div><pre class="code tb-b" hidden>${esc(t)}</pre>${clamp ? `<div class="clamp-more" data-label="展开全部 · ${fmtInt(t.length)} 字符 ▾">展开全部 · ${fmtInt(t.length)} 字符 ▾</div>` : ""}</div>`;
 }
 function jsonFold(label, value){
   return `<details class="fold"><summary>${esc(label)}</summary>${jsonBlock(value)}</details>`;
@@ -643,7 +654,7 @@ function renderChatConversation(p){
     const role = m.role;
     if(role === "system" || role === "developer"){
       const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-      html += `<div class="bubble sys"><div class="role">${esc(role)}</div><details class="fold"><summary>已折叠 · ${fmtBytes(text.length)}</summary><div>${esc(text).replace(/\n/g,"<br>")}</div></details></div>`;
+      html += `<div class="bubble sys"><div class="role">${esc(role)} <span class="muted">${fmtBytes(text.length)}</span></div>${textBlock(text, 400)}</div>`;
     } else if(role === "tool"){
       const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
       html += `<div class="bubble tout"><div class="role">tool result · ${esc(String(m.tool_call_id||"").slice(0,14))}</div>${textBlock(text, 400)}</div>`;
@@ -657,7 +668,7 @@ function renderChatConversation(p){
 function renderResponsesConversation(p){
   let html = "";
   if(p.instructions){
-    html += `<div class="bubble sys"><div class="role">instructions</div><details class="fold"><summary>已折叠 · ${fmtBytes(p.instructions.length)}</summary><div>${esc(p.instructions).replace(/\n/g,"<br>")}</div></details></div>`;
+    html += `<div class="bubble sys"><div class="role">instructions <span class="muted">${fmtBytes(p.instructions.length)}</span></div>${textBlock(p.instructions, 400)}</div>`;
   }
   const items = Array.isArray(p.input) ? p.input : [];
   if(typeof p.input === "string") html += `<div class="bubble user"><div class="role">user</div>${textBlock(p.input)}</div>`;
@@ -729,7 +740,7 @@ function renderAnthropicConversation(p){
   if(p.system){
     const text = typeof p.system === "string" ? p.system
       : Array.isArray(p.system) ? p.system.map(x => x.text || "").join("\n") : JSON.stringify(p.system);
-    html += `<div class="bubble sys"><div class="role">system</div><details class="fold"><summary>已折叠 · ${fmtBytes(text.length)}</summary><div>${esc(text).replace(/\n/g,"<br>")}</div></details></div>`;
+    html += `<div class="bubble sys"><div class="role">system <span class="muted">${fmtBytes(text.length)}</span></div>${textBlock(text, 400)}</div>`;
   }
   for(const m of p.messages || []) html += renderAnthropicMessage(m);
   return html || `<div class="empty">无 messages</div>`;

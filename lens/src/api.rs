@@ -74,7 +74,12 @@ async fn require_token(
 
 async fn index() -> Response {
     (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // The SPA is a single inlined file that changes on every deploy;
+            // force revalidation so browsers never show a stale dashboard.
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         include_str!("../static/index.html"),
     )
         .into_response()
