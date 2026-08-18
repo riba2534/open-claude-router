@@ -151,13 +151,13 @@ pre.code { background:var(--code-bg); border:1px solid var(--line); border-radiu
 .tb > .tb-toggle { position:absolute; top:0; right:0; z-index:2; font-family:var(--mono); font-size:10px; font-weight:600; padding:1px 9px; border-radius:999px; border:1px solid var(--line); background:var(--surface); color:var(--muted); cursor:pointer; opacity:.75; transition:all .15s; box-shadow:0 1px 2px rgba(23,35,46,.06); }
 .tb:hover > .tb-toggle { opacity:1; border-color:var(--accent); color:var(--accent-ink); }
 .tb > .tb-a, .tb > .tb-b { padding-right:52px; }
+.tb.clamp > .tb-a, .tb.clamp > .tb-b { padding-right:170px; }
 .tb.clamp > .tb-a, .tb.clamp > .tb-b { position:relative; }
 /* 长文本默认全部展开（浏览器 Ctrl+F 可全文搜索）；点击「折叠」加 .folded 才限高渐隐 */
 .tb.clamp.folded > .tb-a, .tb.clamp.folded > .tb-b { max-height:250px; overflow:hidden; }
 .tb.clamp.folded > .tb-a::after { content:""; position:absolute; bottom:0; left:0; right:0; height:56px; background:linear-gradient(rgba(255,255,255,0), var(--surface)); pointer-events:none; }
 .tb.clamp.folded > .tb-b::after { content:""; position:absolute; bottom:0; left:0; right:0; height:56px; background:linear-gradient(rgba(244,246,249,0), var(--code-bg)); pointer-events:none; }
-.clamp-more { display:block; text-align:center; font-family:var(--mono); font-size:11.5px; color:var(--accent-ink); cursor:pointer; padding:6px 0 2px; user-select:none; }
-.clamp-more:hover { text-decoration:underline; }
+.tb-fold { right:52px !important; color:var(--accent-ink) !important; }
 
 /* markdown 渲染 */
 .md { line-height:1.65; overflow-wrap:anywhere; }
@@ -457,10 +457,10 @@ document.addEventListener("click", e => {
   }
   const blockHead = e.target.closest(".block-head");
   if(blockHead){ blockHead.parentElement.classList.toggle("folded"); return; }
-  const clampMore = e.target.closest(".clamp-more");
-  if(clampMore){
-    const folded = clampMore.parentElement.classList.toggle("folded");
-    clampMore.textContent = folded ? clampMore.dataset.label : "折叠 ▴";
+  const fold = e.target.closest(".tb-fold");
+  if(fold){
+    const folded = fold.parentElement.classList.toggle("folded");
+    fold.textContent = folded ? fold.dataset.label : "折叠 ▴";
     return;
   }
   const toggle = e.target.closest(".tb-toggle");
@@ -476,7 +476,7 @@ document.addEventListener("click", e => {
 function textBlock(text, limit){
   const t = String(text ?? "");
   const clamp = t.length > (limit || 700);
-  return `<div class="tb${clamp ? " clamp" : ""}"><button class="tb-toggle">RAW</button><div class="tb-a md">${renderMd(t)}</div><pre class="code tb-b" hidden>${esc(t)}</pre>${clamp ? `<div class="clamp-more" data-label="展开全部 · ${fmtInt(t.length)} 字符 ▾">折叠 ▴</div>` : ""}</div>`;
+  return `<div class="tb${clamp ? " clamp" : ""}">${clamp ? `<button class="tb-toggle tb-fold" data-label="展开 · ${fmtInt(t.length)} 字符 ▾">折叠 ▴</button>` : ""}<button class="tb-toggle">RAW</button><div class="tb-a md">${renderMd(t)}</div><pre class="code tb-b" hidden>${esc(t)}</pre></div>`;
 }
 function jsonFold(label, value){
   return `<details class="fold"><summary>${esc(label)}</summary>${jsonBlock(value)}</details>`;
