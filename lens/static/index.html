@@ -90,9 +90,19 @@ table.data tr.row:hover { background:var(--surface-2); }
 .seg button { border:none; background:var(--surface); color:var(--muted); padding:7px 20px; font-size:13px; cursor:pointer; font-family:var(--sans); }
 .seg button.on { background:var(--accent); color:#fff; font-weight:600; }
 .seg button:not(.on):hover { background:var(--surface-2); }
-.detail-grid { display:grid; grid-template-columns:1.08fr 1fr; gap:16px; align-items:start; }
-.detail-grid > div { min-width:0; }
-@media (max-width:1000px){ .detail-grid { grid-template-columns:1fr; } }
+.block { margin-bottom:14px; min-width:0; }
+.block-head { display:flex; align-items:center; gap:12px; background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:10px 18px; cursor:pointer; box-shadow:var(--shadow); user-select:none; transition:background .15s; }
+.block-head:hover { background:var(--surface-2); }
+.block-title { font-weight:600; font-size:14px; display:flex; align-items:center; gap:8px; }
+.block-title::before { content:""; width:9px; height:9px; border-radius:50%; background:var(--accent); flex:none; }
+.block.resp .block-title::before { background:var(--good); }
+.block-meta { color:var(--muted); font-family:var(--mono); font-size:11.5px; }
+.block-caret { margin-left:auto; color:var(--muted); font-size:12px; }
+.block-caret::before { content:"▾ 折叠"; }
+.block.folded .block-caret::before { content:"▸ 展开"; }
+.block.folded > .block-body { display:none; }
+.block-body { margin-top:10px; min-width:0; }
+.block-body .bubble { max-width:980px; }
 
 .tabs { display:flex; gap:2px; flex-wrap:wrap; }
 .tab { padding:5px 13px; border:1px solid var(--line); border-bottom:none; border-radius:7px 7px 0 0; color:var(--muted); background:var(--surface-2); cursor:pointer; font-size:12.5px; font-family:var(--mono); }
@@ -423,6 +433,8 @@ document.addEventListener("click", e => {
     if(!more.dataset.label) more.dataset.label = "展开";
     return;
   }
+  const blockHead = e.target.closest(".block-head");
+  if(blockHead){ blockHead.parentElement.classList.toggle("folded"); return; }
   const clampMore = e.target.closest(".clamp-more");
   if(clampMore){
     const open = clampMore.parentElement.classList.toggle("open");
@@ -943,8 +955,9 @@ async function renderDetail(id){
       <button data-pv="claude">Claude ↔ Router · Anthropic 协议</button>
     </div>
     <div id="pv-router">
-    <div class="detail-grid">
-      <div>
+    <section class="block">
+      <div class="block-head"><span class="block-title">请求 · Router → 网关</span><span class="block-meta">${fmtBytes(d.req_bytes)} · OpenAI ${esc(format)}</span><span class="block-caret"></span></div>
+      <div class="block-body">
         <div class="tabs">
           <span class="tab on" data-tab="convo">会话视图</span>
           <span class="tab" data-tab="tools">工具 (${reqJson && reqJson.tools ? reqJson.tools.length : 0})</span>
@@ -956,7 +969,10 @@ async function renderDetail(id){
         <div class="pane" data-pane="params" hidden>${reqJson ? renderParams(reqJson) : ""}</div>
         <div class="pane" data-pane="rawreq" hidden><div class="muted mono" style="font-size:11px;margin-bottom:6px">发给上游的最终请求 · ${fmtBytes(d.req_bytes)}</div>${d.req_body ? jsonBlock(d.req_body) : `<div class="empty">(无)</div>`}</div>
       </div>
-      <div>
+    </section>
+    <section class="block resp">
+      <div class="block-head"><span class="block-title">响应 · 网关 → Router</span><span class="block-meta">${fmtBytes(d.resp_bytes)}${d.stream ? " · SSE" : ""}</span><span class="block-caret"></span></div>
+      <div class="block-body">
         <div class="tabs">
           <span class="tab on" data-tab="agg">聚合终态</span>
           <span class="tab" data-tab="sse">事件流</span>
@@ -971,11 +987,12 @@ async function renderDetail(id){
           ${!d.resp_body ? `<div class="empty">(无)</div>` : d.stream ? `<pre class="code">${esc(d.resp_body.length > 200000 ? d.resp_body.slice(0,200000) + "\n\n…（截断显示）" : d.resp_body)}</pre>` : jsonBlock(d.resp_body)}
         </div>
       </div>
-    </div>
+    </section>
     </div>
     <div id="pv-claude" hidden>
-    <div class="detail-grid">
-      <div>
+    <section class="block">
+      <div class="block-head"><span class="block-title">请求 · Claude → Router</span><span class="block-meta">${d.client_req_body ? fmtBytes(d.client_req_body.length) : "未记录"} · Anthropic Messages</span><span class="block-caret"></span></div>
+      <div class="block-body">
         <div class="tabs">
           <span class="tab on" data-tab="c-convo">会话视图</span>
           <span class="tab" data-tab="c-tools">工具 (${clientJson && clientJson.tools ? clientJson.tools.length : 0})</span>
@@ -987,7 +1004,10 @@ async function renderDetail(id){
         <div class="pane" data-pane="c-params" hidden>${clientJson ? renderParams(clientJson) : ""}</div>
         <div class="pane" data-pane="c-raw" hidden><div class="muted mono" style="font-size:11px;margin-bottom:6px">客户端发来的原始 Anthropic 请求</div>${d.client_req_body ? jsonBlock(d.client_req_body) : `<div class="empty">(无)</div>`}</div>
       </div>
-      <div>
+    </section>
+    <section class="block resp">
+      <div class="block-head"><span class="block-title">响应 · Router → Claude</span><span class="block-meta">Anthropic ${anthJson ? "已还原" : "不可用"}</span><span class="block-caret"></span></div>
+      <div class="block-body">
         <div class="tabs">
           <span class="tab on" data-tab="c-resp">返回给客户端</span>
           <span class="tab" data-tab="c-rawresp">原始 JSON</span>
@@ -995,7 +1015,7 @@ async function renderDetail(id){
         <div class="pane" data-pane="c-resp">${claudeResp}${anthJson ? usageBar(d) : ""}</div>
         <div class="pane" data-pane="c-rawresp" hidden><div class="muted mono" style="font-size:11px;margin-bottom:6px">Anthropic 协议响应（流式为聚合终态等价形式，由 Router 同款转换代码重放生成）</div>${d.anthropic_response ? jsonBlock(d.anthropic_response) : `<div class="empty">(无)</div>`}</div>
       </div>
-    </div>
+    </section>
     </div>`;
   activateTabs($view);
   document.querySelectorAll("#pv-seg button").forEach(btn => btn.onclick = () => {
