@@ -50,13 +50,21 @@ impl Db {
                output_tokens     INTEGER,
                cached_tokens     INTEGER,
                reasoning_tokens  INTEGER,
-               preview           TEXT
+               preview           TEXT,
+               session_key       TEXT,
+               session_hint      TEXT,
+               updated_at        INTEGER
              );
              CREATE INDEX IF NOT EXISTS idx_exchanges_ts ON exchanges(ts_unix);
              CREATE TABLE IF NOT EXISTS ingest_state (
                file   TEXT PRIMARY KEY,
                offset INTEGER NOT NULL
              );",
+        )?;
+        migrate(&conn)?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_exchanges_session ON exchanges(session_key);
+             CREATE INDEX IF NOT EXISTS idx_exchanges_updated ON exchanges(updated_at);",
         )?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
@@ -68,4 +76,27 @@ impl Db {
         let guard = self.0.lock().expect("lens db mutex poisoned");
         work(&guard)
     }
+}
+
+/// Adds columns introduced after the first release to databases created by
+/// older lens builds. SQLite has no ADD COLUMN IF NOT EXISTS, so consult
+/// pragma table_info first.
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let mut statement = conn.prepare("PRAGMA table_info(exchanges)")?;
+    let existing = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, definition) in [
+        ("session_key", "session_key TEXT"),
+        ("session_hint", "session_hint TEXT"),
+        ("updated_at", "updated_at INTEGER"),
+    ] {
+        if !existing.iter().any(|column| column == name) {
+            conn.execute(
+                &format!("ALTER TABLE exchanges ADD COLUMN {definition}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
 }

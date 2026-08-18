@@ -8,6 +8,8 @@ mod api;
 mod db;
 mod derive;
 mod ingest;
+mod pricing;
+mod session;
 
 #[tokio::main]
 async fn main() {
@@ -39,7 +41,19 @@ async fn main() {
     let ingest_db = db.clone();
     std::thread::spawn(move || ingest::run(ingest_db, log_dir));
 
-    let app = api::build_app(Arc::new(api::LensState { db }));
+    let access_token = std::env::var("LENS_ACCESS_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if access_token.is_some() {
+        info!("dashboard access token required (LENS_ACCESS_TOKEN)");
+    } else {
+        info!("dashboard access token disabled — anyone who can reach the port sees full prompts");
+    }
+    let app = api::build_app(Arc::new(api::LensState {
+        db,
+        pricing: pricing::PricingTable::from_env(),
+        access_token,
+    }));
     let listener = TcpListener::bind((host.as_str(), port))
         .await
         .unwrap_or_else(|error| panic!("bind {host}:{port}: {error}"));

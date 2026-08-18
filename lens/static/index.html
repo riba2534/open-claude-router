@@ -130,6 +130,15 @@ pre.code { background:var(--code-bg); border:1px solid var(--line); border-radiu
 .sse-row .ev { color:var(--accent-ink); font-weight:600; font-size:11.5px; white-space:nowrap; }
 .sse-row .sum { color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
 .empty { color:var(--muted); text-align:center; padding:40px 0; font-size:13px; }
+.live-dot { width:8px; height:8px; border-radius:50%; background:var(--muted); display:inline-block; transition:background .3s; }
+.live-dot.on { background:var(--good); box-shadow:0 0 0 3px var(--good-soft); }
+.overlay { position:fixed; inset:0; background:rgba(23,35,46,.45); display:flex; align-items:center; justify-content:center; z-index:50; }
+.overlay .box { background:var(--surface); border-radius:16px; box-shadow:var(--shadow-lg); padding:28px 32px; max-width:520px; width:92%; }
+.overlay h3 { margin:0 0 6px; font-size:17px; }
+.overlay p { color:var(--muted); font-size:13px; margin:0 0 14px; }
+.overlay input[type=password], .overlay input[type=text] { width:100%; box-sizing:border-box; padding:9px 12px; border:1px solid var(--line); border-radius:8px; font-size:14px; margin-bottom:12px; background:var(--surface); color:var(--ink); }
+.overlay textarea { width:100%; box-sizing:border-box; height:200px; padding:10px 12px; border:1px solid var(--line); border-radius:8px; font-family:var(--mono); font-size:11.5px; background:var(--code-bg); color:var(--ink); white-space:pre; overflow:auto; margin-bottom:12px; }
+.overlay .row { display:flex; gap:10px; justify-content:flex-end; }
 .err-note { background:var(--bad-soft); color:var(--bad); border-radius:7px; padding:8px 12px; font-size:12.5px; margin-bottom:8px; overflow-wrap:anywhere; }
 .warn-note { background:var(--warn-soft); color:var(--warn); border-radius:7px; padding:8px 12px; font-size:12.5px; margin-bottom:8px; }
 h2.vh { font-size:18px; margin:6px 0 14px; }
@@ -141,8 +150,10 @@ h2.vh { font-size:18px; margin:6px 0 14px; }
   <nav class="nav">
     <a href="#/" id="nav-overview">总览</a>
     <a href="#/requests" id="nav-requests">请求</a>
+    <a href="#/sessions" id="nav-sessions">会话</a>
   </nav>
   <span class="spacer"></span>
+  <span class="live-dot" id="live-dot" title="实时流连接状态"></span>
   <label>时间窗
     <select id="hours">
       <option value="1">1 小时</option>
@@ -152,7 +163,7 @@ h2.vh { font-size:18px; margin:6px 0 14px; }
       <option value="720">30 天</option>
     </select>
   </label>
-  <label><input type="checkbox" id="auto" checked> 自动刷新 5s</label>
+  <label><input type="checkbox" id="auto" checked> 自动刷新</label>
   <button class="btn ghost" id="refresh">刷新</button>
 </div>
 <div class="wrap" id="view"></div>
@@ -172,7 +183,82 @@ const fmtBytes = n => n == null ? "–" : n >= 1048576 ? (n/1048576).toFixed(1)+
 const fmtTime = ts => { if(!ts) return "–"; const d = new Date(ts); return d.toLocaleString("zh-CN",{hour12:false,month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}); };
 const shortId = id => id ? id.slice(0,8) : "–";
 const pretty = v => { try { return JSON.stringify(typeof v === "string" ? JSON.parse(v) : v, null, 2); } catch { return String(v); } };
-async function api(path){ const r = await fetch(path); if(!r.ok) throw new Error(path+" -> "+r.status); return r.json(); }
+const fmtUSD = v => {
+  if(v == null) return "–";
+  if(v === 0) return "$0";
+  if(v < 0.01) return "$" + v.toFixed(5).replace(/0+$/,"").replace(/\.$/,"");
+  if(v < 1) return "$" + v.toFixed(4).replace(/0+$/,"").replace(/\.$/,"");
+  return "$" + v.toFixed(2);
+};
+const fmtDur = s => { if(s == null) return "–"; if(s < 60) return s + "s"; if(s < 3600) return Math.round(s/60) + "m"; return (s/3600).toFixed(1) + "h"; };
+const getToken = () => localStorage.getItem("lens_token") || "";
+async function api(path){
+  const r = await fetch(path, {headers: getToken() ? {"X-Lens-Token": getToken()} : {}});
+  if(r.status === 401){ showLogin(); throw new Error("需要访问令牌"); }
+  if(!r.ok) throw new Error(path + " -> " + r.status);
+  return r.json();
+}
+
+/* ---------- auth overlay ---------- */
+function showLogin(){
+  if(document.getElementById("login-overlay")) return;
+  const div = document.createElement("div");
+  div.className = "overlay"; div.id = "login-overlay";
+  div.innerHTML = `<div class="box">
+    <h3>需要访问令牌</h3>
+    <p>该看板已启用鉴权（LENS_ACCESS_TOKEN）。输入令牌后保存在本浏览器。</p>
+    <input type="password" id="login-token" placeholder="访问令牌" autofocus>
+    <div class="row"><button class="btn" id="login-go">进入</button></div>
+  </div>`;
+  document.body.appendChild(div);
+  const submit = () => {
+    localStorage.setItem("lens_token", document.getElementById("login-token").value.trim());
+    div.remove(); connectStream(true); route();
+  };
+  document.getElementById("login-go").onclick = submit;
+  document.getElementById("login-token").onkeydown = e => { if(e.key === "Enter") submit(); };
+}
+
+/* ---------- clipboard modal (clipboard API needs https; show selectable fallback) ---------- */
+function showCopyModal(title, text){
+  const div = document.createElement("div");
+  div.className = "overlay";
+  div.innerHTML = `<div class="box" style="max-width:760px">
+    <h3>${esc(title)}</h3>
+    <textarea readonly id="copy-text"></textarea>
+    <div class="row"><button class="btn ghost" id="copy-close">关闭</button><button class="btn" id="copy-do">复制</button></div>
+  </div>`;
+  document.body.appendChild(div);
+  const area = div.querySelector("#copy-text");
+  area.value = text;
+  div.querySelector("#copy-close").onclick = () => div.remove();
+  div.addEventListener("click", e => { if(e.target === div) div.remove(); });
+  div.querySelector("#copy-do").onclick = async () => {
+    area.select();
+    let ok = false;
+    try { await navigator.clipboard.writeText(text); ok = true; } catch {}
+    if(!ok){ try { ok = document.execCommand("copy"); } catch {} }
+    div.querySelector("#copy-do").textContent = ok ? "已复制 ✓" : "复制失败，请手动全选";
+  };
+}
+
+/* ---------- live stream (SSE) ---------- */
+let es = null, streamTimer = null;
+function connectStream(force){
+  if(es && !force) return;
+  if(es){ es.close(); es = null; }
+  const dot = document.getElementById("live-dot");
+  const url = "/api/stream" + (getToken() ? "?token=" + encodeURIComponent(getToken()) : "");
+  try { es = new EventSource(url); } catch { return; }
+  es.onopen = () => dot.classList.add("on");
+  es.onerror = () => { dot.classList.remove("on"); };
+  es.onmessage = () => {
+    // 收到任何新事件：对当前列表类视图做去抖重渲染（详情页不动）
+    if((location.hash || "#/").startsWith("#/r/")) return;
+    clearTimeout(streamTimer);
+    streamTimer = setTimeout(route, 400);
+  };
+}
 
 function outcomeChip(row){
   const o = row.outcome || "pending";
@@ -246,6 +332,7 @@ async function renderOverview(){
       <div class="card"><div class="k">时延 P50 / P95</div><div class="v">${fmtMs(d.latency.p50)}</div><div class="s">P95 ${fmtMs(d.latency.p95)} · P99 ${fmtMs(d.latency.p99)}</div></div>
       <div class="card"><div class="k">输入 tokens</div><div class="v">${fmtInt(t.input_tokens)}</div><div class="s">cached ${fmtInt(t.cached_tokens)}</div></div>
       <div class="card"><div class="k">输出 tokens</div><div class="v">${fmtInt(t.output_tokens)}</div><div class="s">reasoning ${fmtInt(t.reasoning_tokens)}</div></div>
+      <div class="card"><div class="k">估算费用</div><div class="v">${fmtUSD(t.cost_usd)}</div><div class="s">缓存节省 ${fmtUSD(t.cache_savings_usd)}</div></div>
     </div>
     <div class="panel"><h3>请求量（每 ${d.bucket_seconds >= 3600 ? d.bucket_seconds/3600+" 小时" : d.bucket_seconds/60+" 分钟"}）</h3>
       ${stackChart(d.series, ["ok","error","cancelled"], [cGood, cBad, cWarn], 150, d.hours)}
@@ -257,8 +344,8 @@ async function renderOverview(){
     </div>
     <div class="grid2">
       <div class="panel"><h3>按模型</h3><div class="tbl-scroll"><table class="data">
-        <tr><th>模型</th><th>请求</th><th>in / out tokens</th><th>均耗时</th><th>错误</th><th>取消</th></tr>
-        ${d.by_model.map(m => `<tr><td class="mono">${esc(m.model)}</td><td class="num">${fmtInt(m.count)}</td><td class="num">${fmtInt(m.input_tokens)} / ${fmtInt(m.output_tokens)}</td><td class="num">${fmtMs(m.avg_ms)}</td><td class="num">${fmtInt(m.errors)}</td><td class="num">${fmtInt(m.cancelled)}</td></tr>`).join("") || `<tr><td colspan="6" class="empty">无数据</td></tr>`}
+        <tr><th>模型</th><th>请求</th><th>in / out tokens</th><th>费用</th><th>均耗时</th><th>错误</th><th>取消</th></tr>
+        ${d.by_model.map(m => `<tr><td class="mono">${esc(m.model)}</td><td class="num">${fmtInt(m.count)}</td><td class="num">${fmtInt(m.input_tokens)} / ${fmtInt(m.output_tokens)}</td><td class="num">${fmtUSD(m.cost_usd)}</td><td class="num">${fmtMs(m.avg_ms)}</td><td class="num">${fmtInt(m.errors)}</td><td class="num">${fmtInt(m.cancelled)}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">无数据</td></tr>`}
       </table></div></div>
       <div class="panel"><h3>状态码 / 调用方</h3><div class="tbl-scroll"><table class="data">
         <tr><th>HTTP 状态</th><th>次数</th></tr>
@@ -291,7 +378,7 @@ async function renderList(){
       <span class="muted num">共 ${fmtInt(d.total)} 条</span>
     </div>
     <div class="panel" style="padding:6px 10px"><div class="tbl-scroll"><table class="data">
-      <tr><th>时间</th><th>id</th><th>模型</th><th>协议</th><th>结果</th><th>耗时</th><th>in/out tk</th><th>大小</th><th>预览</th></tr>
+      <tr><th>时间</th><th>id</th><th>模型</th><th>协议</th><th>结果</th><th>耗时</th><th>in/out tk</th><th>费用</th><th>大小</th><th>预览</th></tr>
       ${d.rows.map(r => `<tr class="row" data-id="${esc(r.request_id)}">
         <td class="num" style="white-space:nowrap">${fmtTime(r.ts)}</td>
         <td class="mono">${shortId(r.request_id)}</td>
@@ -300,9 +387,10 @@ async function renderList(){
         <td>${outcomeChip(r)}</td>
         <td class="num">${fmtMs(r.duration_ms)}</td>
         <td class="num">${r.input_tokens != null ? fmtInt(r.input_tokens)+" / "+fmtInt(r.output_tokens) : "–"}</td>
+        <td class="num">${fmtUSD(r.cost_usd)}</td>
         <td class="num" style="white-space:nowrap">${fmtBytes(r.req_bytes)} → ${fmtBytes(r.resp_bytes)}</td>
-        <td class="muted" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.preview || "")}</td>
-      </tr>`).join("") || `<tr><td colspan="9"><div class="empty">窗口内没有请求。向 Router 发几条流量后这里会自动出现。</div></td></tr>`}
+        <td class="muted" style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.preview || "")}</td>
+      </tr>`).join("") || `<tr><td colspan="10"><div class="empty">窗口内没有请求。向 Router 发几条流量后这里会自动出现。</div></td></tr>`}
     </table></div></div>
     <div class="pager">
       <button class="btn ghost" id="pg-prev" ${listState.offset<=0?"disabled":""}>上一页</button>
@@ -315,6 +403,67 @@ async function renderList(){
   document.getElementById("pg-prev").onclick = () => { listState.offset = Math.max(0, listState.offset - 50); renderList(); };
   document.getElementById("pg-next").onclick = () => { listState.offset += 50; renderList(); };
   $view.querySelectorAll("tr.row").forEach(tr => tr.onclick = () => { location.hash = "#/r/" + tr.dataset.id; });
+}
+
+/* ---------- sessions ---------- */
+async function renderSessions(){
+  const hours = $hours.value;
+  const d = await api(`/api/sessions?hours=${hours}`);
+  $view.innerHTML = `
+    <div class="panel" style="padding:6px 10px"><div class="tbl-scroll"><table class="data">
+      <tr><th>最近活动</th><th>首条消息</th><th>请求</th><th>结果</th><th>时长</th><th>in/out tk</th><th>费用</th><th>模型</th><th>client</th></tr>
+      ${d.sessions.map(s => {
+        const span = Math.max(0, s.last_unix - s.first_unix);
+        return `<tr class="row" data-key="${esc(s.session_key)}">
+          <td class="num" style="white-space:nowrap">${fmtTime(s.last_ts)}</td>
+          <td style="max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.hint || "(无首条消息)")}</td>
+          <td class="num">${fmtInt(s.count)}</td>
+          <td><span class="chip good">${s.ok}</span>${s.errors ? ` <span class="chip bad">${s.errors}</span>` : ""}${s.cancelled ? ` <span class="chip warn">${s.cancelled}</span>` : ""}</td>
+          <td class="num">${fmtDur(span)}<span class="muted" style="font-size:11px"> · 模型 ${fmtDur(Math.round((s.model_ms||0)/1000))}</span></td>
+          <td class="num">${fmtInt(s.input_tokens)} / ${fmtInt(s.output_tokens)}</td>
+          <td class="num">${fmtUSD(s.cost_usd)}</td>
+          <td class="mono" style="font-size:11.5px">${esc(s.models || "–")}</td>
+          <td class="mono">${esc(s.client_ip || "–")}</td>
+        </tr>`;
+      }).join("") || `<tr><td colspan="9"><div class="empty">窗口内没有会话。同一客户端、同一 system 提示词、同一开场消息的连续请求会被归为一个会话。</div></td></tr>`}
+    </table></div></div>
+    <p class="muted" style="font-size:12.5px">会话按（client_ip + system 提示词 + 首条 user 消息）哈希归并——一次 Claude Code 任务的几十个连续请求会聚成一行。</p>`;
+  $view.querySelectorAll("tr.row").forEach(tr => tr.onclick = () => { location.hash = "#/s/" + tr.dataset.key; });
+}
+
+async function renderSessionDetail(key){
+  const hours = $hours.value;
+  const [list, sessions] = await Promise.all([
+    api(`/api/requests?hours=${hours}&limit=500&session=${encodeURIComponent(key)}`),
+    api(`/api/sessions?hours=${hours}`),
+  ]);
+  const s = sessions.sessions.find(x => x.session_key === key);
+  const rows = list.rows.slice().reverse(); // 会话内按时间正序
+  $view.innerHTML = `
+    <h2 class="vh"><a href="#/sessions">← 会话列表</a></h2>
+    ${s ? `<div class="meta-bar">
+      <span class="muted">session</span><span>${esc(key)}</span>
+      <span class="num">${fmtInt(s.count)} 次请求</span>
+      <span class="num">${fmtTime(s.first_ts)} → ${fmtTime(s.last_ts)}</span>
+      <span class="num">tokens ${fmtInt(s.input_tokens)} / ${fmtInt(s.output_tokens)}</span>
+      <span class="num">费用 ${fmtUSD(s.cost_usd)}</span>
+      <span class="mono muted">${esc(s.models || "")}</span>
+    </div>
+    <div class="panel" style="padding:12px 18px"><b style="font-size:13.5px">首条消息：</b><span class="muted">${esc(s.hint || "")}</span></div>` : ""}
+    <div class="panel" style="padding:6px 10px"><div class="tbl-scroll"><table class="data">
+      <tr><th>#</th><th>时间</th><th>协议</th><th>结果</th><th>耗时</th><th>in/out tk</th><th>费用</th><th>预览</th></tr>
+      ${rows.map((r, i) => `<tr class="row" data-id="${esc(r.request_id)}">
+        <td class="num muted">${i + 1}</td>
+        <td class="num" style="white-space:nowrap">${fmtTime(r.ts)}</td>
+        <td>${fmtChip(r.format)}${streamChip(r.stream)}</td>
+        <td>${outcomeChip(r)}</td>
+        <td class="num">${fmtMs(r.duration_ms)}</td>
+        <td class="num">${r.input_tokens != null ? fmtInt(r.input_tokens)+" / "+fmtInt(r.output_tokens) : "–"}</td>
+        <td class="num">${fmtUSD(r.cost_usd)}</td>
+        <td class="muted" style="max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.preview || r.cancel_stage || "")}</td>
+      </tr>`).join("")}
+    </table></div></div>`;
+  $view.querySelectorAll("tr.row[data-id]").forEach(tr => tr.onclick = () => { location.hash = "#/r/" + tr.dataset.id; });
 }
 
 /* ---------- request reconstruction ---------- */
@@ -539,9 +688,12 @@ async function renderDetail(id){
       ${outcomeChip(d)}
       <span class="chip ${d.route_mode === "header" ? "dim" : "warn"}">${esc(d.route_mode || "")}</span>
       <span class="num">${fmtMs(d.duration_ms)}</span>
+      <span class="num">${fmtUSD(d.cost_usd)}</span>
       <span class="mono muted">${esc(d.model || "")}</span>
       <span class="mono muted">${esc(d.client_ip || "")} → ${esc((d.upstream_url || "").replace(/^https?:\/\//, ""))}</span>
       <span class="num muted">${fmtTime(d.ts)}</span>
+      ${d.session_key ? `<a href="#/s/${esc(d.session_key)}" class="chip info">↗ 所属会话</a>` : ""}
+      <button class="btn ghost" id="replay-curl" style="padding:3px 12px;font-size:12px">重放 curl</button>
     </div>
     <div class="detail-grid">
       <div>
@@ -573,6 +725,23 @@ async function renderDetail(id){
       </div>
     </div>`;
   activateTabs($view);
+  const replay = document.getElementById("replay-curl");
+  if(replay) replay.onclick = () => {
+    if(!d.req_body || !d.upstream_url){
+      showCopyModal("无法生成重放命令", "该请求缺少已记录的正文或上游地址（metadata 模式或截断）。");
+      return;
+    }
+    const body = d.req_body.replace(/'/g, "'\\''");
+    const command = [
+      "# 重放发往模型网关的原始请求（先 export UPSTREAM_TOKEN=<上游鉴权值>）",
+      `curl -N '${d.upstream_url}' \\`,
+      "  -H 'content-type: application/json' \\",
+      "  -H 'accept: application/json, text/event-stream' \\",
+      '  -H "authorization: $UPSTREAM_TOKEN" \\',
+      `  --data-raw '${body}'`,
+    ].join("\n");
+    showCopyModal("重放上游请求", command);
+  };
 }
 
 /* ---------- router ---------- */
@@ -580,14 +749,19 @@ async function route(){
   const hash = location.hash || "#/";
   document.getElementById("nav-overview").classList.toggle("on", hash === "#/" || hash === "");
   document.getElementById("nav-requests").classList.toggle("on", hash.startsWith("#/requests") || hash.startsWith("#/r/"));
+  document.getElementById("nav-sessions").classList.toggle("on", hash.startsWith("#/sessions") || hash.startsWith("#/s/"));
   try {
     if(hash.startsWith("#/r/")) await renderDetail(hash.slice(4));
     else if(hash.startsWith("#/requests")) await renderList();
+    else if(hash.startsWith("#/s/")) await renderSessionDetail(hash.slice(4));
+    else if(hash.startsWith("#/sessions")) await renderSessions();
     else await renderOverview();
   } catch(err) {
-    $view.innerHTML = `<div class="err-note">加载失败：${esc(err.message)}</div>`;
+    if(!document.getElementById("login-overlay"))
+      $view.innerHTML = `<div class="err-note">加载失败：${esc(err.message)}</div>`;
   }
 }
+// SSE 是主要的实时通道；轮询降级为 15s 兜底（SSE 断开时仍能更新）
 function schedule(){
   if(timer) clearInterval(timer);
   timer = setInterval(() => {
@@ -595,12 +769,12 @@ function schedule(){
     const hash = location.hash || "#/";
     if(hash.startsWith("#/r/")) return; // 详情页不自动刷新
     route();
-  }, 5000);
+  }, 15000);
 }
 window.addEventListener("hashchange", route);
 $hours.addEventListener("change", route);
 document.getElementById("refresh").addEventListener("click", route);
-route(); schedule();
+route(); schedule(); connectStream();
 </script>
 </body>
 </html>

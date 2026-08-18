@@ -1,30 +1,75 @@
-use std::sync::Arc;
+use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{StatusCode, header},
-    response::{IntoResponse, Response},
+    middleware::{self, Next},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::get,
 };
 use rusqlite::{Connection, params_from_iter, types::Value as SqlValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio_stream::wrappers::ReceiverStream;
 
-use crate::db::Db;
+use crate::{db::Db, pricing::PricingTable};
 
 pub struct LensState {
     pub db: Db,
+    pub pricing: PricingTable,
+    pub access_token: Option<String>,
 }
 
 pub fn build_app(state: Arc<LensState>) -> Router {
-    Router::new()
-        .route("/", get(index))
-        .route("/healthz", get(|| async { Json(json!({"status":"ok"})) }))
+    let api = Router::new()
         .route("/api/overview", get(overview))
         .route("/api/requests", get(list_requests))
         .route("/api/requests/{id}", get(request_detail))
+        .route("/api/sessions", get(list_sessions))
+        .route("/api/stream", get(stream))
+        .layer(middleware::from_fn_with_state(state.clone(), require_token))
+        .with_state(state.clone());
+    Router::new()
+        .route("/", get(index))
+        .route("/healthz", get(|| async { Json(json!({"status":"ok"})) }))
+        .merge(api)
         .with_state(state)
+}
+
+/// The static shell is public; every data endpoint requires the token when
+/// LENS_ACCESS_TOKEN is configured. EventSource cannot set headers, so the
+/// token is also accepted as a `token` query parameter.
+async fn require_token(
+    State(state): State<Arc<LensState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = state.access_token.as_deref() else {
+        return next.run(request).await;
+    };
+    let from_header = request
+        .headers()
+        .get("x-lens-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let from_query = request.uri().query().and_then(|query| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("token=").map(str::to_owned))
+    });
+    if from_header.as_deref() == Some(expected) || from_query.as_deref() == Some(expected) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"unauthorized","message":"missing or invalid access token"})),
+        )
+            .into_response()
+    }
 }
 
 async fn index() -> Response {
@@ -47,6 +92,7 @@ struct ListParams {
     offset: Option<i64>,
     model: Option<String>,
     outcome: Option<String>,
+    session: Option<String>,
     q: Option<String>,
 }
 
@@ -54,39 +100,114 @@ async fn overview(
     State(state): State<Arc<LensState>>,
     Query(params): Query<OverviewParams>,
 ) -> Result<Json<Value>, ApiFailure> {
-    let db = state.db.clone();
     let hours = params.hours.unwrap_or(24).clamp(1, 24 * 90);
-    run_query(move || db.with(|conn| build_overview(conn, hours))).await
+    run_query(state.clone(), move |conn, pricing| {
+        build_overview(conn, pricing, hours)
+    })
+    .await
 }
 
 async fn list_requests(
     State(state): State<Arc<LensState>>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Value>, ApiFailure> {
-    let db = state.db.clone();
-    run_query(move || db.with(|conn| build_list(conn, &params))).await
+    run_query(state.clone(), move |conn, pricing| {
+        build_list(conn, pricing, &params)
+    })
+    .await
+}
+
+async fn list_sessions(
+    State(state): State<Arc<LensState>>,
+    Query(params): Query<OverviewParams>,
+) -> Result<Json<Value>, ApiFailure> {
+    let hours = params.hours.unwrap_or(24).clamp(1, 24 * 90);
+    run_query(state.clone(), move |conn, pricing| {
+        build_sessions(conn, pricing, hours)
+    })
+    .await
 }
 
 async fn request_detail(
     State(state): State<Arc<LensState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiFailure> {
-    let db = state.db.clone();
-    let found = run_query(move || db.with(|conn| build_detail(conn, &id))).await?;
+    let found = run_query(state.clone(), move |conn, pricing| {
+        build_detail(conn, pricing, &id)
+    })
+    .await?;
     match found.0 {
         Value::Null => Err(ApiFailure::NotFound),
         value => Ok(Json(value)),
     }
 }
 
+/// Server-sent events: emits a summary row whenever an exchange is inserted or
+/// reaches a terminal state, by polling the updated_at column. Each connection
+/// keeps its own cursor and change cache.
+async fn stream(State(state): State<Arc<LensState>>) -> impl IntoResponse {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+    tokio::spawn(async move {
+        let mut cursor = chrono::Utc::now().timestamp();
+        let mut seen: HashMap<String, String> = HashMap::new();
+        loop {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let since = cursor - 1;
+            let rows = state.db.with(|conn| {
+                collect_rows(
+                    conn,
+                    &format!(
+                        "SELECT {SUMMARY_COLUMNS}, updated_at FROM exchanges
+                         WHERE updated_at >= ? ORDER BY updated_at ASC LIMIT 200"
+                    ),
+                    &[SqlValue::from(since)],
+                    |row| summary_row(row, &state.pricing),
+                )
+            });
+            let Ok(Value::Array(rows)) = rows else {
+                continue;
+            };
+            for row in rows {
+                if let Some(updated) = row.get("updated_at").and_then(Value::as_i64)
+                    && updated > cursor
+                {
+                    cursor = updated;
+                }
+                let id = row
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let fingerprint = row.to_string();
+                if seen.get(&id) == Some(&fingerprint) {
+                    continue;
+                }
+                seen.insert(id, fingerprint);
+                if seen.len() > 1000 {
+                    seen.clear();
+                }
+                let event = Event::default().json_data(&row).unwrap_or_default();
+                if tx.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
 async fn run_query(
-    work: impl FnOnce() -> rusqlite::Result<Value> + Send + 'static,
+    state: Arc<LensState>,
+    work: impl FnOnce(&Connection, &PricingTable) -> rusqlite::Result<Value> + Send + 'static,
 ) -> Result<Json<Value>, ApiFailure> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|error| ApiFailure::Internal(error.to_string()))?
-        .map(Json)
-        .map_err(|error| ApiFailure::Internal(error.to_string()))
+    tokio::task::spawn_blocking(move || {
+        let pricing = &state.pricing;
+        state.db.with(|conn| work(conn, pricing))
+    })
+    .await
+    .map_err(|error| ApiFailure::Internal(error.to_string()))?
+    .map(Json)
+    .map_err(|error| ApiFailure::Internal(error.to_string()))
 }
 
 enum ApiFailure {
@@ -113,7 +234,71 @@ fn since_unix(hours: i64) -> i64 {
     chrono::Utc::now().timestamp() - hours * 3600
 }
 
-fn build_overview(conn: &Connection, hours: i64) -> rusqlite::Result<Value> {
+fn cost_for(
+    pricing: &PricingTable,
+    model: Option<&str>,
+    input: Option<i64>,
+    output: Option<i64>,
+    cached: Option<i64>,
+    reasoning: Option<i64>,
+) -> Option<f64> {
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    Some(pricing.estimate_usd(
+        model.unwrap_or_default(),
+        input.unwrap_or(0),
+        output.unwrap_or(0),
+        cached.unwrap_or(0),
+        reasoning.unwrap_or(0),
+    ))
+}
+
+const SUMMARY_COLUMNS: &str = "request_id, ts, model, format, stream, outcome, status, duration_ms,
+    input_tokens, output_tokens, cached_tokens, reasoning_tokens, preview, client_ip, route_mode,
+    finish_reason, req_bytes, resp_bytes, cancel_stage, protocol_complete, session_key";
+
+fn summary_row(row: &rusqlite::Row<'_>, pricing: &PricingTable) -> rusqlite::Result<Value> {
+    let model = row.get::<_, Option<String>>(2)?;
+    let input = row.get::<_, Option<i64>>(8)?;
+    let output = row.get::<_, Option<i64>>(9)?;
+    let cached = row.get::<_, Option<i64>>(10)?;
+    let reasoning = row.get::<_, Option<i64>>(11)?;
+    let cost = cost_for(pricing, model.as_deref(), input, output, cached, reasoning);
+    let mut value = json!({
+        "request_id": row.get::<_, String>(0)?,
+        "ts": row.get::<_, Option<String>>(1)?,
+        "model": model,
+        "format": row.get::<_, Option<String>>(3)?,
+        "stream": row.get::<_, Option<i64>>(4)?,
+        "outcome": row.get::<_, Option<String>>(5)?,
+        "status": row.get::<_, Option<i64>>(6)?,
+        "duration_ms": row.get::<_, Option<i64>>(7)?,
+        "input_tokens": input,
+        "output_tokens": output,
+        "preview": row.get::<_, Option<String>>(12)?,
+        "client_ip": row.get::<_, Option<String>>(13)?,
+        "route_mode": row.get::<_, Option<String>>(14)?,
+        "finish_reason": row.get::<_, Option<String>>(15)?,
+        "req_bytes": row.get::<_, Option<i64>>(16)?,
+        "resp_bytes": row.get::<_, Option<i64>>(17)?,
+        "cancel_stage": row.get::<_, Option<String>>(18)?,
+        "protocol_complete": row.get::<_, Option<i64>>(19)?,
+        "session_key": row.get::<_, Option<String>>(20)?,
+        "cost_usd": cost,
+    });
+    // The stream query appends updated_at after the summary columns.
+    if let Ok(updated) = row.get::<_, Option<i64>>(21) {
+        value["updated_at"] = json!(updated);
+    }
+    Ok(value)
+}
+
+fn build_overview(
+    conn: &Connection,
+    pricing: &PricingTable,
+    hours: i64,
+) -> rusqlite::Result<Value> {
     let since = since_unix(hours);
     let bucket: i64 = match hours {
         ..=2 => 60,
@@ -122,7 +307,7 @@ fn build_overview(conn: &Connection, hours: i64) -> rusqlite::Result<Value> {
         _ => 3600,
     };
 
-    let totals = conn.query_row(
+    let mut totals = conn.query_row(
         "SELECT COUNT(*),
                 SUM(outcome = 'ok'), SUM(outcome = 'http_error'),
                 SUM(outcome = 'transport_error'), SUM(outcome = 'cancelled'), SUM(outcome = 'pending'),
@@ -189,27 +374,51 @@ fn build_overview(conn: &Connection, hours: i64) -> rusqlite::Result<Value> {
         },
     )?;
 
-    let by_model = collect_rows(
-        conn,
-        "SELECT COALESCE(model,'(unknown)'), COUNT(*),
-                COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                CAST(AVG(CASE WHEN outcome='ok' THEN duration_ms END) AS INTEGER),
-                SUM(outcome IN ('http_error','transport_error')),
-                SUM(outcome = 'cancelled')
-         FROM exchanges WHERE ts_unix >= ?1 GROUP BY 1 ORDER BY 2 DESC LIMIT 20",
-        &[SqlValue::from(since)],
-        |row| {
-            Ok(json!({
-                "model": row.get::<_, String>(0)?,
-                "count": row.get::<_, i64>(1)?,
-                "input_tokens": row.get::<_, i64>(2)?,
-                "output_tokens": row.get::<_, i64>(3)?,
-                "avg_ms": row.get::<_, Option<i64>>(4)?,
-                "errors": row.get::<_, Option<i64>>(5)?.unwrap_or(0),
-                "cancelled": row.get::<_, Option<i64>>(6)?.unwrap_or(0),
-            }))
-        },
-    )?;
+    let mut total_cost = 0.0;
+    let mut total_savings = 0.0;
+    let by_model = {
+        let mut statement = conn.prepare(
+            "SELECT COALESCE(model,'(unknown)'), COUNT(*),
+                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(cached_tokens),0), COALESCE(SUM(reasoning_tokens),0),
+                    CAST(AVG(CASE WHEN outcome='ok' THEN duration_ms END) AS INTEGER),
+                    SUM(outcome IN ('http_error','transport_error')),
+                    SUM(outcome = 'cancelled')
+             FROM exchanges WHERE ts_unix >= ?1 GROUP BY 1 ORDER BY 2 DESC LIMIT 20",
+        )?;
+        let rows = statement
+            .query_map([since], |row| {
+                let model: String = row.get(0)?;
+                let input: i64 = row.get(2)?;
+                let output: i64 = row.get(3)?;
+                let cached: i64 = row.get(4)?;
+                let reasoning: i64 = row.get(5)?;
+                let cost = pricing.estimate_usd(&model, input, output, cached, reasoning);
+                let savings = pricing.cache_savings_usd(&model, cached);
+                Ok(json!({
+                    "model": model,
+                    "count": row.get::<_, i64>(1)?,
+                    "input_tokens": input,
+                    "output_tokens": output,
+                    "avg_ms": row.get::<_, Option<i64>>(6)?,
+                    "errors": row.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                    "cancelled": row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                    "cost_usd": cost,
+                    "cache_savings_usd": savings,
+                }))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for row in &rows {
+            total_cost += row.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
+            total_savings += row
+                .get("cache_savings_usd")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+        }
+        Value::Array(rows)
+    };
+    totals["cost_usd"] = json!(total_cost);
+    totals["cache_savings_usd"] = json!(total_savings);
 
     let by_status = collect_rows(
         conn,
@@ -250,7 +459,11 @@ fn build_overview(conn: &Connection, hours: i64) -> rusqlite::Result<Value> {
     }))
 }
 
-fn build_list(conn: &Connection, params: &ListParams) -> rusqlite::Result<Value> {
+fn build_list(
+    conn: &Connection,
+    pricing: &PricingTable,
+    params: &ListParams,
+) -> rusqlite::Result<Value> {
     let hours = params.hours.unwrap_or(24).clamp(1, 24 * 90);
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
     let offset = params.offset.unwrap_or(0).max(0);
@@ -264,6 +477,10 @@ fn build_list(conn: &Connection, params: &ListParams) -> rusqlite::Result<Value>
     if let Some(outcome) = params.outcome.as_deref().filter(|value| !value.is_empty()) {
         clauses.push("outcome = ?".into());
         values.push(SqlValue::from(outcome.to_owned()));
+    }
+    if let Some(session) = params.session.as_deref().filter(|value| !value.is_empty()) {
+        clauses.push("session_key = ?".into());
+        values.push(SqlValue::from(session.to_owned()));
     }
     if let Some(term) = params.q.as_deref().filter(|value| !value.is_empty()) {
         clauses.push("(request_id LIKE ? OR preview LIKE ? OR req_body LIKE ?)".into());
@@ -285,35 +502,11 @@ fn build_list(conn: &Connection, params: &ListParams) -> rusqlite::Result<Value>
     let rows = collect_rows(
         conn,
         &format!(
-            "SELECT request_id, ts, model, format, stream, outcome, status, duration_ms,
-                    input_tokens, output_tokens, preview, client_ip, route_mode, finish_reason,
-                    req_bytes, resp_bytes, cancel_stage, protocol_complete
-             FROM exchanges WHERE {where_clause}
+            "SELECT {SUMMARY_COLUMNS} FROM exchanges WHERE {where_clause}
              ORDER BY ts_unix DESC, request_id DESC LIMIT ? OFFSET ?"
         ),
         &values,
-        |row| {
-            Ok(json!({
-                "request_id": row.get::<_, String>(0)?,
-                "ts": row.get::<_, Option<String>>(1)?,
-                "model": row.get::<_, Option<String>>(2)?,
-                "format": row.get::<_, Option<String>>(3)?,
-                "stream": row.get::<_, Option<i64>>(4)?,
-                "outcome": row.get::<_, Option<String>>(5)?,
-                "status": row.get::<_, Option<i64>>(6)?,
-                "duration_ms": row.get::<_, Option<i64>>(7)?,
-                "input_tokens": row.get::<_, Option<i64>>(8)?,
-                "output_tokens": row.get::<_, Option<i64>>(9)?,
-                "preview": row.get::<_, Option<String>>(10)?,
-                "client_ip": row.get::<_, Option<String>>(11)?,
-                "route_mode": row.get::<_, Option<String>>(12)?,
-                "finish_reason": row.get::<_, Option<String>>(13)?,
-                "req_bytes": row.get::<_, Option<i64>>(14)?,
-                "resp_bytes": row.get::<_, Option<i64>>(15)?,
-                "cancel_stage": row.get::<_, Option<String>>(16)?,
-                "protocol_complete": row.get::<_, Option<i64>>(17)?,
-            }))
-        },
+        |row| summary_row(row, pricing),
     )?;
 
     let models = collect_rows(
@@ -326,26 +519,103 @@ fn build_list(conn: &Connection, params: &ListParams) -> rusqlite::Result<Value>
     Ok(json!({"total": total, "rows": rows, "models": models}))
 }
 
-fn build_detail(conn: &Connection, id: &str) -> rusqlite::Result<Value> {
+fn build_sessions(
+    conn: &Connection,
+    pricing: &PricingTable,
+    hours: i64,
+) -> rusqlite::Result<Value> {
+    let since = since_unix(hours);
+    // Sessions can mix models (main model plus background helpers), so cost is
+    // priced per (session, model) split and then summed, reference-style.
+    let mut costs: HashMap<String, f64> = HashMap::new();
+    {
+        let mut statement = conn.prepare(
+            "SELECT session_key, COALESCE(model,''),
+                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(cached_tokens),0), COALESCE(SUM(reasoning_tokens),0)
+             FROM exchanges WHERE ts_unix >= ?1 AND session_key IS NOT NULL
+             GROUP BY session_key, model",
+        )?;
+        let rows = statement.query_map([since], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (key, model, input, output, cached, reasoning) = row?;
+            *costs.entry(key).or_default() +=
+                pricing.estimate_usd(&model, input, output, cached, reasoning);
+        }
+    }
+
+    let mut statement = conn.prepare(
+        "SELECT session_key, MIN(ts_unix), MAX(ts_unix), MIN(ts), MAX(ts), COUNT(*),
+                SUM(outcome = 'ok'), SUM(outcome IN ('http_error','transport_error')), SUM(outcome = 'cancelled'),
+                COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                COALESCE(SUM(duration_ms),0),
+                MAX(session_hint), MAX(client_ip), GROUP_CONCAT(DISTINCT model)
+         FROM exchanges WHERE ts_unix >= ?1 AND session_key IS NOT NULL
+         GROUP BY session_key ORDER BY MAX(ts_unix) DESC LIMIT 200",
+    )?;
+    let rows = statement
+        .query_map([since], |row| {
+            let key: String = row.get(0)?;
+            let cost = costs.get(&key).copied();
+            Ok(json!({
+                "session_key": key,
+                "first_unix": row.get::<_, i64>(1)?,
+                "last_unix": row.get::<_, i64>(2)?,
+                "first_ts": row.get::<_, Option<String>>(3)?,
+                "last_ts": row.get::<_, Option<String>>(4)?,
+                "count": row.get::<_, i64>(5)?,
+                "ok": row.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                "errors": row.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                "cancelled": row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                "input_tokens": row.get::<_, i64>(9)?,
+                "output_tokens": row.get::<_, i64>(10)?,
+                "model_ms": row.get::<_, i64>(11)?,
+                "hint": row.get::<_, Option<String>>(12)?,
+                "client_ip": row.get::<_, Option<String>>(13)?,
+                "models": row.get::<_, Option<String>>(14)?,
+                "cost_usd": cost,
+            }))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({"sessions": rows}))
+}
+
+fn build_detail(conn: &Connection, pricing: &PricingTable, id: &str) -> rusqlite::Result<Value> {
     let mut statement = conn.prepare(
         "SELECT request_id, ts, upstream_url, format, model, stream, client_ip, route_mode,
                 req_body, req_bytes, req_truncated,
                 outcome, status, duration_ms, complete, protocol_complete, cancel_stage, error_message,
                 resp_headers, resp_body, resp_bytes, resp_truncated,
                 agg_response, finish_reason,
-                input_tokens, output_tokens, cached_tokens, reasoning_tokens, preview
+                input_tokens, output_tokens, cached_tokens, reasoning_tokens, preview,
+                session_key, session_hint
          FROM exchanges WHERE request_id = ?1",
     )?;
     let mut rows = statement.query([id])?;
     let Some(row) = rows.next()? else {
         return Ok(Value::Null);
     };
+    let model = row.get::<_, Option<String>>(4)?;
+    let input = row.get::<_, Option<i64>>(24)?;
+    let output = row.get::<_, Option<i64>>(25)?;
+    let cached = row.get::<_, Option<i64>>(26)?;
+    let reasoning = row.get::<_, Option<i64>>(27)?;
+    let cost = cost_for(pricing, model.as_deref(), input, output, cached, reasoning);
     Ok(json!({
         "request_id": row.get::<_, String>(0)?,
         "ts": row.get::<_, Option<String>>(1)?,
         "upstream_url": row.get::<_, Option<String>>(2)?,
         "format": row.get::<_, Option<String>>(3)?,
-        "model": row.get::<_, Option<String>>(4)?,
+        "model": model,
         "stream": row.get::<_, Option<i64>>(5)?,
         "client_ip": row.get::<_, Option<String>>(6)?,
         "route_mode": row.get::<_, Option<String>>(7)?,
@@ -365,11 +635,14 @@ fn build_detail(conn: &Connection, id: &str) -> rusqlite::Result<Value> {
         "resp_truncated": row.get::<_, Option<i64>>(21)?,
         "agg_response": row.get::<_, Option<String>>(22)?,
         "finish_reason": row.get::<_, Option<String>>(23)?,
-        "input_tokens": row.get::<_, Option<i64>>(24)?,
-        "output_tokens": row.get::<_, Option<i64>>(25)?,
-        "cached_tokens": row.get::<_, Option<i64>>(26)?,
-        "reasoning_tokens": row.get::<_, Option<i64>>(27)?,
+        "input_tokens": input,
+        "output_tokens": output,
+        "cached_tokens": cached,
+        "reasoning_tokens": reasoning,
         "preview": row.get::<_, Option<String>>(28)?,
+        "session_key": row.get::<_, Option<String>>(29)?,
+        "session_hint": row.get::<_, Option<String>>(30)?,
+        "cost_usd": cost,
     }))
 }
 

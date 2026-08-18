@@ -9,15 +9,20 @@ use rusqlite::params;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::{db::Db, derive::derive_response};
+use crate::{db::Db, derive::derive_response, session};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+fn now_unix() -> i64 {
+    chrono::Utc::now().timestamp()
+}
 
 /// Tails every model-interactions-*.ndjson file in the log directory with a
 /// per-file byte offset persisted in SQLite, so restarts resume where they
 /// stopped and files removed by the router's retention sweep are forgotten.
 pub fn run(db: Db, dir: PathBuf) {
     info!(directory = %dir.display(), "lens ingester watching model interaction logs");
+    backfill_sessions(&db);
     loop {
         if let Err(error) = scan_once(&db, &dir) {
             warn!(%error, "ingest scan failed; retrying");
@@ -132,8 +137,8 @@ fn apply_entry(db: &Db, entry: &Value) -> Result<(), String> {
     // shared metadata first.
     db.with(|conn| {
         conn.execute(
-            "INSERT INTO exchanges (request_id, ts, ts_unix, upstream_url, format, model, stream, client_ip, route_mode)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO exchanges (request_id, ts, ts_unix, upstream_url, format, model, stream, client_ip, route_mode, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(request_id) DO NOTHING",
             params![
                 request_id,
@@ -145,6 +150,7 @@ fn apply_entry(db: &Db, entry: &Value) -> Result<(), String> {
                 entry.get("stream").and_then(Value::as_bool).map(i64::from),
                 entry.get("client_ip").and_then(Value::as_str),
                 entry.get("route_mode").and_then(Value::as_str),
+                now_unix(),
             ],
         )
     })
@@ -175,9 +181,22 @@ fn apply_entry(db: &Db, entry: &Value) -> Result<(), String> {
 
 fn apply_request(db: &Db, request_id: &str, entry: &Value) -> Result<(), String> {
     let body = body_string(entry);
+    let payload = entry.get("body").cloned().or_else(|| {
+        body.as_deref()
+            .and_then(|text| serde_json::from_str(text).ok())
+    });
+    let session = payload.as_ref().map(|payload| {
+        session::derive(
+            entry.get("format").and_then(Value::as_str).unwrap_or(""),
+            entry.get("client_ip").and_then(Value::as_str),
+            payload,
+        )
+    });
     db.with(|conn| {
         conn.execute(
-            "UPDATE exchanges SET req_body = ?2, req_bytes = ?3, req_truncated = ?4 WHERE request_id = ?1",
+            "UPDATE exchanges SET req_body = ?2, req_bytes = ?3, req_truncated = ?4,
+                    session_key = ?5, session_hint = ?6, updated_at = ?7
+             WHERE request_id = ?1",
             params![
                 request_id,
                 body,
@@ -186,11 +205,56 @@ fn apply_request(db: &Db, request_id: &str, entry: &Value) -> Result<(), String>
                     .get("body_truncated")
                     .and_then(Value::as_bool)
                     .map(i64::from),
+                session.as_ref().map(|session| session.key.clone()),
+                session.as_ref().and_then(|session| session.hint.clone()),
+                now_unix(),
             ],
         )
     })
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+/// Computes session keys for rows ingested by lens builds that predate
+/// session threading. Runs once at startup; the volume is whatever the
+/// dashboard has accumulated, so a single pass is fine.
+fn backfill_sessions(db: &Db) {
+    let rows: Vec<(String, String, Option<String>, String)> = match db.with(|conn| {
+        conn.prepare(
+            "SELECT request_id, COALESCE(format,''), client_ip, req_body FROM exchanges
+             WHERE session_key IS NULL AND req_body IS NOT NULL",
+        )?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect()
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(%error, "session backfill scan failed");
+            return;
+        }
+    };
+    let mut updated = 0usize;
+    for (request_id, format, client_ip, req_body) in rows {
+        let Ok(payload) = serde_json::from_str::<Value>(&req_body) else {
+            continue;
+        };
+        let session = session::derive(&format, client_ip.as_deref(), &payload);
+        let result = db.with(|conn| {
+            conn.execute(
+                "UPDATE exchanges SET session_key = ?2, session_hint = ?3 WHERE request_id = ?1",
+                params![request_id, session.key, session.hint],
+            )
+        });
+        match result {
+            Ok(_) => updated += 1,
+            Err(error) => warn!(%error, "session backfill update failed"),
+        }
+    }
+    if updated > 0 {
+        info!(updated, "backfilled session keys");
+    }
 }
 
 fn apply_response(db: &Db, request_id: &str, entry: &Value) -> Result<(), String> {
@@ -223,7 +287,7 @@ fn apply_response(db: &Db, request_id: &str, entry: &Value) -> Result<(), String
                error_message = ?7, resp_headers = ?8, resp_body = ?9, resp_bytes = ?10, resp_truncated = ?11,
                agg_response = ?12, finish_reason = ?13,
                input_tokens = ?14, output_tokens = ?15, cached_tokens = ?16, reasoning_tokens = ?17,
-               preview = ?18
+               preview = ?18, updated_at = ?19
              WHERE request_id = ?1",
             params![
                 request_id,
@@ -250,6 +314,7 @@ fn apply_response(db: &Db, request_id: &str, entry: &Value) -> Result<(), String
                 derived.cached_tokens,
                 derived.reasoning_tokens,
                 derived.preview,
+                now_unix(),
             ],
         )
     })
@@ -267,7 +332,7 @@ fn apply_terminal(
 ) -> Result<(), String> {
     db.with(|conn| {
         conn.execute(
-            "UPDATE exchanges SET outcome = ?2, duration_ms = ?3, cancel_stage = ?4, error_message = ?5
+            "UPDATE exchanges SET outcome = ?2, duration_ms = ?3, cancel_stage = ?4, error_message = ?5, updated_at = ?6
              WHERE request_id = ?1",
             params![
                 request_id,
@@ -275,6 +340,7 @@ fn apply_terminal(
                 entry.get("duration_ms").and_then(Value::as_i64),
                 cancel_stage,
                 error_message,
+                now_unix(),
             ],
         )
     })
