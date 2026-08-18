@@ -10,3 +10,5 @@ logs/
 .claude/settings.local.json
 .idea/
 .vscode/
+/lens/target/
+/lens/data/

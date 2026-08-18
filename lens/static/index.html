@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>OCR Lens</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔭</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap">
+<style>
+/* 现代浅色主题（单主题，不随系统切换） */
+:root {
+  --bg:#F5F7FA; --surface:#FFFFFF; --surface-2:#F1F4F8; --ink:#17232E; --muted:#5F7285;
+  --line:#E4E9F0; --accent:#0C8599; --accent-ink:#09677A; --accent-soft:#E3F3F6;
+  --warn:#B25E09; --warn-soft:#FCF0DF; --good:#188349; --good-soft:#E4F4EA;
+  --bad:#C23B41; --bad-soft:#FBE9E9; --code-bg:#F4F6F9;
+  --shadow:0 1px 2px rgba(23,35,46,.05), 0 2px 8px rgba(23,35,46,.05);
+  --shadow-lg:0 2px 4px rgba(23,35,46,.05), 0 8px 24px rgba(23,35,46,.08);
+  --sans:"IBM Plex Sans","Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--ink); font-family:var(--sans); font-size:14px; line-height:1.6; }
+a { color:var(--accent-ink); text-decoration:none; }
+a:hover { text-decoration:underline; }
+
+.topbar { display:flex; align-items:center; gap:20px; padding:12px 24px; background:var(--surface); border-bottom:1px solid var(--line); box-shadow:0 1px 3px rgba(23,35,46,.04); position:sticky; top:0; z-index:5; flex-wrap:wrap; }
+.brand { font-weight:700; font-size:17px; letter-spacing:-.01em; display:flex; align-items:center; gap:8px; }
+.brand .dot { width:10px; height:10px; border-radius:50%; background:var(--accent); display:inline-block; }
+.nav { display:flex; gap:4px; }
+.nav a { padding:6px 15px; border-radius:999px; color:var(--muted); font-weight:500; transition:background .15s,color .15s; }
+.nav a.on { background:var(--accent-soft); color:var(--accent-ink); }
+.nav a:hover { background:var(--surface-2); text-decoration:none; }
+.topbar .spacer { flex:1; }
+.topbar select, .topbar input[type=text], .filters select, .filters input {
+  background:var(--surface); color:var(--ink); border:1px solid var(--line); border-radius:8px;
+  padding:6px 10px; font-family:var(--sans); font-size:13px; box-shadow:0 1px 2px rgba(23,35,46,.04);
+}
+.topbar select:focus, .filters select:focus, .filters input:focus, .topbar input:focus { outline:2px solid var(--accent-soft); border-color:var(--accent); }
+.topbar label { font-size:12.5px; color:var(--muted); display:flex; align-items:center; gap:6px; }
+.btn { background:var(--accent); color:#fff; border:none; border-radius:8px; padding:7px 16px; font-size:13px; cursor:pointer; font-family:var(--sans); font-weight:500; box-shadow:0 1px 2px rgba(23,35,46,.08); transition:filter .15s; }
+.btn:hover { filter:brightness(1.06); }
+.btn:disabled { opacity:.45; cursor:default; }
+.btn.ghost { background:var(--surface); color:var(--accent-ink); border:1px solid var(--line); box-shadow:0 1px 2px rgba(23,35,46,.04); }
+.btn.ghost:hover { background:var(--surface-2); filter:none; }
+.btn:focus-visible, a:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+
+.wrap { max-width:1280px; margin:0 auto; padding:20px 22px 60px; }
+.mono { font-family:var(--mono); }
+.num { font-variant-numeric:tabular-nums; }
+.muted { color:var(--muted); }
+
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:18px; }
+.card { background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:14px 18px; box-shadow:var(--shadow); }
+.card .k { font-family:var(--mono); font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
+.card .v { font-size:24px; font-weight:600; font-variant-numeric:tabular-nums; margin-top:2px; }
+.card .s { font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; }
+
+.panel { background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:18px 20px; margin-bottom:18px; box-shadow:var(--shadow); }
+.panel h3 { margin:0 0 10px; font-size:14.5px; }
+.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+@media (max-width:900px){ .grid2 { grid-template-columns:1fr; } }
+.chart-scroll { overflow-x:auto; }
+svg.chart { display:block; width:100%; height:auto; }
+
+table.data { width:100%; border-collapse:collapse; font-size:13px; }
+table.data th { text-align:left; font-family:var(--mono); font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); padding:8px 10px; background:var(--surface-2); border-bottom:1px solid var(--line); white-space:nowrap; }
+table.data th:first-child { border-radius:8px 0 0 8px; }
+table.data th:last-child { border-radius:0 8px 8px 0; }
+table.data td { padding:7px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+table.data tr:last-child td { border-bottom:none; }
+table.data tr.row { cursor:pointer; }
+table.data tr.row:hover { background:var(--surface-2); }
+.tbl-scroll { overflow-x:auto; }
+
+.chip { display:inline-block; font-family:var(--mono); font-size:11px; font-weight:600; border-radius:999px; padding:1px 9px; white-space:nowrap; }
+.chip.good { background:var(--good-soft); color:var(--good); }
+.chip.warn { background:var(--warn-soft); color:var(--warn); }
+.chip.bad { background:var(--bad-soft); color:var(--bad); }
+.chip.info { background:var(--accent-soft); color:var(--accent-ink); }
+.chip.dim { background:var(--surface-2); color:var(--muted); }
+
+.filters { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
+.pager { display:flex; gap:10px; align-items:center; margin-top:12px; font-size:13px; color:var(--muted); }
+
+.meta-bar { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:12px 18px; margin-bottom:14px; font-family:var(--mono); font-size:12px; box-shadow:var(--shadow); }
+.detail-grid { display:grid; grid-template-columns:1.08fr 1fr; gap:16px; align-items:start; }
+@media (max-width:1000px){ .detail-grid { grid-template-columns:1fr; } }
+
+.tabs { display:flex; gap:2px; flex-wrap:wrap; }
+.tab { padding:5px 13px; border:1px solid var(--line); border-bottom:none; border-radius:7px 7px 0 0; color:var(--muted); background:var(--surface-2); cursor:pointer; font-size:12.5px; font-family:var(--mono); }
+.tab.on { background:var(--surface); color:var(--ink); font-weight:600; border-color:var(--accent); }
+.pane { border:1px solid var(--line); border-radius:0 12px 12px 12px; padding:14px; background:var(--surface); min-height:120px; box-shadow:var(--shadow); }
+
+.bubble { border:1px solid var(--line); border-radius:8px; padding:8px 12px; background:var(--surface); margin-bottom:8px; overflow-wrap:anywhere; }
+.bubble .role { font-family:var(--mono); font-size:10.5px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; margin-bottom:3px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.bubble.sys { background:var(--surface-2); color:var(--muted); }
+.bubble.user { border-left:3px solid var(--accent); }
+.bubble.user .role { color:var(--accent-ink); }
+.bubble.asst .role { color:var(--good); }
+.bubble.think { background:var(--accent-soft); border-style:dashed; color:var(--muted); }
+.bubble.tcall { margin-left:18px; border-left:3px solid var(--warn); }
+.bubble.tcall .role { color:var(--warn); }
+.bubble.tout { margin-left:36px; color:var(--muted); }
+.bubble img { max-width:220px; max-height:160px; border-radius:6px; border:1px solid var(--line); display:block; margin:4px 0; }
+.bubble pre { margin:4px 0; }
+details.fold > summary { cursor:pointer; color:var(--accent-ink); font-size:12px; font-family:var(--mono); list-style:none; }
+details.fold > summary::before { content:"▸ "; }
+details.fold[open] > summary::before { content:"▾ "; }
+pre.code { background:var(--code-bg); border:1px solid var(--line); border-radius:7px; padding:9px 12px; overflow-x:auto; font-size:12px; line-height:1.55; font-family:var(--mono); white-space:pre-wrap; overflow-wrap:anywhere; margin:6px 0; }
+.kv { display:grid; grid-template-columns:max-content 1fr; gap:3px 14px; font-size:12.5px; }
+.kv .k { font-family:var(--mono); color:var(--muted); }
+
+.usage-wrap { margin:10px 0 4px; }
+.usage-row { display:flex; align-items:center; gap:10px; font-family:var(--mono); font-size:11.5px; }
+.usage-track { flex:1; height:10px; border-radius:5px; background:var(--surface-2); overflow:hidden; display:flex; }
+.usage-track i { display:block; height:100%; }
+.u-in { background:var(--accent); }
+.u-cache { background:var(--accent); opacity:.35; }
+.u-out { background:var(--good); }
+.u-think { background:var(--warn); }
+.legend { display:flex; gap:14px; font-size:11px; color:var(--muted); font-family:var(--mono); margin-top:4px; flex-wrap:wrap; }
+.legend i { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:4px; vertical-align:-1px; }
+
+.sse-row { border-bottom:1px solid var(--line); padding:4px 2px; font-size:12px; }
+.sse-row:last-child { border-bottom:none; }
+.sse-row .head { display:flex; gap:10px; cursor:pointer; align-items:baseline; font-family:var(--mono); }
+.sse-row .idx { color:var(--muted); min-width:34px; text-align:right; font-size:10.5px; }
+.sse-row .ev { color:var(--accent-ink); font-weight:600; font-size:11.5px; white-space:nowrap; }
+.sse-row .sum { color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
+.empty { color:var(--muted); text-align:center; padding:40px 0; font-size:13px; }
+.err-note { background:var(--bad-soft); color:var(--bad); border-radius:7px; padding:8px 12px; font-size:12.5px; margin-bottom:8px; overflow-wrap:anywhere; }
+.warn-note { background:var(--warn-soft); color:var(--warn); border-radius:7px; padding:8px 12px; font-size:12.5px; margin-bottom:8px; }
+h2.vh { font-size:18px; margin:6px 0 14px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <span class="brand"><span class="dot"></span>OCR Lens</span>
+  <nav class="nav">
+    <a href="#/" id="nav-overview">总览</a>
+    <a href="#/requests" id="nav-requests">请求</a>
+  </nav>
+  <span class="spacer"></span>
+  <label>时间窗
+    <select id="hours">
+      <option value="1">1 小时</option>
+      <option value="6">6 小时</option>
+      <option value="24" selected>24 小时</option>
+      <option value="168">7 天</option>
+      <option value="720">30 天</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="auto" checked> 自动刷新 5s</label>
+  <button class="btn ghost" id="refresh">刷新</button>
+</div>
+<div class="wrap" id="view"></div>
+
+<script>
+"use strict";
+const $view = document.getElementById("view");
+const $hours = document.getElementById("hours");
+const $auto = document.getElementById("auto");
+let timer = null;
+
+/* ---------- helpers ---------- */
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmtInt = n => n == null ? "–" : Number(n).toLocaleString("en-US");
+const fmtMs = n => n == null ? "–" : n >= 10000 ? (n/1000).toFixed(1)+"s" : fmtInt(n)+"ms";
+const fmtBytes = n => n == null ? "–" : n >= 1048576 ? (n/1048576).toFixed(1)+" MB" : n >= 1024 ? (n/1024).toFixed(1)+" KB" : n+" B";
+const fmtTime = ts => { if(!ts) return "–"; const d = new Date(ts); return d.toLocaleString("zh-CN",{hour12:false,month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}); };
+const shortId = id => id ? id.slice(0,8) : "–";
+const pretty = v => { try { return JSON.stringify(typeof v === "string" ? JSON.parse(v) : v, null, 2); } catch { return String(v); } };
+async function api(path){ const r = await fetch(path); if(!r.ok) throw new Error(path+" -> "+r.status); return r.json(); }
+
+function outcomeChip(row){
+  const o = row.outcome || "pending";
+  if(o === "ok"){
+    const tail = row.protocol_complete === 0 && row.stream ? " · 流截断" : "";
+    return `<span class="chip good">${row.status || 200}${tail}</span>`;
+  }
+  if(o === "http_error") return `<span class="chip bad">${row.status || "ERR"}</span>`;
+  if(o === "transport_error") return `<span class="chip bad">transport</span>`;
+  if(o === "cancelled") return `<span class="chip warn">取消·${esc((row.cancel_stage||"").includes("waiting")?"等响应":"读流中")}</span>`;
+  return `<span class="chip dim">pending</span>`;
+}
+const fmtChip = f => f ? `<span class="chip info">${esc(f === "chat-completions" ? "chat" : f)}</span>` : "";
+const streamChip = s => s ? `<span class="chip dim">stream</span>` : "";
+
+function textBlock(text, limit){
+  limit = limit || 600;
+  const t = String(text ?? "");
+  if(t.length <= limit) return `<div>${esc(t).replace(/\n/g,"<br>")}</div>`;
+  return `<details class="fold"><summary>展开全文 · ${fmtInt(t.length)} 字符</summary><div>${esc(t).replace(/\n/g,"<br>")}</div></details><div>${esc(t.slice(0,limit))}…</div>`;
+}
+function jsonFold(label, value){
+  return `<details class="fold"><summary>${esc(label)}</summary><pre class="code">${esc(pretty(value))}</pre></details>`;
+}
+
+/* ---------- charts ---------- */
+function stackChart(series, keys, colors, height, hours){
+  if(!series || !series.length) return `<div class="empty">窗口内暂无数据</div>`;
+  const W = Math.max(660, series.length * 14), H = height || 150, pad = 30;
+  let max = 1;
+  for(const p of series){ let s = 0; for(const k of keys) s += p[k] || 0; if(s > max) max = s; }
+  const slot = (W - pad) / series.length;
+  const bw = Math.min(26, Math.max(3, Math.floor(slot) - 2));
+  let bars = "";
+  series.forEach((p, i) => {
+    let y = H - 18;
+    const x = pad + i * slot + (slot - bw) / 2;
+    const label = new Date(p.t * 1000).toLocaleString("zh-CN",{hour12:false,month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"});
+    let tip = label;
+    keys.forEach((k, ki) => {
+      const v = p[k] || 0; tip += ` · ${k}:${fmtInt(v)}`;
+      if(v <= 0) return;
+      const h = Math.max(1, (v / max) * (H - 30));
+      y -= h;
+      bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw}" height="${h.toFixed(1)}" fill="${colors[ki]}" rx="1"><title>${esc(tip)}</title></rect>`;
+    });
+  });
+  const gridY = [0, .5, 1].map(f => { const y = (H - 18) - f * (H - 30);
+    return `<line x1="${pad}" y1="${y}" x2="${W}" y2="${y}" stroke="currentColor" opacity=".12"/>` +
+      `<text x="${pad - 5}" y="${y + 3}" font-size="9" text-anchor="end" fill="currentColor" opacity=".55">${fmtInt(Math.round(f * max))}</text>`; }).join("");
+  const t0 = series[0].t, t1 = series[series.length - 1].t;
+  const fmtX = t => new Date(t * 1000).toLocaleString("zh-CN", hours > 48 ? {month:"2-digit",day:"2-digit"} : {hour12:false,hour:"2-digit",minute:"2-digit"});
+  return `<div class="chart-scroll"><svg class="chart" viewBox="0 0 ${W} ${H}" style="min-width:${Math.min(W,660)}px">${gridY}${bars}
+    <text x="${pad}" y="${H - 4}" font-size="9" fill="currentColor" opacity=".55">${fmtX(t0)}</text>
+    <text x="${W - 2}" y="${H - 4}" font-size="9" text-anchor="end" fill="currentColor" opacity=".55">${fmtX(t1)}</text></svg></div>`;
+}
+
+/* ---------- overview ---------- */
+async function renderOverview(){
+  const hours = $hours.value;
+  const d = await api(`/api/overview?hours=${hours}`);
+  const t = d.totals, okRate = t.count ? (100 * t.ok / t.count).toFixed(1) + "%" : "–";
+  const css = getComputedStyle(document.documentElement);
+  const cGood = css.getPropertyValue("--good").trim(), cBad = css.getPropertyValue("--bad").trim(),
+        cWarn = css.getPropertyValue("--warn").trim(), cAcc = css.getPropertyValue("--accent").trim();
+  $view.innerHTML = `
+    <div class="cards">
+      <div class="card"><div class="k">请求数</div><div class="v">${fmtInt(t.count)}</div><div class="s">ok ${fmtInt(t.ok)} · pending ${fmtInt(t.pending)}</div></div>
+      <div class="card"><div class="k">成功率</div><div class="v">${okRate}</div><div class="s">HTTP 错 ${fmtInt(t.http_error)} · 传输错 ${fmtInt(t.transport_error)}</div></div>
+      <div class="card"><div class="k">取消</div><div class="v">${fmtInt(t.cancelled)}</div><div class="s">客户端提前断开</div></div>
+      <div class="card"><div class="k">时延 P50 / P95</div><div class="v">${fmtMs(d.latency.p50)}</div><div class="s">P95 ${fmtMs(d.latency.p95)} · P99 ${fmtMs(d.latency.p99)}</div></div>
+      <div class="card"><div class="k">输入 tokens</div><div class="v">${fmtInt(t.input_tokens)}</div><div class="s">cached ${fmtInt(t.cached_tokens)}</div></div>
+      <div class="card"><div class="k">输出 tokens</div><div class="v">${fmtInt(t.output_tokens)}</div><div class="s">reasoning ${fmtInt(t.reasoning_tokens)}</div></div>
+    </div>
+    <div class="panel"><h3>请求量（每 ${d.bucket_seconds >= 3600 ? d.bucket_seconds/3600+" 小时" : d.bucket_seconds/60+" 分钟"}）</h3>
+      ${stackChart(d.series, ["ok","error","cancelled"], [cGood, cBad, cWarn], 150, d.hours)}
+      <div class="legend"><span><i style="background:${cGood}"></i>ok</span><span><i style="background:${cBad}"></i>error</span><span><i style="background:${cWarn}"></i>cancelled</span></div>
+    </div>
+    <div class="panel"><h3>Tokens</h3>
+      ${stackChart(d.series, ["input_tokens","output_tokens"], [cAcc, cGood], 130, d.hours)}
+      <div class="legend"><span><i style="background:${cAcc}"></i>input</span><span><i style="background:${cGood}"></i>output</span></div>
+    </div>
+    <div class="grid2">
+      <div class="panel"><h3>按模型</h3><div class="tbl-scroll"><table class="data">
+        <tr><th>模型</th><th>请求</th><th>in / out tokens</th><th>均耗时</th><th>错误</th><th>取消</th></tr>
+        ${d.by_model.map(m => `<tr><td class="mono">${esc(m.model)}</td><td class="num">${fmtInt(m.count)}</td><td class="num">${fmtInt(m.input_tokens)} / ${fmtInt(m.output_tokens)}</td><td class="num">${fmtMs(m.avg_ms)}</td><td class="num">${fmtInt(m.errors)}</td><td class="num">${fmtInt(m.cancelled)}</td></tr>`).join("") || `<tr><td colspan="6" class="empty">无数据</td></tr>`}
+      </table></div></div>
+      <div class="panel"><h3>状态码 / 调用方</h3><div class="tbl-scroll"><table class="data">
+        <tr><th>HTTP 状态</th><th>次数</th></tr>
+        ${d.by_status.map(s => `<tr><td>${s.status >= 400 ? `<span class="chip bad">${s.status}</span>` : `<span class="chip good">${s.status}</span>`}</td><td class="num">${fmtInt(s.count)}</td></tr>`).join("") || `<tr><td colspan="2" class="empty">无数据</td></tr>`}
+      </table>
+      <table class="data" style="margin-top:14px">
+        <tr><th>client ip</th><th>次数</th></tr>
+        ${d.by_client.map(c => `<tr><td class="mono">${esc(c.client_ip)}</td><td class="num">${fmtInt(c.count)}</td></tr>`).join("")}
+      </table></div></div>
+    </div>`;
+}
+
+/* ---------- request list ---------- */
+const listState = { offset: 0, model: "", outcome: "", q: "" };
+async function renderList(){
+  const hours = $hours.value;
+  const qs = new URLSearchParams({hours, limit: 50, offset: listState.offset});
+  if(listState.model) qs.set("model", listState.model);
+  if(listState.outcome) qs.set("outcome", listState.outcome);
+  if(listState.q) qs.set("q", listState.q);
+  const d = await api(`/api/requests?${qs}`);
+  $view.innerHTML = `
+    <div class="filters">
+      <select id="f-model"><option value="">全部模型</option>${d.models.map(m => `<option ${m===listState.model?"selected":""}>${esc(m)}</option>`).join("")}</select>
+      <select id="f-outcome">
+        <option value="">全部结果</option>
+        ${["ok","http_error","transport_error","cancelled","pending"].map(o => `<option ${o===listState.outcome?"selected":""}>${o}</option>`).join("")}
+      </select>
+      <input type="text" id="f-q" placeholder="搜 request_id / 内容…" value="${esc(listState.q)}" style="min-width:220px">
+      <span class="muted num">共 ${fmtInt(d.total)} 条</span>
+    </div>
+    <div class="panel" style="padding:6px 10px"><div class="tbl-scroll"><table class="data">
+      <tr><th>时间</th><th>id</th><th>模型</th><th>协议</th><th>结果</th><th>耗时</th><th>in/out tk</th><th>大小</th><th>预览</th></tr>
+      ${d.rows.map(r => `<tr class="row" data-id="${esc(r.request_id)}">
+        <td class="num" style="white-space:nowrap">${fmtTime(r.ts)}</td>
+        <td class="mono">${shortId(r.request_id)}</td>
+        <td class="mono">${esc(r.model || "–")}</td>
+        <td>${fmtChip(r.format)}${streamChip(r.stream)}</td>
+        <td>${outcomeChip(r)}</td>
+        <td class="num">${fmtMs(r.duration_ms)}</td>
+        <td class="num">${r.input_tokens != null ? fmtInt(r.input_tokens)+" / "+fmtInt(r.output_tokens) : "–"}</td>
+        <td class="num" style="white-space:nowrap">${fmtBytes(r.req_bytes)} → ${fmtBytes(r.resp_bytes)}</td>
+        <td class="muted" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.preview || "")}</td>
+      </tr>`).join("") || `<tr><td colspan="9"><div class="empty">窗口内没有请求。向 Router 发几条流量后这里会自动出现。</div></td></tr>`}
+    </table></div></div>
+    <div class="pager">
+      <button class="btn ghost" id="pg-prev" ${listState.offset<=0?"disabled":""}>上一页</button>
+      <button class="btn ghost" id="pg-next" ${listState.offset+50>=d.total?"disabled":""}>下一页</button>
+      <span class="num">${fmtInt(listState.offset+1)}–${fmtInt(Math.min(listState.offset+50, d.total))}</span>
+    </div>`;
+  document.getElementById("f-model").onchange = e => { listState.model = e.target.value; listState.offset = 0; renderList(); };
+  document.getElementById("f-outcome").onchange = e => { listState.outcome = e.target.value; listState.offset = 0; renderList(); };
+  document.getElementById("f-q").onchange = e => { listState.q = e.target.value.trim(); listState.offset = 0; renderList(); };
+  document.getElementById("pg-prev").onclick = () => { listState.offset = Math.max(0, listState.offset - 50); renderList(); };
+  document.getElementById("pg-next").onclick = () => { listState.offset += 50; renderList(); };
+  $view.querySelectorAll("tr.row").forEach(tr => tr.onclick = () => { location.hash = "#/r/" + tr.dataset.id; });
+}
+
+/* ---------- request reconstruction ---------- */
+function renderContentParts(parts){
+  if(typeof parts === "string") return textBlock(parts);
+  if(!Array.isArray(parts)) return jsonFold("content", parts);
+  return parts.map(p => {
+    const type = p.type || "";
+    if(type === "text" || type === "input_text" || type === "output_text") return textBlock(p.text);
+    if(type === "image_url" || type === "input_image"){
+      const url = typeof p.image_url === "string" ? p.image_url : (p.image_url && p.image_url.url) || "";
+      const size = url.startsWith("data:") ? ` <span class="chip info">🖼 ${fmtBytes(Math.round(url.length * 0.75))}</span>` : "";
+      return url ? `<div><img src="${esc(url)}" alt="请求图片" loading="lazy">${size}</div>` : jsonFold("image", p);
+    }
+    if(type === "refusal") return `<div class="err-note">refusal: ${esc(p.refusal || "")}</div>`;
+    return jsonFold(type || "part", p);
+  }).join("");
+}
+function toolCallCard(name, args, id){
+  return `<div class="bubble tcall"><div class="role">tool_call · ${esc(name || "?")} ${id ? `<span class="muted">${esc(String(id).slice(0,14))}</span>` : ""}</div><pre class="code">${esc(pretty(args))}</pre></div>`;
+}
+function renderChatConversation(p){
+  let html = "";
+  for(const m of p.messages || []){
+    const role = m.role;
+    if(role === "system" || role === "developer"){
+      const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      html += `<div class="bubble sys"><div class="role">${esc(role)}</div><details class="fold"><summary>已折叠 · ${fmtBytes(text.length)}</summary><div>${esc(text).replace(/\n/g,"<br>")}</div></details></div>`;
+    } else if(role === "tool"){
+      const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      html += `<div class="bubble tout"><div class="role">tool result · ${esc(String(m.tool_call_id||"").slice(0,14))}</div>${textBlock(text, 400)}</div>`;
+    } else {
+      html += `<div class="bubble ${role === "user" ? "user" : "asst"}"><div class="role">${esc(role)}</div>${m.content != null ? renderContentParts(m.content) : ""}</div>`;
+      for(const c of m.tool_calls || []) html += toolCallCard(c.function && c.function.name, c.function && c.function.arguments, c.id);
+    }
+  }
+  return html || `<div class="empty">无 messages</div>`;
+}
+function renderResponsesConversation(p){
+  let html = "";
+  if(p.instructions){
+    html += `<div class="bubble sys"><div class="role">instructions</div><details class="fold"><summary>已折叠 · ${fmtBytes(p.instructions.length)}</summary><div>${esc(p.instructions).replace(/\n/g,"<br>")}</div></details></div>`;
+  }
+  const items = Array.isArray(p.input) ? p.input : [];
+  if(typeof p.input === "string") html += `<div class="bubble user"><div class="role">user</div>${textBlock(p.input)}</div>`;
+  for(const item of items){
+    const type = item.type || (item.role ? "message" : "");
+    if(type === "message"){
+      const role = item.role || "user";
+      html += `<div class="bubble ${role === "user" ? "user" : role === "system" || role === "developer" ? "sys" : "asst"}"><div class="role">${esc(role)}</div>${renderContentParts(item.content)}</div>`;
+    } else if(type === "function_call"){
+      html += toolCallCard(item.name, item.arguments, item.call_id);
+    } else if(type === "function_call_output"){
+      const out = typeof item.output === "string" ? item.output : JSON.stringify(item.output);
+      html += `<div class="bubble tout"><div class="role">function_call_output · ${esc(String(item.call_id||"").slice(0,14))}</div>${textBlock(out, 400)}</div>`;
+    } else if(type === "reasoning"){
+      const text = (item.summary || []).map(s => s.text || "").join("\n");
+      html += `<div class="bubble think"><div class="role">reasoning</div>${text ? textBlock(text, 400) : jsonFold("reasoning item", item)}</div>`;
+    } else {
+      html += `<div class="bubble">${jsonFold(type || "item", item)}</div>`;
+    }
+  }
+  return html || `<div class="empty">无 input</div>`;
+}
+function renderToolDefs(p, format){
+  const tools = p.tools || [];
+  if(!tools.length) return `<div class="empty">该请求未携带工具定义</div>`;
+  return tools.map(t => {
+    const fn = format === "responses" ? t : (t.function || t);
+    return `<div class="bubble"><div class="role">${esc(fn.name || t.type || "?")} ${fn.strict ? '<span class="chip info">strict</span>' : ""}</div>
+      <div class="muted" style="font-size:12.5px">${esc(fn.description || "")}</div>
+      ${fn.parameters ? jsonFold("参数 schema", fn.parameters) : ""}</div>`;
+  }).join("");
+}
+function renderParams(p){
+  const skip = new Set(["messages","input","tools","instructions","system"]);
+  const rows = Object.entries(p).filter(([k]) => !skip.has(k)).map(([k, v]) =>
+    `<div class="k">${esc(k)}</div><div class="mono" style="overflow-wrap:anywhere">${esc(typeof v === "object" ? JSON.stringify(v) : String(v))}</div>`).join("");
+  return rows ? `<div class="kv">${rows}</div>` : `<div class="empty">无其他参数</div>`;
+}
+
+/* ---------- response reconstruction ---------- */
+function usageBar(d){
+  const inTok = d.input_tokens || 0, out = d.output_tokens || 0, cache = d.cached_tokens || 0, think = d.reasoning_tokens || 0;
+  const total = inTok + out;
+  if(!total) return "";
+  const seg = (v, cls) => v > 0 ? `<i class="${cls}" style="width:${(100 * v / total).toFixed(2)}%"></i>` : "";
+  return `<div class="usage-wrap"><div class="usage-row"><span>tokens</span><span class="usage-track">${seg(inTok - cache,"u-in")}${seg(cache,"u-cache")}${seg(out - think,"u-out")}${seg(think,"u-think")}</span><span class="num">${fmtInt(total)}</span></div>
+  <div class="legend"><span><i class="u-in"></i>input ${fmtInt(inTok - cache)}</span><span><i class="u-cache"></i>cached ${fmtInt(cache)}</span><span><i class="u-out"></i>output ${fmtInt(out - think)}</span><span><i class="u-think"></i>reasoning ${fmtInt(think)}</span></div></div>`;
+}
+function renderAggChat(agg){
+  const choice = (agg.choices || [])[0] || {};
+  const msg = choice.message || {};
+  let html = "";
+  if(msg.reasoning_content) html += `<div class="bubble think"><div class="role">reasoning</div>${textBlock(msg.reasoning_content, 500)}</div>`;
+  if(msg.content) html += `<div class="bubble asst"><div class="role">assistant ${choice.finish_reason ? `<span class="chip good">${esc(choice.finish_reason)}</span>` : ""}</div>${textBlock(msg.content, 4000)}</div>`;
+  for(const c of msg.tool_calls || []) html += toolCallCard(c.function && c.function.name, c.function && c.function.arguments, c.id);
+  if(msg.refusal) html += `<div class="err-note">refusal: ${esc(msg.refusal)}</div>`;
+  return html || `<div class="empty">无输出内容</div>`;
+}
+function renderAggResponses(agg){
+  let html = "";
+  for(const item of agg.output || []){
+    const type = item.type;
+    if(type === "reasoning"){
+      const text = (item.summary || []).map(s => s.text || "").join("\n\n");
+      if(text) html += `<div class="bubble think"><div class="role">reasoning summary</div>${textBlock(text, 500)}</div>`;
+    } else if(type === "message"){
+      html += `<div class="bubble asst"><div class="role">assistant ${agg.status ? `<span class="chip good">${esc(agg.status)}</span>` : ""}</div>${renderContentParts(item.content)}</div>`;
+    } else if(type === "function_call"){
+      html += toolCallCard(item.name, item.arguments, item.call_id);
+    } else {
+      html += `<div class="bubble">${jsonFold(type || "output item", item)}</div>`;
+    }
+  }
+  return html || `<div class="empty">无输出内容</div>`;
+}
+function parseSse(raw){
+  const events = [];
+  let ev = null, data = [];
+  for(const line of String(raw).split(/\r?\n/)){
+    if(line === ""){ if(ev !== null || data.length) events.push({event: ev, data: data.join("\n")}); ev = null; data = []; continue; }
+    if(line.startsWith("event:")) ev = line.slice(6).trim();
+    else if(line.startsWith("data:")) data.push(line.slice(5).trim());
+  }
+  if(ev !== null || data.length) events.push({event: ev, data: data.join("\n")});
+  return events;
+}
+function sseLabel(e, format){
+  if(e.event) return e.event;
+  if(e.data === "[DONE]") return "[DONE]";
+  try {
+    const d = JSON.parse(e.data);
+    const delta = d.choices && d.choices[0] && d.choices[0].delta || {};
+    if(delta.tool_calls) return "delta.tool_calls";
+    if(delta.reasoning_content) return "delta.reasoning";
+    if(delta.content != null) return "delta.content";
+    if(d.choices && d.choices[0] && d.choices[0].finish_reason) return "finish:" + d.choices[0].finish_reason;
+    if(d.usage) return "usage";
+    return "chunk";
+  } catch { return "data"; }
+}
+function sseSummary(e){
+  if(e.data === "[DONE]") return "";
+  try {
+    const d = JSON.parse(e.data);
+    const delta = d.choices && d.choices[0] && d.choices[0].delta;
+    if(delta){
+      if(delta.content) return JSON.stringify(delta.content);
+      if(delta.reasoning_content) return JSON.stringify(delta.reasoning_content);
+      if(delta.tool_calls){ const c = delta.tool_calls[0] || {}; return (c.function && (c.function.name || "")) + " " + JSON.stringify((c.function && c.function.arguments) || ""); }
+    }
+    if(d.delta != null) return JSON.stringify(d.delta);
+    if(typeof d.text === "string") return JSON.stringify(d.text);
+    if(d.item && d.item.type) return "item: " + d.item.type + (d.item.name ? " · " + d.item.name : "");
+    if(d.response && d.response.status) return "status: " + d.response.status;
+    if(d.usage) return "usage " + JSON.stringify(d.usage);
+    return e.data.slice(0, 100);
+  } catch { return e.data.slice(0, 100); }
+}
+function renderSseTimeline(raw, format){
+  const events = parseSse(raw);
+  if(!events.length) return `<div class="empty">响应体不是 SSE 流</div>`;
+  const groups = [];
+  // 相邻同类 delta 折叠成一组，避免几百行同名事件刷屏
+  for(const e of events){
+    const label = sseLabel(e, format);
+    const last = groups[groups.length - 1];
+    if(last && last.label === label && label.startsWith("delta")) { last.items.push(e); }
+    else groups.push({label, items: [e]});
+  }
+  let index = 0;
+  return `<div style="max-height:520px;overflow-y:auto">` + groups.map(g => {
+    const first = g.items[0];
+    const count = g.items.length;
+    const start = index; index += count;
+    const merged = g.label.startsWith("delta") ? g.items.map(sseSummary).map(s => { try { return JSON.parse(s); } catch { return s; } }).join("") : sseSummary(first);
+    return `<div class="sse-row"><div class="head" onclick="this.nextElementSibling.hidden=!this.nextElementSibling.hidden">
+        <span class="idx">${start}${count > 1 ? "–" + (start + count - 1) : ""}</span>
+        <span class="ev">${esc(g.label)}${count > 1 ? " ×" + count : ""}</span>
+        <span class="sum">${esc(String(merged).slice(0, 160))}</span></div>
+      <pre class="code" hidden>${esc(g.items.slice(0, 50).map(e => (e.event ? "event: " + e.event + "\n" : "") + "data: " + e.data).join("\n\n"))}${count > 50 ? "\n\n… 其余 " + (count - 50) + " 条略" : ""}</pre></div>`;
+  }).join("") + `</div>`;
+}
+
+/* ---------- detail view ---------- */
+function activateTabs(root){
+  root.querySelectorAll(".tabs").forEach(tabs => {
+    tabs.querySelectorAll(".tab").forEach(tab => tab.onclick = () => {
+      tabs.querySelectorAll(".tab").forEach(x => x.classList.remove("on"));
+      tab.classList.add("on");
+      const wrap = tabs.parentElement;
+      wrap.querySelectorAll(":scope > .pane").forEach(p => p.hidden = p.dataset.pane !== tab.dataset.tab);
+    });
+  });
+}
+async function renderDetail(id){
+  const d = await api(`/api/requests/${id}`);
+  let reqJson = null, aggJson = null;
+  try { reqJson = d.req_body ? JSON.parse(d.req_body) : null; } catch {}
+  try { aggJson = d.agg_response ? JSON.parse(d.agg_response) : null; } catch {}
+  const format = d.format || "chat-completions";
+  const isResponses = format === "responses";
+
+  const convo = reqJson ? (isResponses ? renderResponsesConversation(reqJson) : renderChatConversation(reqJson))
+    : `<div class="warn-note">请求正文不可用${d.req_truncated ? "（已被截断——调大 OCR_MODEL_LOG_MAX_BODY_BYTES）" : "（metadata 模式或该行丢失）"}</div>`;
+  const agg = aggJson ? (isResponses ? renderAggResponses(aggJson) : renderAggChat(aggJson))
+    : d.outcome === "ok" ? `<div class="warn-note">未能聚合出终态（流被取消/截断，可看事件流原始视图）</div>` : "";
+
+  let respNotes = "";
+  if(d.outcome === "http_error") respNotes += `<div class="err-note">上游 HTTP ${d.status}${d.resp_body ? `<pre class="code">${esc(pretty(d.resp_body)).slice(0,4000)}</pre>` : ""}</div>`;
+  if(d.outcome === "transport_error") respNotes += `<div class="err-note">传输错误：${esc(d.error_message || "")}</div>`;
+  if(d.outcome === "cancelled") respNotes += `<div class="warn-note">客户端取消 · 阶段 ${esc(d.cancel_stage || "?")} · ${fmtMs(d.duration_ms)}</div>`;
+  if(d.outcome === "ok" && d.stream && d.protocol_complete === 0) respNotes += `<div class="warn-note">HTTP 200 但未收到协议终态（流中断）</div>`;
+  if(d.resp_truncated) respNotes += `<div class="warn-note">响应正文超出捕获上限已截断（${fmtBytes(d.resp_bytes)} 实际）</div>`;
+
+  $view.innerHTML = `
+    <h2 class="vh"><a href="#/requests">← 请求列表</a></h2>
+    <div class="meta-bar">
+      <span class="muted">req</span><span>${esc(d.request_id)}</span>
+      ${fmtChip(d.format)}${streamChip(d.stream)}
+      ${outcomeChip(d)}
+      <span class="chip ${d.route_mode === "header" ? "dim" : "warn"}">${esc(d.route_mode || "")}</span>
+      <span class="num">${fmtMs(d.duration_ms)}</span>
+      <span class="mono muted">${esc(d.model || "")}</span>
+      <span class="mono muted">${esc(d.client_ip || "")} → ${esc((d.upstream_url || "").replace(/^https?:\/\//, ""))}</span>
+      <span class="num muted">${fmtTime(d.ts)}</span>
+    </div>
+    <div class="detail-grid">
+      <div>
+        <div class="tabs">
+          <span class="tab on" data-tab="convo">会话视图</span>
+          <span class="tab" data-tab="tools">工具 (${reqJson && reqJson.tools ? reqJson.tools.length : 0})</span>
+          <span class="tab" data-tab="params">参数</span>
+          <span class="tab" data-tab="rawreq">原始 JSON</span>
+        </div>
+        <div class="pane" data-pane="convo">${convo}</div>
+        <div class="pane" data-pane="tools" hidden>${reqJson ? renderToolDefs(reqJson, format) : ""}</div>
+        <div class="pane" data-pane="params" hidden>${reqJson ? renderParams(reqJson) : ""}</div>
+        <div class="pane" data-pane="rawreq" hidden><div class="muted mono" style="font-size:11px;margin-bottom:6px">发给上游的最终请求 · ${fmtBytes(d.req_bytes)}</div><pre class="code" style="max-height:520px;overflow-y:auto">${esc(d.req_body ? pretty(d.req_body) : "(无)")}</pre></div>
+      </div>
+      <div>
+        <div class="tabs">
+          <span class="tab on" data-tab="agg">聚合终态</span>
+          <span class="tab" data-tab="sse">事件流</span>
+          <span class="tab" data-tab="rawresp">原始</span>
+        </div>
+        <div class="pane" data-pane="agg">${respNotes}${agg}${usageBar(d)}
+          ${d.finish_reason ? `<div class="muted mono" style="font-size:11px;margin-top:6px">finish: ${esc(d.finish_reason)} · complete=${d.complete} · protocol_complete=${d.protocol_complete}</div>` : ""}</div>
+        <div class="pane" data-pane="sse" hidden>${d.resp_body && d.stream ? renderSseTimeline(d.resp_body, format) : `<div class="empty">非流式响应，无事件流</div>`}</div>
+        <div class="pane" data-pane="rawresp" hidden>
+          ${d.resp_headers ? `<div class="muted mono" style="font-size:11px;margin-bottom:4px">headers</div><pre class="code">${esc(pretty(d.resp_headers))}</pre>` : ""}
+          <div class="muted mono" style="font-size:11px;margin:6px 0 4px">上游原始响应体 · ${fmtBytes(d.resp_bytes)}</div>
+          <pre class="code" style="max-height:520px;overflow-y:auto">${esc(d.resp_body ? (d.resp_body.length > 200000 ? d.resp_body.slice(0,200000) + "\n\n…（截断显示）" : (d.stream ? d.resp_body : pretty(d.resp_body))) : "(无)")}</pre>
+        </div>
+      </div>
+    </div>`;
+  activateTabs($view);
+}
+
+/* ---------- router ---------- */
+async function route(){
+  const hash = location.hash || "#/";
+  document.getElementById("nav-overview").classList.toggle("on", hash === "#/" || hash === "");
+  document.getElementById("nav-requests").classList.toggle("on", hash.startsWith("#/requests") || hash.startsWith("#/r/"));
+  try {
+    if(hash.startsWith("#/r/")) await renderDetail(hash.slice(4));
+    else if(hash.startsWith("#/requests")) await renderList();
+    else await renderOverview();
+  } catch(err) {
+    $view.innerHTML = `<div class="err-note">加载失败：${esc(err.message)}</div>`;
+  }
+}
+function schedule(){
+  if(timer) clearInterval(timer);
+  timer = setInterval(() => {
+    if(!$auto.checked) return;
+    const hash = location.hash || "#/";
+    if(hash.startsWith("#/r/")) return; // 详情页不自动刷新
+    route();
+  }, 5000);
+}
+window.addEventListener("hashchange", route);
+$hours.addEventListener("change", route);
+document.getElementById("refresh").addEventListener("click", route);
+route(); schedule();
+</script>
+</body>
+</html>
