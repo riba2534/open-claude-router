@@ -149,7 +149,19 @@ jobs:
 
           probe "$(host_port 3457)"
           probe "$(host_port 3458)"
-          curl --fail --silent "http://127.0.0.1:$(host_port 3458)/" | grep -q "<title>Open Claude Router</title>"
+
+          # Capture the page instead of piping into grep: grep -q exits on the
+          # first match and closes the pipe, which makes curl fail with a write
+          # error (exit 23) whenever the body is still being written.
+          page="$(curl --fail --silent --show-error "http://127.0.0.1:$(host_port 3458)/")"
+          case "${page}" in
+            *"<title>Open Claude Router</title>"*) ;;
+            *)
+              echo "dashboard shell was not served on the lens port" >&2
+              docker logs "${container_id}" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Run forwarding-only smoke test
         shell: bash
