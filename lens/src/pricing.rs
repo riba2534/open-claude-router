@@ -1,5 +1,5 @@
-//! Cost estimation following the the reference methodology:
-//! five disjoint token buckets — uncached input, cache reads, cache writes,
+//! Cost estimation over five disjoint token buckets —
+//! uncached input, cache reads, cache writes,
 //! non-reasoning output, reasoning — each priced in USD per million tokens,
 //! model matched by longest case-insensitive substring, Sonnet-class fallback
 //! when nothing matches. OpenAI usage folds `cached` into `prompt_tokens` and
@@ -9,15 +9,16 @@
 //! is priced at the model's output rate so the total matches what the vendor
 //! actually bills for `completion_tokens`.
 //!
-//! Price list source: aligned with the reference `model_pricing` migration
-//! end-state (published vendor price sheets); gpt-5.5/5.4/5.2 use the
-//! current list prices rather than their older rows.
+//! Price list source: each vendor's published list price at the time of
+//! writing. Prices change; `LENS_PRICING_JSON` overrides or extends the
+//! table without a rebuild, and costs are computed at query time so an
+//! updated table reprices history automatically.
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelPrice {
-    /// Substring pattern (reference keeps SQL `%` suffixes; they are trimmed).
+    /// Substring pattern; a trailing SQL-style `%` is accepted and trimmed.
     pub pattern: String,
     pub display: String,
     /// USD per million tokens.
@@ -30,7 +31,7 @@ pub struct ModelPrice {
     pub reasoning: f64,
 }
 
-/// reference fallback when no pattern matches (Claude Sonnet-class rates).
+/// Fallback when no pattern matches (Claude Sonnet-class rates).
 static FALLBACK: ModelPrice = ModelPrice {
     pattern: String::new(),
     display: String::new(),
@@ -46,8 +47,8 @@ pub struct PricingTable {
 }
 
 impl PricingTable {
-    /// Defaults mirror the reference `model_pricing` migration end-state (see the
-    /// module header for the exact migration lineage).
+    /// Defaults come from the built-in table (see the module header for how
+    /// the prices are sourced and overridden).
     pub fn from_env() -> Self {
         let mut entries = default_entries();
         if let Ok(raw) = std::env::var("LENS_PRICING_JSON")
@@ -67,7 +68,7 @@ impl PricingTable {
         Self { entries }
     }
 
-    /// Longest-substring match, reference semantics.
+    /// Longest-substring match: the most specific pattern wins.
     pub fn matched(&self, model: &str) -> Option<&ModelPrice> {
         let lower = model.to_ascii_lowercase();
         let mut best: Option<&ModelPrice> = None;
@@ -87,8 +88,7 @@ impl PricingTable {
     /// `cache_creation` is the fifth, disjoint bucket — it is never part of
     /// `input`, so it is not deducted from it. Upstream OpenAI-protocol usage
     /// does not report a cache-write count, so lens currently always passes 0;
-    /// the term exists to keep the formula complete against reference's
-    /// five-bucket accounting.
+    /// the term exists to keep the five-bucket formula complete.
     pub fn estimate_usd(
         &self,
         model: &str,
@@ -117,7 +117,7 @@ impl PricingTable {
             / 1e6
     }
 
-    /// reference cost-breakdown extra: money saved versus paying full input price
+    /// Cost-breakdown extra: money saved versus paying full input price
     /// for the cached reads, clamped at zero.
     pub fn cache_savings_usd(&self, model: &str, cached: i64) -> f64 {
         let price = self.matched(model).unwrap_or(&FALLBACK);
@@ -148,7 +148,7 @@ fn entry(
 fn default_entries() -> Vec<ModelPrice> {
     vec![
         // Anthropic (cache write = 1.25x input; reasoning shadow-priced at the
-        // output rate, reference convention)
+        // output rate)
         entry(
             "claude-opus-4-5",
             "Claude Opus 4.5",
@@ -430,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_savings_follow_reference_formula() {
+    fn cache_savings_use_the_input_minus_cache_read_delta() {
         let table = table();
         // claude-sonnet-4: (3.0 - 0.3) per MTok saved on cached reads.
         let saved = table.cache_savings_usd("claude-sonnet-4-20250514", 2_000_000);

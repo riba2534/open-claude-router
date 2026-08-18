@@ -5,7 +5,7 @@
 <h1 align="center">open-claude-router</h1>
 
 <p align="center">
-  让 Claude Code 通过 Anthropic Messages API 使用 OpenAI Chat Completions 或 Responses 协议上游。
+  让 Claude Code 通过 Anthropic Messages API 使用 OpenAI Chat Completions 或 Responses 协议上游，<br/>并自带一个可视化看板，完整还原每一次经过 Router 的模型流量。
 </p>
 
 <p align="center">
@@ -27,7 +27,7 @@ Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(Ope
 
 服务的协议路由和会话是无状态的。上游 URL、Authorization 和模型名由客户端逐请求传入；服务端不读取上游配置文件、不持久化凭证、不维护对话状态。一份部署可以同时服务多个客户端和上游。
 
-上游凭证在转发时会经过 Router 进程，但不会写入模型交互日志。默认审计日志会记录转换后的上游请求、上游原始响应和直接客户端 IP，按 UTC 日期保存 7 天；可调整保留期、只记录元数据或完全关闭。
+上游凭证在转发时会经过 Router 进程，但不会写入模型交互日志。默认审计日志会记录客户端原始 Anthropic 请求、转换后的上游请求、上游原始响应和直接客户端 IP，按 UTC 日期保存 7 天；可调整保留期、只记录元数据或完全关闭。镜像同时内置流量观测看板（Lens）：读取这份日志，把每次转发还原成可视化的会话、工具调用与费用视图（见[流量观测看板](#流量观测看板lens)）。
 
 典型场景：
 
@@ -37,12 +37,14 @@ Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(Ope
 
 ## 目录
 
-[快速开始](#快速开始) · [配置说明](#配置说明) · [协议覆盖与边界](#协议覆盖与边界) · [API](#api) · [环境变量](#环境变量) · [模型交互日志](#模型交互日志) · [常见问题](#常见问题) · [安全](#安全)
+[快速开始](#快速开始) · [配置说明](#配置说明) · [协议覆盖与边界](#协议覆盖与边界) · [API](#api) · [环境变量](#环境变量) · [模型交互日志](#模型交互日志) · [流量观测看板](#流量观测看板lens) · [常见问题](#常见问题) · [安全](#安全)
 
 ## 特性
 
 - **路由和会话无状态**：服务侧不持久化 API Key、不读上游配置、不维护会话状态；上游信息由客户端逐请求传入
-- **模型交互日志**：按请求 ID 记录直接客户端 IP、接入模式、转换后实际发给上游的 JSON、上游原始 JSON/SSE 和取消阶段，默认按 UTC 天轮转并保留 7 天；正文模式、保留期、目录和单条上限均可配置
+- **模型交互日志**：按请求 ID 记录直接客户端 IP、接入模式、客户端原始 Anthropic 请求、转换后实际发给上游的 JSON、上游原始 JSON/SSE 和取消阶段，默认按 UTC 天轮转并保留 7 天；正文模式、保留期、目录和单条上限均可配置
+- **流量观测看板（Lens）**：镜像内置的 Web 后台（`:3458`），基于交互日志还原每次转发的双协议视角（Claude↔Router 的 Anthropic 侧、Router↔网关 的 OpenAI 侧），提供会话聚合、工具调用与思考块渲染、SSE 事件流、费用估算、调用方筛选和实时刷新；纯观测组件，不参与转发，可用 `LENS_ENABLED=false` 关闭
+- **调用方身份标签**：客户端可通过可选的 `X-OCR-Client` 请求头自报身份（如容器名 / 业务线），Router 记入日志、看板按其区分和筛选流量；该 header 只用于观测，不会被转发给上游
 - **Authorization 值透明转发**：合法的 Bearer 或非 Bearer 上游鉴权值不会被解析或重组
 - **覆盖 Claude Code 核心链路**：支持流式 SSE、工具调用、多模态输入、thinking、结构化输出、错误转换和客户端取消；不能安全转换的边界会明确报错
 - **支持两种 OpenAI 协议**：默认使用 Chat Completions；通过 `X-Upstream-Format: responses` 选择 Responses API
@@ -51,7 +53,7 @@ Claude Code  ──(Anthropic Messages)──▶  open-claude-router  ──(Ope
 - **结构化输出与严格工具**：Anthropic `output_config.format` 和 `tools[].strict` 分别映射到 Chat Completions / Responses 的正式结构，不按模型名猜测支持能力
 - **上游错误统一交给客户端重试**：上游返回任意非 2xx 时保留原状态码和错误内容，同时响应 `X-Should-Retry: true`，由 Claude Code 使用自身有界重试策略处理；服务端不读取错误文本后修改请求体重发
 - **两种接入方式**：上游信息可以放 HTTP header，也可以直接拼在 URL path 里
-- **Rust 单二进制运行时**：复用上游连接，流式链路逐 chunk 转换并传播背压与取消；应用进程只需一个可执行文件
+- **Rust 单二进制运行时**：复用上游连接，流式链路逐 chunk 转换并传播背压与取消；转发只需一个可执行文件，观测看板是可独立启停的第二个二进制
 
 ## 架构
 
@@ -69,6 +71,26 @@ flowchart LR
 
 服务收到 Anthropic 协议的请求后，从 HTTP header 或 URL path 解析出真实上游 URL 和 Authorization，把请求体转成对应的 OpenAI 协议（默认 Chat Completions，可通过 `X-Upstream-Format: responses` 切到 Responses API）调用上游，再把上游响应（SSE 流或 JSON）转回 Anthropic 格式返回。路由过程不读 provider 配置、不存任何凭证、不维护会话状态，因此可任意水平扩展；模型交互日志属于独立的运维观测数据，各实例可写各自的目录或集中采集。
 
+官方镜像内是**两个独立进程**：转发器 `open-claude-router`（`:3457`）和看板 `ocr-lens`（`:3458`）。二者之间没有任何 RPC，唯一的契约是磁盘上的 NDJSON 交互日志：
+
+```mermaid
+flowchart LR
+    subgraph Image["官方镜像（一个容器，两个进程）"]
+        Router["open-claude-router<br/>:3457 转发"]
+        Log[("模型交互日志<br/>NDJSON / 按 UTC 天")]
+        Lens["ocr-lens<br/>:3458 观测看板"]
+        Db[("SQLite<br/>lens.db")]
+        Router -- "异步追加写（fail-open）" --> Log
+        Log -- "只读 tail" --> Lens
+        Lens --> Db
+    end
+    Client["Claude Code"] --> Router
+    Router --> Upstream[("OpenAI 协议上游")]
+    Browser["浏览器"] --> Lens
+```
+
+转发器把每次交换异步追加写入日志（fail-open，日志故障不改变转发行为），看板只读地 tail 日志入 SQLite 并提供 Web 界面。看板还原请求响应时直接复用转发器的协议转换代码（`lens` crate 以库依赖引用 `rust` crate），因此展示的 Anthropic 响应与线上真实返回同源。任一侧故障不影响另一侧；`LENS_ENABLED=false` 时只启动转发器。
+
 ## 快速开始
 
 ### 1. 启动服务
@@ -81,17 +103,21 @@ flowchart LR
 
 ```bash
 docker pull riba2534/open-claude-router:latest
-docker run -d --name ocr --restart unless-stopped -p 3457:3457 \
-  -v ocr-model-logs:/app/logs \
+docker run -d --name ocr --restart unless-stopped \
+  -p 3457:3457 -p 3458:3458 \
+  -v ocr-model-logs:/app/logs -v ocr-lens-data:/app/data \
   riba2534/open-claude-router:latest
 ```
 
-服务监听 `:3457`，服务端无需任何配置即可启动。公网部署可加 `-e OCR_ACCESS_TOKENS=token1,token2`（`OCR` 即 open-claude-router 缩写）启用访问鉴权。
+转发服务监听 `:3457`，流量看板监听 `:3458`（浏览器打开 `http://<主机>:3458`），服务端无需任何配置即可启动。公网部署可加 `-e OCR_ACCESS_TOKENS=token1,token2`（`OCR` 即 open-claude-router 缩写）启用转发端鉴权。
+
+看板端口的暴露范围完全由你在启动时决定：只想本机访问就写 `-p 127.0.0.1:3458:3458`；不映射 `3458` 则外界不可达；只要纯转发可加 `-e LENS_ENABLED=false` 连看板进程都不启动。
 
 启动后验证服务就绪：
 
 ```bash
-curl http://localhost:3457/healthz   # 预期 {"status":"ok"}
+curl http://localhost:3457/healthz   # 转发服务，预期 {"status":"ok"}
+curl http://localhost:3458/healthz   # 观测看板，预期 {"status":"ok"}
 ```
 
 > 端口被占用时改宿主端口即可，例如 `-p 13457:3457`，并把下面 alias 里的 `localhost:3457` 同步改成 `localhost:13457`。
@@ -113,7 +139,7 @@ Linux / macOS：
 
 ```bash
 # 把版本和平台替换成 Release 页面中的实际值
-VERSION=v0.6.11
+VERSION=v0.7.0
 PLATFORM=linux-amd64
 ARCHIVE="open-claude-router-${VERSION}-${PLATFORM}.tar.gz"
 
@@ -130,7 +156,7 @@ cd "open-claude-router-${VERSION}-${PLATFORM}"
 Windows PowerShell：
 
 ```powershell
-$Version = "v0.6.11"
+$Version = "v0.7.0"
 $Platform = "windows-amd64" # Windows on ARM 使用 windows-arm64
 $Archive = "open-claude-router-$Version-$Platform.zip"
 
@@ -139,7 +165,7 @@ Expand-Archive $Archive
 & ".\open-claude-router-$Version-$Platform\open-claude-router.exe"
 ```
 
-二进制默认监听 `0.0.0.0:3457`，模型交互日志写到当前目录的 `./logs`；端口、鉴权和日志配置与 Docker 版本使用相同的[环境变量](#环境变量)。macOS/Windows 产物目前没有商业代码签名；如系统拦截，请先用 `SHA256SUMS` 验证文件确实来自本项目 Release，再按系统提示放行。
+二进制默认监听 `0.0.0.0:3457`，模型交互日志写到当前目录的 `./logs`；端口、鉴权和日志配置与 Docker 版本使用相同的[环境变量](#环境变量)。Release 归档只包含**转发器**，[流量观测看板](#流量观测看板lens)随官方 Docker 镜像发布，也可从源码自行构建（见下方开发者章节）。macOS/Windows 产物目前没有商业代码签名；如系统拦截，请先用 `SHA256SUMS` 验证文件确实来自本项目 Release，再按系统提示放行。
 
 </details>
 
@@ -147,16 +173,20 @@ Expand-Archive $Archive
 <summary>开发者：本地裸跑</summary>
 
 ```bash
-# 直接运行 Rust 服务
+# 直接运行 Rust 转发服务
 rustup toolchain install 1.97.1 --profile minimal
 cargo run --manifest-path rust/Cargo.toml
 
 # release 二进制
 cargo build --locked --release --manifest-path rust/Cargo.toml
 ./rust/target/release/open-claude-router
+
+# 另开一个终端跑观测看板（读同一份交互日志目录）
+OCR_MODEL_LOG_DIR=./logs LENS_DB_PATH=./data/lens.db \
+  cargo run --manifest-path lens/Cargo.toml
 ```
 
-仓库、测试和生产镜像均只包含 Rust 实现。
+仓库有两个 Rust crate：`rust/`（转发器，同时是被看板复用的协议转换库）和 `lens/`（观测看板）。官方镜像同时包含两者。
 
 > 镜像只能由仓库的 GitHub Actions 发布流程构建并推送。本机和部署机器禁止执行 `docker build` / `docker buildx build`，只允许拉取已发布镜像并做运行验证。
 </details>
@@ -327,14 +357,22 @@ cargo test --locked --manifest-path rust/Cargo.toml --all-targets
 cargo build --locked --release --manifest-path rust/Cargo.toml
 ```
 
+看板 crate 同样需要通过：
+
+```bash
+cargo fmt --manifest-path lens/Cargo.toml -- --check
+cargo clippy --locked --manifest-path lens/Cargo.toml --all-targets --all-features -- -D warnings
+cargo test --locked --manifest-path lens/Cargo.toml --all-targets
+```
+
 协议改动必须同时增加对应的 Rust 单元测试或 `rust/tests/router_contract.rs` HTTP 契约测试。测试 fixture 不得写入真实 endpoint、模型名或凭证。
 
 ### 发布版本
 
 推送版本 tag 时，GitHub Actions 会自动执行 Rust fmt/clippy/test 和 release 构建。验证通过后会同时发布：
 
-- Docker Hub `linux/amd64`、`linux/arm64` 多架构镜像，并校验 manifest / attestations；
-- GitHub Release 的 Linux、macOS、Windows amd64/arm64 六个二进制归档和 `SHA256SUMS`。
+- Docker Hub `linux/amd64`、`linux/arm64` 多架构镜像（含转发器与观测看板两个二进制），并校验 manifest / attestations；
+- GitHub Release 的 Linux、macOS、Windows amd64/arm64 六个转发器二进制归档和 `SHA256SUMS`。
 
 所有产物都在对应架构的 GitHub 托管 Runner 上原生编译，不使用 QEMU。发布前须在仓库 Actions secrets 配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`；tag 必须是 SemVer（可带 `v` 前缀），且必须与 `rust/Cargo.toml` 一致。使用 annotated tag，并显式推送该 tag：
 
@@ -375,6 +413,7 @@ git push origin "refs/tags/v${version}"
 | `Authorization: Bearer <token>` | header | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | 服务自身访问鉴权 |
 | `X-OCR-Token` | path | 仅 `OCR_ACCESS_TOKENS` 启用时校验 | path 模式下 `Authorization` 被上游凭证占用，服务鉴权改走此 header |
 | `X-Upstream-Format` | 两种模式都可用 | 可选 | `chat-completions`（默认）或 `responses`，声明上游 OpenAI 协议变体 |
+| `X-OCR-Client` | 两种模式都可用 | 可选 | 调用方自报身份标签（trim 后截断至 120 字符），记入交互日志的 `client_tag` 字段并用于看板筛选；**只用于观测，不会被转发给上游**。Claude Code 客户端可经 `ANTHROPIC_CUSTOM_HEADERS` 注入 |
 
 ### Path 模式
 
@@ -398,16 +437,30 @@ Claude Code 会自动追加 `/v1/messages`，服务端识别并砍掉这个后�
 | `OCR_MODEL_LOG_MODE` | `full` | 模型交互日志正文模式：`full` 记录正文、`metadata` 仅记录模型/状态/耗时/字节数、`off` 关闭 |
 | `OCR_MODEL_LOG_RETENTION_DAYS` | `7` | 模型交互日志保留的 UTC 自然日数（非负整数）；`0` 等价于关闭日志，与 `OCR_MODEL_LOG_MODE=off` 效果相同 |
 | `OCR_MODEL_LOG_DIR` | `./logs` | 日志目录；官方镜像工作目录下对应 `/app/logs` |
-| `OCR_MODEL_LOG_MAX_BODY_BYTES` | `1048576` | 每个请求或响应最多保留的正文 byte 数；超出后只截断日志副本，不影响实际转发 |
+| `OCR_MODEL_LOG_MAX_BODY_BYTES` | `1048576` | 每个请求或响应最多保留的正文 byte 数；超出后只截断日志副本，不影响实际转发。官方镜像调为 32 MiB，保证看板能完整还原大请求 |
+
+以下变量属于[流量观测看板](#流量观测看板lens)进程（`ocr-lens`），对转发行为没有任何影响：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `LENS_ENABLED` | `true` | 官方镜像 entrypoint 使用；设为 `false` / `0` / `no` / `off` 时只启动转发器，不启动看板 |
+| `LENS_PORT` | `3458` | 看板监听端口 |
+| `LENS_HOST` | `0.0.0.0` | 看板监听地址；容器内保持 `0.0.0.0`，暴露范围用 `docker run -p` 控制 |
+| `LENS_DB_PATH` | `data/lens.db` | SQLite 文件路径（相对当前工作目录）；官方镜像对应 `/app/data/lens.db` |
+| `LENS_ACCESS_TOKEN` | unset | 设置后所有数据接口需带 `X-Lens-Token: <token>` 或 `?token=<token>`（页面本身会弹出令牌输入框）；不设则不鉴权 |
+| `LENS_RETENTION_DAYS` | `30` | 看板数据库保留天数（按记录时间），每小时清理一次；`0` 表示不清理 |
+| `LENS_PRICING_JSON` | unset | 追加价目表条目的 JSON 数组，条目形如 `[{"pattern":"my-model","display":"My Model","input":5,"output":30,"cache_read":0.5,"cache_creation":0,"reasoning":30}]`（单位 USD/MTok）；按模型名最长子串匹配，同长度时自定义条目优先，解析失败会告警并回落内置表 |
+| `OCR_MODEL_LOG_DIR` | `logs` | 与转发器共用；看板从这里读取 NDJSON 日志，必须与转发器指向同一目录 |
 
 > 上游请求默认超时 **1 小时**（`rust/src/main.rs`，为长补全 / 推理模型留足余量），目前硬编码、暂不可通过环境变量调整。客户端中断（Ctrl+C）会立即取消当前上游读取。
 
 ### 模型交互日志
 
-模型交互日志用于直接核对 Router 的协议边界：`model_request` 是 Anthropic 请求完成转换后、实际发给模型方的 OpenAI JSON；`model_response` 是任何响应转换发生前的上游原始 JSON 或 SSE。二者通过 `request_id` 关联，另含以下追溯字段：
+模型交互日志用于直接核对 Router 的协议边界：`client_request` 是客户端发来的原始 Anthropic JSON（转换发生前）；`model_request` 是 Anthropic 请求完成转换后、实际发给模型方的 OpenAI JSON；`model_response` 是任何响应转换发生前的上游原始 JSON 或 SSE。三者通过 `request_id` 关联，另含以下追溯字段：
 
 - `client_ip`：TCP 直连客户端 IP，不含临时端口；不信任也不读取客户端可伪造的 `X-Forwarded-For` / `X-Real-IP`。部署在反向代理后时这里记录代理 IP，应由代理单独保留真实来源日志。
 - `route_mode`：`header` 或 `embedded-path`，用于区分两种接入方式。
+- `client_tag`：调用方经 `X-OCR-Client` header 自报的身份标签（未提供时为 null）。
 - 上游 URL（已移除 userinfo、query、fragment）、协议格式、模型、HTTP 状态、耗时和正文 byte 数。
 - `complete` 表示原始 HTTP body 是否读到 EOF；`protocol_complete` 表示流中是否已经出现 `[DONE]` 或正式 Responses 终态。两者分开后，可以区分“协议已完成后取消底层读取”和真正的半途断开。
 - 客户端在上游响应完成前断开时写 `model_cancelled`，并用 `stage` 区分 `waiting_for_upstream_response` 与 `reading_upstream_response`；连接上游失败则写 `model_transport_error`。正常运行且日志存储可写时，每个已发往上游的 `model_request` 都会留下可关联的终态；进程被强杀或日志 fail-open 丢弃时仍可能缺失。
@@ -466,6 +519,71 @@ OCR_MODEL_LOG_MODE=off cargo run --manifest-path rust/Cargo.toml
 
 > ⚠️ Docker bridge 模式（`-p` 端口映射）下，**不要**在容器内设 `HOST=127.0.0.1`——docker-proxy 是从宿主转发到容器 IP（通常 `172.17.x.x`），容器只听 lo 接口会直接连不通。要限制宿主访问范围，改宿主端口绑定（`-p 127.0.0.1:3457:3457`），容器内继续 `0.0.0.0`。
 
+## 流量观测看板（Lens）
+
+官方镜像内置的只读 Web 看板，默认监听 `:3458`，浏览器直接打开即可。它不参与转发，只 tail 转发器写下的模型交互日志、落进 SQLite 并做可视化；看板挂掉不影响转发，转发器写日志失败也不影响转发。
+
+```bash
+# 镜像已经同时启动了两个进程，打开浏览器即可
+open http://localhost:3458
+```
+
+<p align="center">
+  <img src="docs/lens-detail.png" alt="请求详情：Claude ↔ Router 视角" width="900" />
+  <br/>
+  <sub>请求详情页 · Claude ↔ Router（Anthropic）视角，thinking 与 Markdown 正文都已结构化渲染</sub>
+</p>
+
+<p align="center">
+  <img src="docs/lens-overview.png" alt="总览页" width="900" />
+  <br/>
+  <sub>总览页 · 请求量、成功率、延迟分位、token 与费用汇总（图中为本地 mock 上游产生的演示数据）</sub>
+</p>
+
+### 能看到什么
+
+| 页面 | 内容 |
+|---|---|
+| **总览** | 请求数、成功/失败、token 与费用汇总、模型与调用方分布、最近请求 |
+| **请求** | 按时间倒序的请求列表，可按调用方筛选；点进去是单次交换的完整还原 |
+| **会话** | 按 Claude Code 会话聚合的对话，含轮次、累计 token 与费用 |
+
+请求详情页提供**双视角**，对应 Router 两侧的协议边界：
+
+- **Claude ↔ Router（Anthropic）**：客户端发来的原始请求，以及还原成 Anthropic 格式的响应。还原直接复用转发器的转换代码（`transform_chat_json_response` / `transform_responses_json` / SSE 聚合），与线上真实返回一致。
+- **Router ↔ 上游（OpenAI）**：转换后实际发出的 JSON，以及上游原始 JSON / SSE 事件流。
+
+两侧都支持渲染视图与原始 JSON 双切换：Markdown 正文、思考块、工具调用与工具结果都会结构化展开，JSON 以可折叠的语法高亮树呈现，整块（system / 每条消息 / 每个工具调用）可点标题栏折叠，默认全展开以便浏览器内 `Ctrl+F` 搜索。详情页还能一键生成复现该次上游调用的 `curl` 命令。
+
+### 会话聚合口径
+
+会话严格按 **Claude Code 自己的 session id** 聚合：客户端在 `metadata.user_id` 中携带该 id，看板解析后与调用方标识组合成 `<调用方>:<session_id>` 作为会话键（不同调用方可能生成相同的确定性 id，因此必须带调用方前缀）。请求里没有 session id 时，回落到 `客户端 IP + system 提示词头部 + 首条 user 消息头部` 的启发式指纹。
+
+### 区分调用方
+
+Router 不猜测调用方身份，也不从部署环境推断——身份由调用方自己声明：请求带上 `X-OCR-Client: <标签>`，Router 原样记录到日志的 `client_tag`，看板据此分组和筛选。它只用于观测，不会被转发给上游（发往上游的额外 header 只来自客户端在 `X-Upstream-Headers` 中显式声明的内容）；不带这个 header 时按客户端 IP 归类。
+
+Claude Code 侧通过环境变量注入即可：
+
+```bash
+export ANTHROPIC_CUSTOM_HEADERS="X-OCR-Client: my-laptop"
+```
+
+多条 header 用换行分隔。容器化部署可以把容器名、业务线或链路名写进去，看板顶栏就能按标签筛选各自的流量。
+
+### 费用估算
+
+费用按五个互斥 token 桶估算：把 usage 归一成五个桶（未命中缓存的输入、缓存读、缓存写、普通输出、reasoning），分别乘以内置价目表中的 USD/MTok；模型按名称最长子串匹配，未命中时回退 Sonnet 档位。价目表可用 `LENS_PRICING_JSON` 追加或覆盖，且费用是**查询时实时计算**的，改价会自动作用于历史数据。
+
+> 这是估算值，不是账单：以上游自己报告的 usage 为输入，部分网关不报告 cached tokens，此时缓存读会按全价计入。
+
+### 关闭与访问控制
+
+- `LENS_ENABLED=false` 时容器只启动转发器，不启动看板进程。
+- 看板默认不鉴权，**任何能访问该端口的人都能看到完整提示词和模型输出**。镜像本身不对你的网络做任何假设：只想本机可见就用 `-p 127.0.0.1:3458:3458`，不映射端口则外部不可达，需要口令再加 `-e LENS_ACCESS_TOKEN=...`——页面会提示输入令牌，接口也接受 `X-Lens-Token` header 或 `?token=` 查询参数。
+- 看板只读取日志，`OCR_MODEL_LOG_MODE=metadata` / `off` 时相应地看不到正文；单条正文超过 `OCR_MODEL_LOG_MAX_BODY_BYTES` 会被截断，官方镜像默认放到 32 MiB 就是为了保证大请求可还原。
+- 看板数据落在 `LENS_DB_PATH`（镜像内 `/app/data/lens.db`），需要持久化就挂卷；`LENS_RETENTION_DAYS` 控制保留期。
+
 ## 常见问题
 
 - **上游错误会重试吗**：会上报为可重试。上游返回任意非 2xx、连接/读取超时，或已请求上游后发现 JSON/SSE 畸形、截断、缺少正式终态时，服务保留/映射状态与 Anthropic 错误体，并增加 `X-Should-Retry: true`。合法、单值的 `Retry-After`（非负秒数或 HTTP-date）和 `Retry-After-Ms`（非负毫秒数）会保持原值返回；重复或畸形值会被丢弃，不会连带透传其他上游响应头。实时 SSE 只能在初始 HTTP 响应已有这些提示时返回，因为流开始后 HTTP header 已不可修改。本地请求校验 400 不带该 header；只有明确的客户端断开返回 499 且不标记重试。具体次数和退避由 Claude Code 决定，Router 自身始终只请求上游一次。
@@ -483,6 +601,8 @@ OCR_MODEL_LOG_MODE=off cargo run --manifest-path rust/Cargo.toml
 - JSON 运行日志和模型交互日志都不记录请求 Header；模型交互日志中的上游 URL 会移除 userinfo、query 和 fragment
 - `client_ip` 属于访问来源数据，`full` 模式还会记录提示词、工具内容和模型输出；敏感场景请缩短 `OCR_MODEL_LOG_RETENTION_DAYS`，或改用 `OCR_MODEL_LOG_MODE=metadata` / `off`
 - 不要把上游凭证写入版本控制；可以保存在权限受限的个人 shell 配置中，或在启动 alias 前由本机凭证工具注入
+- 观测看板（`:3458`）是完整提示词和模型输出的可读视图，默认不鉴权。镜像不对部署网络做任何假设，端口的可达范围由你在 `docker run` 时决定：仅本机可见用 `-p 127.0.0.1:3458:3458`，不需要看板就不映射该端口或设 `LENS_ENABLED=false`，需要共享访问时用 `LENS_ACCESS_TOKEN` 并在其前面加 HTTPS 反代
+- `X-OCR-Client` 是调用方自报的标签，Router 只做记录、不做校验，也不会把它转发给上游；不要把它当作可信身份，也不要在其中写入敏感信息
 
 ## Star History
 

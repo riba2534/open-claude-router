@@ -9,6 +9,10 @@ on:
     paths:
       - ".github/workflows/docker-release.yml"
       - "rust/**"
+      - "lens/**"
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
+      - ".dockerignore"
   workflow_dispatch:
 
 permissions:
@@ -25,7 +29,9 @@ jobs:
   validate:
     name: Validate Rust release
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Covers both crates from a cold cache; the lens crate statically builds
+    # SQLite, which alone takes a couple of minutes on a hosted runner.
+    timeout-minutes: 35
     outputs:
       release_version: ${{ steps.version.outputs.release_version }}
     steps:
@@ -76,6 +82,17 @@ jobs:
 
       - name: Build release binary
         run: cargo build --locked --release --manifest-path rust/Cargo.toml
+
+      # The published image ships the lens dashboard alongside the router, so
+      # it gets the same gate before anything is released.
+      - name: Check dashboard formatting
+        run: cargo fmt --manifest-path lens/Cargo.toml -- --check
+
+      - name: Lint dashboard
+        run: cargo clippy --locked --manifest-path lens/Cargo.toml --all-targets --all-features -- -D warnings
+
+      - name: Run dashboard tests
+        run: cargo test --locked --manifest-path lens/Cargo.toml --all-targets
 
   build-binaries:
     name: Build binary for ${{ matrix.platform }} natively

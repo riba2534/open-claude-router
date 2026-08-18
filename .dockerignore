@@ -5,6 +5,8 @@
 .vscode
 .worktrees
 rust/target
+lens/target
+lens/data
 logs
 *.log
 .DS_Store

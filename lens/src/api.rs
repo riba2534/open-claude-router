@@ -623,7 +623,7 @@ fn build_sessions(
     let mut base_values: Vec<SqlValue> = vec![SqlValue::from(since)];
     base_values.extend(cf_values.iter().cloned());
     // Sessions can mix models (main model plus background helpers), so cost is
-    // priced per (session, model) split and then summed, reference-style.
+    // priced per (session, model) split and then summed.
     let mut costs: HashMap<String, f64> = HashMap::new();
     {
         let mut statement = conn.prepare(&format!(

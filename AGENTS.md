@@ -4,6 +4,8 @@
 
 `open-claude-router` is a stateless Rust service that converts Anthropic Messages requests to OpenAI Chat Completions or Responses and converts upstream responses back to Anthropic format. The Cargo project is in `rust/` and uses Axum, Tokio, Reqwest, Serde, and rustls.
 
+`lens/` is a separate Cargo project: the traffic observability dashboard. It tails the router's model interaction logs into SQLite and serves a web UI; it depends on `rust/` as a library to replay the router's own SSE aggregation and protocol transforms, and must never change forwarding behavior. The released container image runs both binaries (`LENS_ENABLED=false` for forwarding-only).
+
 The router receives the upstream URL, authorization value, model, and compatibility controls on every request. It must not load provider configuration or persist credentials.
 
 ## Required checks
@@ -15,6 +17,14 @@ cargo fmt --manifest-path rust/Cargo.toml -- --check
 cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets --all-features -- -D warnings
 cargo test --locked --manifest-path rust/Cargo.toml --all-targets
 cargo build --locked --release --manifest-path rust/Cargo.toml
+```
+
+When `lens/` changes (or the transform exports it consumes change), also run:
+
+```bash
+cargo fmt --manifest-path lens/Cargo.toml -- --check
+cargo clippy --locked --manifest-path lens/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path lens/Cargo.toml
 ```
 
 Protocol changes require focused unit tests and HTTP contract tests. Do not place real endpoints, model names, credentials, or private gateway details in source, tests, documentation, commits, or logs.
@@ -39,6 +49,9 @@ If image validation requires a new image, push the appropriate commit/tag and le
 | Error envelopes and retry metadata | `rust/src/error.rs` |
 | Token estimation | `rust/src/tokenizer.rs` |
 | Model interaction logs | `rust/src/model_log.rs` |
+| Lens: log ingestion, sessions, retention | `lens/src/ingest.rs`, `lens/src/session.rs` |
+| Lens: response replay and cost estimation | `lens/src/derive.rs`, `lens/src/pricing.rs` |
+| Lens: HTTP API and web UI | `lens/src/api.rs`, `lens/static/index.html` |
 | HTTP contract tests | `rust/tests/router_contract.rs` |
 
 Both access modes converge on the same conversion and transport path:
