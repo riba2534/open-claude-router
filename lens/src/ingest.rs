@@ -236,7 +236,7 @@ fn backfill_sessions(db: &Db) {
     let rows: Vec<(String, String, Option<String>, String)> = match db.with(|conn| {
         conn.prepare(
             "SELECT request_id, COALESCE(format,''), client_ip, req_body FROM exchanges
-             WHERE session_key IS NULL AND req_body IS NOT NULL",
+             WHERE (session_key IS NULL OR session_hint LIKE '<system-reminder>%') AND req_body IS NOT NULL",
         )?
         .query_map([], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))

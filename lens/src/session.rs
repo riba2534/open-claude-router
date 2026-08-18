@@ -35,7 +35,16 @@ pub fn derive(format: &str, client_ip: Option<&str>, payload: &Value) -> Session
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let hint = {
+        // Claude Code 会把注入的 <system-reminder> 块放在首条用户消息前面，
+        // 作为展示提示时跳过它们，取真正的用户内容。
         let trimmed = first_user.trim();
+        let trimmed = match trimmed.rfind("</system-reminder>") {
+            Some(pos) => {
+                let after = trimmed[pos + "</system-reminder>".len()..].trim();
+                if after.is_empty() { trimmed } else { after }
+            }
+            None => trimmed,
+        };
         if trimmed.is_empty() {
             None
         } else {

@@ -91,6 +91,7 @@ table.data tr.row:hover { background:var(--surface-2); }
 .seg button.on { background:var(--accent); color:#fff; font-weight:600; }
 .seg button:not(.on):hover { background:var(--surface-2); }
 .detail-grid { display:grid; grid-template-columns:1.08fr 1fr; gap:16px; align-items:start; }
+.detail-grid > div { min-width:0; }
 @media (max-width:1000px){ .detail-grid { grid-template-columns:1fr; } }
 
 .tabs { display:flex; gap:2px; flex-wrap:wrap; }
@@ -450,9 +451,10 @@ function jsonFold(label, value){
 /* ---------- charts ---------- */
 function stackChart(series, keys, colors, height, hours){
   if(!series || !series.length) return `<div class="empty">窗口内暂无数据</div>`;
-  const W = Math.max(660, series.length * 14), H = height || 150, pad = 30;
+  const W = Math.max(660, series.length * 14), H = height || 150;
   let max = 1;
   for(const p of series){ let s = 0; for(const k of keys) s += p[k] || 0; if(s > max) max = s; }
+  const pad = Math.max(30, fmtInt(max).length * 6.5 + 10);
   const slot = (W - pad) / series.length;
   const bw = Math.min(26, Math.max(3, Math.floor(slot) - 2));
   let bars = "";
@@ -633,17 +635,26 @@ async function renderSessionDetail(key){
 function renderContentParts(parts){
   if(typeof parts === "string") return textBlock(parts);
   if(!Array.isArray(parts)) return jsonFold("content", parts);
-  return parts.map(p => {
+  // 连续文本段合并渲染为一个块，避免每段各带一个 RAW 按钮堆叠
+  const out = [];
+  let buf = [];
+  const flush = () => { if(buf.length){ out.push(textBlock(buf.join("\n\n"))); buf = []; } };
+  for(const p of parts){
     const type = p.type || "";
-    if(type === "text" || type === "input_text" || type === "output_text") return textBlock(p.text);
+    if(type === "text" || type === "input_text" || type === "output_text"){ buf.push(p.text ?? ""); continue; }
+    flush();
     if(type === "image_url" || type === "input_image"){
       const url = typeof p.image_url === "string" ? p.image_url : (p.image_url && p.image_url.url) || "";
       const size = url.startsWith("data:") ? ` <span class="chip info">🖼 ${fmtBytes(Math.round(url.length * 0.75))}</span>` : "";
-      return url ? `<div><img src="${esc(url)}" alt="请求图片" loading="lazy">${size}</div>` : jsonFold("image", p);
+      out.push(url ? `<div><img src="${esc(url)}" alt="请求图片" loading="lazy">${size}</div>` : jsonFold("image", p));
+    } else if(type === "refusal"){
+      out.push(`<div class="err-note">refusal: ${esc(p.refusal || "")}</div>`);
+    } else {
+      out.push(jsonFold(type || "part", p));
     }
-    if(type === "refusal") return `<div class="err-note">refusal: ${esc(p.refusal || "")}</div>`;
-    return jsonFold(type || "part", p);
-  }).join("");
+  }
+  flush();
+  return out.join("");
 }
 function toolCallCard(name, args, id){
   return `<div class="bubble tcall"><div class="role">tool_call · ${esc(name || "?")} ${id ? `<span class="muted">${esc(String(id).slice(0,14))}</span>` : ""}</div><pre class="code">${esc(pretty(args))}</pre></div>`;
@@ -698,7 +709,7 @@ function renderToolDefs(p, format){
     const fn = format === "chat-completions" ? (t.function || t) : t;
     const schema = fn.parameters || fn.input_schema;
     return `<div class="bubble"><div class="role">${esc(fn.name || t.type || "?")} ${fn.strict ? '<span class="chip info">strict</span>' : ""}</div>
-      <div class="muted" style="font-size:12.5px">${esc(fn.description || "")}</div>
+      ${fn.description ? `<div style="font-size:12.5px;color:var(--muted)">${textBlock(fn.description, 320)}</div>` : ""}
       ${schema ? jsonFold("参数 schema", schema) : ""}</div>`;
   }).join("");
 }
@@ -716,11 +727,14 @@ function renderAnthropicMessage(m){
   const role = m.role || "user";
   const content = typeof m.content === "string" ? [{type:"text", text:m.content}] : (m.content || []);
   const inner = [], after = [];
+  let textBuf = [];
+  const flushText = () => { if(textBuf.length){ inner.push(textBlock(textBuf.join("\n\n"))); textBuf = []; } };
   for(const b of content){
+    if(b.type === "text"){ textBuf.push(b.text ?? ""); continue; }
+    flushText();
     switch(b.type){
-      case "text": inner.push(textBlock(b.text)); break;
       case "image": inner.push(anthropicImage(b)); break;
-      case "thinking": inner.push(`<div class="bubble think"><div class="role">thinking</div>${textBlock(b.thinking, 400)}</div>`); break;
+      case "thinking": if((b.thinking || "").trim()) inner.push(`<div class="bubble think"><div class="role">thinking</div>${textBlock(b.thinking, 400)}</div>`); break;
       case "redacted_thinking": inner.push(`<div class="bubble think"><div class="role">redacted_thinking</div><span class="muted">（内容已加密省略）</span></div>`); break;
       case "tool_use": after.push(toolCallCard(b.name, b.input, b.id)); break;
       case "tool_result": {
@@ -732,6 +746,7 @@ function renderAnthropicMessage(m){
       default: inner.push(jsonFold(b.type || "block", b));
     }
   }
+  flushText();
   const bubble = inner.length ? `<div class="bubble ${role === "user" ? "user" : "asst"}"><div class="role">${esc(role)}</div>${inner.join("")}</div>` : "";
   return bubble + after.join("");
 }
@@ -851,7 +866,8 @@ function renderSseTimeline(raw, format){
   for(const e of events){
     const label = sseLabel(e, format);
     const last = groups[groups.length - 1];
-    if(last && last.label === label && label.startsWith("delta")) { last.items.push(e); }
+    const isDelta = label.startsWith("delta") || label.endsWith(".delta");
+    if(last && last.label === label && isDelta) { last.items.push(e); }
     else groups.push({label, items: [e]});
   }
   let index = 0;
@@ -859,7 +875,8 @@ function renderSseTimeline(raw, format){
     const first = g.items[0];
     const count = g.items.length;
     const start = index; index += count;
-    const merged = g.label.startsWith("delta") ? g.items.map(sseSummary).map(s => { try { return JSON.parse(s); } catch { return s; } }).join("") : sseSummary(first);
+    const mergeable = g.label.startsWith("delta") || g.label.endsWith(".delta");
+    const merged = mergeable ? g.items.map(sseSummary).map(s => { try { return JSON.parse(s); } catch { return s; } }).join("") : sseSummary(first);
     return `<div class="sse-row"><div class="head" onclick="this.nextElementSibling.hidden=!this.nextElementSibling.hidden">
         <span class="idx">${start}${count > 1 ? "–" + (start + count - 1) : ""}</span>
         <span class="ev">${esc(g.label)}${count > 1 ? " ×" + count : ""}</span>
