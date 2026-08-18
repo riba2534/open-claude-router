@@ -844,7 +844,7 @@ function renderSseTimeline(raw, format){
     else groups.push({label, items: [e]});
   }
   let index = 0;
-  return `<div style="max-height:520px;overflow-y:auto">` + groups.map(g => {
+  return `<div>` + groups.map(g => {
     const first = g.items[0];
     const count = g.items.length;
     const start = index; index += count;
@@ -884,7 +884,7 @@ async function renderDetail(id){
     : d.outcome === "ok" ? `<div class="warn-note">未能聚合出终态（流被取消/截断，可看事件流原始视图）</div>` : "";
 
   let respNotes = "";
-  if(d.outcome === "http_error") respNotes += `<div class="err-note">上游 HTTP ${d.status}${d.resp_body ? jsonBlock(d.resp_body, 300) : ""}</div>`;
+  if(d.outcome === "http_error") respNotes += `<div class="err-note">上游 HTTP ${d.status}${d.resp_body ? jsonBlock(d.resp_body) : ""}</div>`;
   if(d.outcome === "transport_error") respNotes += `<div class="err-note">传输错误：${esc(d.error_message || "")}</div>`;
   if(d.outcome === "cancelled") respNotes += `<div class="warn-note">客户端取消 · 阶段 ${esc(d.cancel_stage || "?")} · ${fmtMs(d.duration_ms)}</div>`;
   if(d.outcome === "ok" && d.stream && d.protocol_complete === 0) respNotes += `<div class="warn-note">HTTP 200 但未收到协议终态（流中断）</div>`;
@@ -926,7 +926,7 @@ async function renderDetail(id){
         <div class="pane" data-pane="convo">${convo}</div>
         <div class="pane" data-pane="tools" hidden>${reqJson ? renderToolDefs(reqJson, format) : ""}</div>
         <div class="pane" data-pane="params" hidden>${reqJson ? renderParams(reqJson) : ""}</div>
-        <div class="pane" data-pane="rawreq" hidden><div class="muted mono" style="font-size:11px;margin-bottom:6px">发给上游的最终请求 · ${fmtBytes(d.req_bytes)}</div>${d.req_body ? jsonBlock(d.req_body, 520) : `<div class="empty">(无)</div>`}</div>
+        <div class="pane" data-pane="rawreq" hidden><div class="muted mono" style="font-size:11px;margin-bottom:6px">发给上游的最终请求 · ${fmtBytes(d.req_bytes)}</div>${d.req_body ? jsonBlock(d.req_body) : `<div class="empty">(无)</div>`}</div>
       </div>
       <div>
         <div class="tabs">
@@ -940,7 +940,7 @@ async function renderDetail(id){
         <div class="pane" data-pane="rawresp" hidden>
           ${d.resp_headers ? `<div class="muted mono" style="font-size:11px;margin-bottom:4px">headers</div>${jsonBlock(d.resp_headers)}` : ""}
           <div class="muted mono" style="font-size:11px;margin:6px 0 4px">上游原始响应体 · ${fmtBytes(d.resp_bytes)}</div>
-          ${!d.resp_body ? `<div class="empty">(无)</div>` : d.stream ? `<pre class="code" style="max-height:520px;overflow-y:auto">${esc(d.resp_body.length > 200000 ? d.resp_body.slice(0,200000) + "\n\n…（截断显示）" : d.resp_body)}</pre>` : jsonBlock(d.resp_body, 520)}
+          ${!d.resp_body ? `<div class="empty">(无)</div>` : d.stream ? `<pre class="code">${esc(d.resp_body.length > 200000 ? d.resp_body.slice(0,200000) + "\n\n…（截断显示）" : d.resp_body)}</pre>` : jsonBlock(d.resp_body)}
         </div>
       </div>
     </div>
@@ -957,7 +957,7 @@ async function renderDetail(id){
         <div class="pane" data-pane="c-convo">${claudeConvo}</div>
         <div class="pane" data-pane="c-tools" hidden>${clientJson ? renderToolDefs(clientJson, "anthropic") : ""}</div>
         <div class="pane" data-pane="c-params" hidden>${clientJson ? renderParams(clientJson) : ""}</div>
-        <div class="pane" data-pane="c-raw" hidden><div class="muted mono" style="font-size:11px;margin-bottom:6px">客户端发来的原始 Anthropic 请求</div>${d.client_req_body ? jsonBlock(d.client_req_body, 520) : `<div class="empty">(无)</div>`}</div>
+        <div class="pane" data-pane="c-raw" hidden><div class="muted mono" style="font-size:11px;margin-bottom:6px">客户端发来的原始 Anthropic 请求</div>${d.client_req_body ? jsonBlock(d.client_req_body) : `<div class="empty">(无)</div>`}</div>
       </div>
       <div>
         <div class="tabs">
@@ -965,7 +965,7 @@ async function renderDetail(id){
           <span class="tab" data-tab="c-rawresp">原始 JSON</span>
         </div>
         <div class="pane" data-pane="c-resp">${claudeResp}${anthJson ? usageBar(d) : ""}</div>
-        <div class="pane" data-pane="c-rawresp" hidden><div class="muted mono" style="font-size:11px;margin-bottom:6px">Anthropic 协议响应（流式为聚合终态等价形式，由 Router 同款转换代码重放生成）</div>${d.anthropic_response ? jsonBlock(d.anthropic_response, 520) : `<div class="empty">(无)</div>`}</div>
+        <div class="pane" data-pane="c-rawresp" hidden><div class="muted mono" style="font-size:11px;margin-bottom:6px">Anthropic 协议响应（流式为聚合终态等价形式，由 Router 同款转换代码重放生成）</div>${d.anthropic_response ? jsonBlock(d.anthropic_response) : `<div class="empty">(无)</div>`}</div>
       </div>
     </div>
     </div>`;
