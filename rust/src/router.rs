@@ -323,6 +323,7 @@ async fn forward(
             client_ip,
             route_mode: route_mode.to_owned(),
         },
+        Some(&payload),
         &outbound,
     );
     let upstream_response = match call_upstream(

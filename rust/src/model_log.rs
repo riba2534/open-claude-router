@@ -189,7 +189,18 @@ impl ModelInteractionLogger {
         );
     }
 
-    pub fn begin(&self, metadata: ExchangeMetadata, outbound: &Value) -> Exchange {
+    /// Starts an exchange record. `client_body` is the original Anthropic
+    /// Messages payload as received from the client; when provided it is
+    /// logged as a separate `client_request` entry so operators can inspect
+    /// both sides of the protocol conversion. It obeys the same mode and
+    /// body-size bounds as every other entry and never includes credentials
+    /// (the router only ever passes the parsed JSON body).
+    pub fn begin(
+        &self,
+        metadata: ExchangeMetadata,
+        client_body: Option<&Value>,
+        outbound: &Value,
+    ) -> Exchange {
         let exchange = Exchange {
             request_id: metadata.request_id,
             upstream_url: sanitize_url(&metadata.upstream_url),
@@ -204,9 +215,19 @@ impl ModelInteractionLogger {
             logger: self.clone(),
         };
         if self.config.enabled() {
-            let serialized = serde_json::to_vec(outbound).unwrap_or_else(|error| {
-                serde_json::to_vec(&json!({"serialization_error":error.to_string()})).unwrap()
-            });
+            if let Some(client_body) = client_body {
+                let serialized = serialize_body(client_body);
+                let mut entry = base_entry(&exchange, "client_request");
+                add_body(
+                    &mut entry,
+                    &serialized,
+                    serialized.len(),
+                    "application/json",
+                    &self.config,
+                );
+                self.append(entry);
+            }
+            let serialized = serialize_body(outbound);
             let mut entry = base_entry(&exchange, "model_request");
             add_body(
                 &mut entry,
@@ -507,6 +528,12 @@ impl Drop for StreamingCapture {
     }
 }
 
+fn serialize_body(body: &Value) -> Vec<u8> {
+    serde_json::to_vec(body).unwrap_or_else(|error| {
+        serde_json::to_vec(&json!({"serialization_error":error.to_string()})).unwrap()
+    })
+}
+
 fn base_entry(exchange: &Exchange, event: &str) -> Value {
     json!({
         "timestamp":DateTime::<Utc>::from(std::time::SystemTime::now()).to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -772,6 +799,7 @@ mod tests {
                 client_ip: Some("203.0.113.8".into()),
                 route_mode: "header".into(),
             },
+            None,
             &json!({}),
         );
         let mut capture = logger.streaming_capture(exchange, 200, json!({}));
@@ -816,6 +844,7 @@ mod tests {
                 client_ip: Some("198.51.100.24".into()),
                 route_mode: "embedded-path".into(),
             },
+            None,
             &json!({"model":"model-a","messages":[]}),
         );
         drop(exchange);
@@ -851,6 +880,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_request_is_logged_alongside_model_request() {
+        let directory =
+            std::env::temp_dir().join(format!("ocr-model-log-{}", uuid::Uuid::new_v4()));
+        let logger = test_logger(directory.clone(), LogMode::Full, 7);
+        let mut exchange = logger.begin(
+            ExchangeMetadata {
+                request_id: "both-sides".into(),
+                upstream_url: "https://upstream.example.com/v1".into(),
+                format: "chat-completions".into(),
+                model: Some(json!("m")),
+                stream: false,
+                client_ip: None,
+                route_mode: "header".into(),
+            },
+            Some(&json!({"model":"m","max_tokens":1})),
+            &json!({"model":"m"}),
+        );
+        logger.response(&mut exchange, 200, json!({}), b"{}", true);
+        logger.flush().await;
+
+        let path = directory.join(format!(
+            "model-interactions-{}.ndjson",
+            Utc::now().format("%Y-%m-%d")
+        ));
+        let entries = fs::read_to_string(path)
+            .await
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["event"], "client_request");
+        assert_eq!(entries[0]["request_id"], "both-sides");
+        // The Full-mode body capture is bounded at 8 bytes in test_logger, so
+        // the client payload arrives truncated as text rather than JSON.
+        assert_eq!(entries[0]["body_truncated"], true);
+        assert_eq!(entries[1]["event"], "model_request");
+        assert_eq!(entries[2]["event"], "model_response");
+        fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn protocol_terminal_is_distinct_from_http_body_eof() {
         let directory =
             std::env::temp_dir().join(format!("ocr-model-log-{}", uuid::Uuid::new_v4()));
@@ -865,6 +936,7 @@ mod tests {
                 client_ip: None,
                 route_mode: "header".into(),
             },
+            None,
             &json!({}),
         );
         let mut capture = logger.streaming_capture(exchange, 200, json!({}));

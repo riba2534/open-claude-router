@@ -804,17 +804,10 @@ async fn socket_peer_ip_and_route_mode_are_written_to_audit_log() {
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(entries.len(), 2);
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry["event"] == "model_request")
-    );
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry["event"] == "model_response")
-    );
+    assert_eq!(entries.len(), 3);
+    for event in ["client_request", "model_request", "model_response"] {
+        assert!(entries.iter().any(|entry| entry["event"] == event));
+    }
     let request_id = entries[0]["request_id"].clone();
     for entry in entries {
         assert_eq!(entry["client_ip"], "127.0.0.1");
