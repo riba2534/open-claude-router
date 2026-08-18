@@ -69,6 +69,7 @@ table.data th { text-align:left; font-family:var(--mono); font-size:11px; letter
 table.data th:first-child { border-radius:8px 0 0 8px; }
 table.data th:last-child { border-radius:0 8px 8px 0; }
 table.data td { padding:7px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+table.data td.mono { white-space:nowrap; }
 table.data tr:last-child td { border-bottom:none; }
 table.data tr.row { cursor:pointer; }
 table.data tr.row:hover { background:var(--surface-2); }
@@ -85,6 +86,10 @@ table.data tr.row:hover { background:var(--surface-2); }
 .pager { display:flex; gap:10px; align-items:center; margin-top:12px; font-size:13px; color:var(--muted); }
 
 .meta-bar { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:12px 18px; margin-bottom:14px; font-family:var(--mono); font-size:12px; box-shadow:var(--shadow); }
+.seg { display:inline-flex; border:1px solid var(--line); border-radius:10px; overflow:hidden; margin-bottom:14px; box-shadow:0 1px 2px rgba(23,35,46,.04); }
+.seg button { border:none; background:var(--surface); color:var(--muted); padding:7px 20px; font-size:13px; cursor:pointer; font-family:var(--sans); }
+.seg button.on { background:var(--accent); color:#fff; font-weight:600; }
+.seg button:not(.on):hover { background:var(--surface-2); }
 .detail-grid { display:grid; grid-template-columns:1.08fr 1fr; gap:16px; align-items:start; }
 @media (max-width:1000px){ .detail-grid { grid-template-columns:1fr; } }
 
@@ -130,6 +135,44 @@ pre.code { background:var(--code-bg); border:1px solid var(--line); border-radiu
 .sse-row .ev { color:var(--accent-ink); font-weight:600; font-size:11.5px; white-space:nowrap; }
 .sse-row .sum { color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
 .empty { color:var(--muted); text-align:center; padding:40px 0; font-size:13px; }
+
+/* rendered/raw 切换容器（markdown 与 JSON 树共用） */
+.tb { position:relative; min-height:20px; }
+.tb > .tb-toggle { position:absolute; top:0; right:0; z-index:2; font-family:var(--mono); font-size:10px; padding:1px 9px; border-radius:999px; border:1px solid var(--line); background:var(--surface-2); color:var(--muted); cursor:pointer; opacity:.45; transition:opacity .15s; }
+.tb:hover > .tb-toggle { opacity:1; }
+.tb > .tb-a, .tb > .tb-b { padding-right:52px; }
+
+/* markdown 渲染 */
+.md { line-height:1.65; overflow-wrap:anywhere; }
+.md p { margin:0 0 8px; max-width:none; }
+.md p:last-child { margin-bottom:0; }
+.md h1,.md h2,.md h3,.md h4 { margin:10px 0 6px; line-height:1.35; }
+.md h1 { font-size:1.22em; } .md h2 { font-size:1.13em; } .md h3 { font-size:1.05em; } .md h4 { font-size:1em; }
+.md ul,.md ol { margin:4px 0 8px; padding-left:1.5em; max-width:none; }
+.md li { margin-bottom:2px; }
+.md blockquote { border-left:3px solid var(--line); margin:6px 0 8px; padding:2px 12px; color:var(--muted); }
+.md pre.code { margin:8px 0; white-space:pre; }
+.md table { border-collapse:collapse; margin:8px 0; font-size:.95em; display:block; overflow-x:auto; }
+.md th,.md td { border:1px solid var(--line); padding:4px 10px; }
+.md th { background:var(--surface-2); font-family:inherit; text-transform:none; letter-spacing:0; }
+.md hr { border:none; border-top:1px solid var(--line); margin:10px 0; }
+.md a { color:var(--accent-ink); }
+
+/* JSON 树 */
+.jt { font-family:var(--mono); font-size:12px; line-height:1.65; overflow-wrap:anywhere; }
+.jt-k { color:var(--accent-ink); }
+.jt-s { color:var(--good); }
+.jt-n { color:var(--warn); }
+.jt-b { color:var(--bad); }
+.jt-node > .jt-caret { cursor:pointer; user-select:none; display:inline-block; width:1em; color:var(--muted); }
+.jt-node > .jt-caret::before { content:"▾"; }
+.jt-node.jt-collapsed > .jt-caret::before { content:"▸"; }
+.jt-children { display:block; padding-left:1.1em; margin-left:.3em; border-left:1px dotted var(--line); }
+.jt-node.jt-collapsed > .jt-children { display:none; }
+.jt-badge { display:none; color:var(--muted); font-style:italic; cursor:pointer; padding:0 4px; }
+.jt-node.jt-collapsed > .jt-badge { display:inline; }
+.jt-more { color:var(--accent-ink); cursor:pointer; font-size:11px; white-space:nowrap; }
+
 .live-dot { width:8px; height:8px; border-radius:50%; background:var(--muted); display:inline-block; transition:background .3s; }
 .live-dot.on { background:var(--good); box-shadow:0 0 0 3px var(--good-soft); }
 .overlay { position:fixed; inset:0; background:rgba(23,35,46,.45); display:flex; align-items:center; justify-content:center; z-index:50; }
@@ -274,14 +317,123 @@ function outcomeChip(row){
 const fmtChip = f => f ? `<span class="chip info">${esc(f === "chat-completions" ? "chat" : f)}</span>` : "";
 const streamChip = s => s ? `<span class="chip dim">stream</span>` : "";
 
+/* ---------- markdown renderer（自带，无外部依赖；先整体转义再变换） ---------- */
+function mdInline(s){
+  return s
+    .replace(/`([^`\n]+)`/g, (m, c) => `<code>${c}</code>`)
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s（(>])\*([^*\n]+)\*(?=[\s，。．,.:;）)]|$)/g, "$1<em>$2</em>");
+}
+function renderMd(src){
+  src = String(src ?? "").replace(/\r\n?/g, "\n");
+  const codes = [];
+  src = src.replace(/```[^\n`]*\n([\s\S]*?)(?:```|$)/g, (m, body) => {
+    codes.push(`<pre class="code"><code>${esc(body.replace(/\n$/, ""))}</code></pre>`);
+    return `\u0000${codes.length - 1}\u0000`;
+  });
+  src = esc(src);
+  const lines = src.split("\n");
+  const out = [];
+  let para = [], list = null; // list: {tag, items}
+  const flushPara = () => { if(para.length){ out.push(`<p>${para.map(mdInline).join("<br>")}</p>`); para = []; } };
+  const flushList = () => { if(list){ out.push(`<${list.tag}>${list.items.map(i => `<li>${mdInline(i)}</li>`).join("")}</${list.tag}>`); list = null; } };
+  const isTableSep = l => /^\s*\|?[\s:|-]+\|?\s*$/.test(l) && l.includes("-");
+  const splitRow = l => l.replace(/^\s*\|/, "").replace(/\|\s*$/, "").split("|").map(c => mdInline(c.trim()));
+  for(let i = 0; i < lines.length; i++){
+    const line = lines[i];
+    let m;
+    if(/^\s*$/.test(line)){ flushPara(); flushList(); continue; }
+    if((m = line.match(/^(#{1,4})\s+(.+)$/))){ flushPara(); flushList(); out.push(`<h${m[1].length}>${mdInline(m[2])}</h${m[1].length}>`); continue; }
+    if(/^\s*(---+|\*\*\*+)\s*$/.test(line)){ flushPara(); flushList(); out.push("<hr>"); continue; }
+    if((m = line.match(/^&gt;\s?(.*)$/))){ flushPara(); flushList();
+      const quote = [m[1]];
+      while(i + 1 < lines.length && (m = lines[i + 1].match(/^&gt;\s?(.*)$/))){ quote.push(m[1]); i++; }
+      out.push(`<blockquote>${quote.map(mdInline).join("<br>")}</blockquote>`); continue; }
+    if((m = line.match(/^\s*[-*+]\s+(.+)$/))){ flushPara(); if(!list || list.tag !== "ul"){ flushList(); list = {tag:"ul", items:[]}; } list.items.push(m[1]); continue; }
+    if((m = line.match(/^\s*\d+[.)]\s+(.+)$/))){ flushPara(); if(!list || list.tag !== "ol"){ flushList(); list = {tag:"ol", items:[]}; } list.items.push(m[1]); continue; }
+    if(line.includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1])){
+      flushPara(); flushList();
+      const head = splitRow(line); i++;
+      const rows = [];
+      while(i + 1 < lines.length && lines[i + 1].includes("|") && !/^\s*$/.test(lines[i + 1])){ rows.push(splitRow(lines[i + 1])); i++; }
+      out.push(`<table><tr>${head.map(c => `<th>${c}</th>`).join("")}</tr>${rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join("")}</tr>`).join("")}</table>`);
+      continue;
+    }
+    para.push(line);
+  }
+  flushPara(); flushList();
+  return out.join("").replace(/\u0000(\d+)\u0000/g, (m, i) => codes[Number(i)]);
+}
+
+/* ---------- JSON 树（语法高亮 + 节点折叠） ---------- */
+const JT_STR_SHORT = 200, JT_STR_HARD = 100000;
+function jtString(s){
+  if(s.length <= JT_STR_SHORT) return `<span class="jt-s">${esc(JSON.stringify(s))}</span>`;
+  const short = `<span class="jt-str-short">${esc(JSON.stringify(s.slice(0, JT_STR_SHORT)).slice(0, -1))}…"</span>`;
+  if(s.length > JT_STR_HARD)
+    return `<span class="jt-s">${short}</span> <span class="muted" style="font-size:11px">(${fmtInt(s.length)} 字符，过长仅显示开头，完整内容见 RAW)</span>`;
+  return `<span class="jt-s jt-strwrap">${short}<span class="jt-str-full" hidden>${esc(JSON.stringify(s))}</span></span> <span class="jt-more">展开 ${fmtInt(s.length)} 字符</span>`;
+}
+function jsonTree(v, depth){
+  depth = depth || 0;
+  if(v === null) return `<span class="jt-b">null</span>`;
+  if(typeof v === "string") return jtString(v);
+  if(typeof v === "number") return `<span class="jt-n">${v}</span>`;
+  if(typeof v === "boolean") return `<span class="jt-b">${v}</span>`;
+  const isArr = Array.isArray(v);
+  const entries = isArr ? v.map((x, i) => [i, x]) : Object.entries(v);
+  if(!entries.length) return isArr ? "[]" : "{}";
+  const collapsed = depth >= 3 || entries.length > 40;
+  const rows = entries.map(([k, val], i) =>
+    `<div class="jt-row">${isArr ? "" : `<span class="jt-k">${esc(JSON.stringify(String(k)))}</span>: `}${jsonTree(val, depth + 1)}${i < entries.length - 1 ? "," : ""}</div>`
+  ).join("");
+  return `<span class="jt-node${collapsed ? " jt-collapsed" : ""}"><span class="jt-caret"></span>${isArr ? "[" : "{"}<span class="jt-badge">… ${entries.length} 项</span><span class="jt-children">${rows}</span>${isArr ? "]" : "}"}</span>`;
+}
+
+/* ---------- 双视图块：渲染视图 + RAW，右上角切换 ---------- */
+function mdBlock(text){
+  return `<div class="tb" data-alt="RAW"><button class="tb-toggle">RAW</button><div class="tb-a md">${renderMd(text)}</div><pre class="code tb-b" hidden>${esc(text)}</pre></div>`;
+}
+function jsonBlock(source, maxHeight){
+  const style = maxHeight ? ` style="max-height:${maxHeight}px;overflow-y:auto"` : "";
+  let value;
+  try { value = typeof source === "string" ? JSON.parse(source) : source; } catch {}
+  if(value === undefined) return `<pre class="code"${style}>${esc(String(source ?? ""))}</pre>`;
+  const raw = typeof source === "string" ? pretty(source) : JSON.stringify(source, null, 2);
+  return `<div class="tb" data-alt="RAW"><button class="tb-toggle">RAW</button><div class="tb-a jt"${style}>${jsonTree(value)}</div><pre class="code tb-b" hidden${style}>${esc(raw)}</pre></div>`;
+}
+document.addEventListener("click", e => {
+  const caret = e.target.closest(".jt-caret, .jt-badge");
+  if(caret){ caret.closest(".jt-node").classList.toggle("jt-collapsed"); return; }
+  const more = e.target.closest(".jt-more");
+  if(more){
+    const wrap = more.previousElementSibling;
+    const short = wrap.querySelector(".jt-str-short"), full = wrap.querySelector(".jt-str-full");
+    const showFull = full.hidden;
+    full.hidden = !showFull; short.hidden = showFull;
+    more.textContent = showFull ? "收起" : more.dataset.label || "展开";
+    if(!more.dataset.label) more.dataset.label = "展开";
+    return;
+  }
+  const toggle = e.target.closest(".tb-toggle");
+  if(toggle){
+    const tb = toggle.parentElement;
+    const a = tb.querySelector(":scope > .tb-a"), b = tb.querySelector(":scope > .tb-b");
+    const showRaw = b.hidden;
+    b.hidden = !showRaw; a.hidden = showRaw;
+    toggle.textContent = showRaw ? (a.classList.contains("jt") ? "树" : "MD") : "RAW";
+  }
+});
+
 function textBlock(text, limit){
   limit = limit || 600;
   const t = String(text ?? "");
-  if(t.length <= limit) return `<div>${esc(t).replace(/\n/g,"<br>")}</div>`;
-  return `<details class="fold"><summary>展开全文 · ${fmtInt(t.length)} 字符</summary><div>${esc(t).replace(/\n/g,"<br>")}</div></details><div>${esc(t.slice(0,limit))}…</div>`;
+  if(t.length <= limit) return mdBlock(t);
+  return `<details class="fold"><summary>展开全文 · ${fmtInt(t.length)} 字符</summary>${mdBlock(t)}</details><div class="muted">${esc(t.slice(0, limit))}…</div>`;
 }
 function jsonFold(label, value){
-  return `<details class="fold"><summary>${esc(label)}</summary><pre class="code">${esc(pretty(value))}</pre></details>`;
+  return `<details class="fold"><summary>${esc(label)}</summary>${jsonBlock(value)}</details>`;
 }
 
 /* ---------- charts ---------- */
@@ -532,11 +684,67 @@ function renderToolDefs(p, format){
   const tools = p.tools || [];
   if(!tools.length) return `<div class="empty">该请求未携带工具定义</div>`;
   return tools.map(t => {
-    const fn = format === "responses" ? t : (t.function || t);
+    const fn = format === "chat-completions" ? (t.function || t) : t;
+    const schema = fn.parameters || fn.input_schema;
     return `<div class="bubble"><div class="role">${esc(fn.name || t.type || "?")} ${fn.strict ? '<span class="chip info">strict</span>' : ""}</div>
       <div class="muted" style="font-size:12.5px">${esc(fn.description || "")}</div>
-      ${fn.parameters ? jsonFold("参数 schema", fn.parameters) : ""}</div>`;
+      ${schema ? jsonFold("参数 schema", schema) : ""}</div>`;
   }).join("");
+}
+
+/* ---------- Anthropic（Claude 视角）渲染 ---------- */
+function anthropicImage(b){
+  const source = b.source || {};
+  const url = source.type === "base64" ? `data:${source.media_type};base64,${source.data}`
+    : source.type === "url" ? source.url : "";
+  if(!url) return jsonFold("image", b);
+  const size = source.data ? ` <span class="chip info">🖼 ${fmtBytes(Math.round(source.data.length * 0.75))}</span>` : "";
+  return `<div><img src="${esc(url)}" alt="请求图片" loading="lazy">${size}</div>`;
+}
+function renderAnthropicMessage(m){
+  const role = m.role || "user";
+  const content = typeof m.content === "string" ? [{type:"text", text:m.content}] : (m.content || []);
+  const inner = [], after = [];
+  for(const b of content){
+    switch(b.type){
+      case "text": inner.push(textBlock(b.text)); break;
+      case "image": inner.push(anthropicImage(b)); break;
+      case "thinking": inner.push(`<div class="bubble think"><div class="role">thinking</div>${textBlock(b.thinking, 400)}</div>`); break;
+      case "redacted_thinking": inner.push(`<div class="bubble think"><div class="role">redacted_thinking</div><span class="muted">（内容已加密省略）</span></div>`); break;
+      case "tool_use": after.push(toolCallCard(b.name, b.input, b.id)); break;
+      case "tool_result": {
+        const body = typeof b.content === "string" ? textBlock(b.content, 400)
+          : (b.content || []).map(x => x.type === "text" ? textBlock(x.text, 400) : x.type === "image" ? anthropicImage(x) : jsonFold(x.type || "block", x)).join("");
+        after.push(`<div class="bubble tout"><div class="role">tool_result · ${esc(String(b.tool_use_id || "").slice(0, 16))}${b.is_error ? ' <span class="chip bad">error</span>' : ""}</div>${body}</div>`);
+        break;
+      }
+      default: inner.push(jsonFold(b.type || "block", b));
+    }
+  }
+  const bubble = inner.length ? `<div class="bubble ${role === "user" ? "user" : "asst"}"><div class="role">${esc(role)}</div>${inner.join("")}</div>` : "";
+  return bubble + after.join("");
+}
+function renderAnthropicConversation(p){
+  let html = "";
+  if(p.system){
+    const text = typeof p.system === "string" ? p.system
+      : Array.isArray(p.system) ? p.system.map(x => x.text || "").join("\n") : JSON.stringify(p.system);
+    html += `<div class="bubble sys"><div class="role">system</div><details class="fold"><summary>已折叠 · ${fmtBytes(text.length)}</summary><div>${esc(text).replace(/\n/g,"<br>")}</div></details></div>`;
+  }
+  for(const m of p.messages || []) html += renderAnthropicMessage(m);
+  return html || `<div class="empty">无 messages</div>`;
+}
+function renderAnthropicResponse(resp){
+  let html = renderAnthropicMessage({role:"assistant", content: resp.content});
+  const u = resp.usage || {};
+  const meta = [
+    resp.stop_reason ? `stop_reason: ${resp.stop_reason}` : null,
+    u.input_tokens != null ? `in ${fmtInt(u.input_tokens)}` : null,
+    u.cache_read_input_tokens ? `cache_read ${fmtInt(u.cache_read_input_tokens)}` : null,
+    u.output_tokens != null ? `out ${fmtInt(u.output_tokens)}` : null,
+  ].filter(Boolean).join(" · ");
+  if(meta) html += `<div class="muted mono" style="font-size:11px;margin-top:6px">${esc(meta)}</div>`;
+  return html || `<div class="empty">无内容</div>`;
 }
 function renderParams(p){
   const skip = new Set(["messages","input","tools","instructions","system"]);
@@ -662,9 +870,11 @@ function activateTabs(root){
 }
 async function renderDetail(id){
   const d = await api(`/api/requests/${id}`);
-  let reqJson = null, aggJson = null;
+  let reqJson = null, aggJson = null, clientJson = null, anthJson = null;
   try { reqJson = d.req_body ? JSON.parse(d.req_body) : null; } catch {}
   try { aggJson = d.agg_response ? JSON.parse(d.agg_response) : null; } catch {}
+  try { clientJson = d.client_req_body ? JSON.parse(d.client_req_body) : null; } catch {}
+  try { anthJson = d.anthropic_response ? JSON.parse(d.anthropic_response) : null; } catch {}
   const format = d.format || "chat-completions";
   const isResponses = format === "responses";
 
@@ -674,11 +884,16 @@ async function renderDetail(id){
     : d.outcome === "ok" ? `<div class="warn-note">未能聚合出终态（流被取消/截断，可看事件流原始视图）</div>` : "";
 
   let respNotes = "";
-  if(d.outcome === "http_error") respNotes += `<div class="err-note">上游 HTTP ${d.status}${d.resp_body ? `<pre class="code">${esc(pretty(d.resp_body)).slice(0,4000)}</pre>` : ""}</div>`;
+  if(d.outcome === "http_error") respNotes += `<div class="err-note">上游 HTTP ${d.status}${d.resp_body ? jsonBlock(d.resp_body, 300) : ""}</div>`;
   if(d.outcome === "transport_error") respNotes += `<div class="err-note">传输错误：${esc(d.error_message || "")}</div>`;
   if(d.outcome === "cancelled") respNotes += `<div class="warn-note">客户端取消 · 阶段 ${esc(d.cancel_stage || "?")} · ${fmtMs(d.duration_ms)}</div>`;
   if(d.outcome === "ok" && d.stream && d.protocol_complete === 0) respNotes += `<div class="warn-note">HTTP 200 但未收到协议终态（流中断）</div>`;
   if(d.resp_truncated) respNotes += `<div class="warn-note">响应正文超出捕获上限已截断（${fmtBytes(d.resp_bytes)} 实际）</div>`;
+
+  const claudeConvo = clientJson ? renderAnthropicConversation(clientJson)
+    : `<div class="warn-note">未记录客户端原始请求（client_request 事件需 Router 本版本及以后产生的流量；历史流量只有 Router 视角）</div>`;
+  const claudeResp = anthJson ? renderAnthropicResponse(anthJson)
+    : `${respNotes}<div class="warn-note">无法还原 Anthropic 视角响应（错误/取消，或流未完成聚合）</div>`;
 
   $view.innerHTML = `
     <h2 class="vh"><a href="#/requests">← 请求列表</a></h2>
@@ -695,6 +910,11 @@ async function renderDetail(id){
       ${d.session_key ? `<a href="#/s/${esc(d.session_key)}" class="chip info">↗ 所属会话</a>` : ""}
       <button class="btn ghost" id="replay-curl" style="padding:3px 12px;font-size:12px">重放 curl</button>
     </div>
+    <div class="seg" id="pv-seg">
+      <button class="on" data-pv="router">Router ↔ 网关 · OpenAI 协议</button>
+      <button data-pv="claude">Claude ↔ Router · Anthropic 协议</button>
+    </div>
+    <div id="pv-router">
     <div class="detail-grid">
       <div>
         <div class="tabs">
@@ -706,7 +926,7 @@ async function renderDetail(id){
         <div class="pane" data-pane="convo">${convo}</div>
         <div class="pane" data-pane="tools" hidden>${reqJson ? renderToolDefs(reqJson, format) : ""}</div>
         <div class="pane" data-pane="params" hidden>${reqJson ? renderParams(reqJson) : ""}</div>
-        <div class="pane" data-pane="rawreq" hidden><div class="muted mono" style="font-size:11px;margin-bottom:6px">发给上游的最终请求 · ${fmtBytes(d.req_bytes)}</div><pre class="code" style="max-height:520px;overflow-y:auto">${esc(d.req_body ? pretty(d.req_body) : "(无)")}</pre></div>
+        <div class="pane" data-pane="rawreq" hidden><div class="muted mono" style="font-size:11px;margin-bottom:6px">发给上游的最终请求 · ${fmtBytes(d.req_bytes)}</div>${d.req_body ? jsonBlock(d.req_body, 520) : `<div class="empty">(无)</div>`}</div>
       </div>
       <div>
         <div class="tabs">
@@ -718,13 +938,44 @@ async function renderDetail(id){
           ${d.finish_reason ? `<div class="muted mono" style="font-size:11px;margin-top:6px">finish: ${esc(d.finish_reason)} · complete=${d.complete} · protocol_complete=${d.protocol_complete}</div>` : ""}</div>
         <div class="pane" data-pane="sse" hidden>${d.resp_body && d.stream ? renderSseTimeline(d.resp_body, format) : `<div class="empty">非流式响应，无事件流</div>`}</div>
         <div class="pane" data-pane="rawresp" hidden>
-          ${d.resp_headers ? `<div class="muted mono" style="font-size:11px;margin-bottom:4px">headers</div><pre class="code">${esc(pretty(d.resp_headers))}</pre>` : ""}
+          ${d.resp_headers ? `<div class="muted mono" style="font-size:11px;margin-bottom:4px">headers</div>${jsonBlock(d.resp_headers)}` : ""}
           <div class="muted mono" style="font-size:11px;margin:6px 0 4px">上游原始响应体 · ${fmtBytes(d.resp_bytes)}</div>
-          <pre class="code" style="max-height:520px;overflow-y:auto">${esc(d.resp_body ? (d.resp_body.length > 200000 ? d.resp_body.slice(0,200000) + "\n\n…（截断显示）" : (d.stream ? d.resp_body : pretty(d.resp_body))) : "(无)")}</pre>
+          ${!d.resp_body ? `<div class="empty">(无)</div>` : d.stream ? `<pre class="code" style="max-height:520px;overflow-y:auto">${esc(d.resp_body.length > 200000 ? d.resp_body.slice(0,200000) + "\n\n…（截断显示）" : d.resp_body)}</pre>` : jsonBlock(d.resp_body, 520)}
         </div>
       </div>
+    </div>
+    </div>
+    <div id="pv-claude" hidden>
+    <div class="detail-grid">
+      <div>
+        <div class="tabs">
+          <span class="tab on" data-tab="c-convo">会话视图</span>
+          <span class="tab" data-tab="c-tools">工具 (${clientJson && clientJson.tools ? clientJson.tools.length : 0})</span>
+          <span class="tab" data-tab="c-params">参数</span>
+          <span class="tab" data-tab="c-raw">原始 JSON</span>
+        </div>
+        <div class="pane" data-pane="c-convo">${claudeConvo}</div>
+        <div class="pane" data-pane="c-tools" hidden>${clientJson ? renderToolDefs(clientJson, "anthropic") : ""}</div>
+        <div class="pane" data-pane="c-params" hidden>${clientJson ? renderParams(clientJson) : ""}</div>
+        <div class="pane" data-pane="c-raw" hidden><div class="muted mono" style="font-size:11px;margin-bottom:6px">客户端发来的原始 Anthropic 请求</div>${d.client_req_body ? jsonBlock(d.client_req_body, 520) : `<div class="empty">(无)</div>`}</div>
+      </div>
+      <div>
+        <div class="tabs">
+          <span class="tab on" data-tab="c-resp">返回给客户端</span>
+          <span class="tab" data-tab="c-rawresp">原始 JSON</span>
+        </div>
+        <div class="pane" data-pane="c-resp">${claudeResp}${anthJson ? usageBar(d) : ""}</div>
+        <div class="pane" data-pane="c-rawresp" hidden><div class="muted mono" style="font-size:11px;margin-bottom:6px">Anthropic 协议响应（流式为聚合终态等价形式，由 Router 同款转换代码重放生成）</div>${d.anthropic_response ? jsonBlock(d.anthropic_response, 520) : `<div class="empty">(无)</div>`}</div>
+      </div>
+    </div>
     </div>`;
   activateTabs($view);
+  document.querySelectorAll("#pv-seg button").forEach(btn => btn.onclick = () => {
+    document.querySelectorAll("#pv-seg button").forEach(x => x.classList.remove("on"));
+    btn.classList.add("on");
+    document.getElementById("pv-router").hidden = btn.dataset.pv !== "router";
+    document.getElementById("pv-claude").hidden = btn.dataset.pv !== "claude";
+  });
   const replay = document.getElementById("replay-curl");
   if(replay) replay.onclick = () => {
     if(!d.req_body || !d.upstream_url){

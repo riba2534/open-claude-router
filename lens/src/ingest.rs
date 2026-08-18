@@ -157,6 +157,7 @@ fn apply_entry(db: &Db, entry: &Value) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
 
     match event {
+        "client_request" => apply_client_request(db, request_id, entry),
         "model_request" => apply_request(db, request_id, entry),
         "model_response" => apply_response(db, request_id, entry),
         "model_cancelled" => apply_terminal(
@@ -177,6 +178,19 @@ fn apply_entry(db: &Db, entry: &Value) -> Result<(), String> {
         ),
         other => Err(format!("unknown event {other}")),
     }
+}
+
+/// The original Anthropic Messages payload as the client sent it (router
+/// v0.6.13+ logs it as its own event ahead of the converted request).
+fn apply_client_request(db: &Db, request_id: &str, entry: &Value) -> Result<(), String> {
+    db.with(|conn| {
+        conn.execute(
+            "UPDATE exchanges SET client_req_body = ?2, updated_at = ?3 WHERE request_id = ?1",
+            params![request_id, body_string(entry), now_unix()],
+        )
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn apply_request(db: &Db, request_id: &str, entry: &Value) -> Result<(), String> {
@@ -255,6 +269,48 @@ fn backfill_sessions(db: &Db) {
     if updated > 0 {
         info!(updated, "backfilled session keys");
     }
+    backfill_anthropic(db);
+}
+
+/// Replays the Anthropic-view response for rows ingested before dual-view
+/// support, using the aggregated upstream payload already stored.
+fn backfill_anthropic(db: &Db) {
+    let rows: Vec<(String, String, String)> = match db.with(|conn| {
+        conn.prepare(
+            "SELECT request_id, COALESCE(format,''), agg_response FROM exchanges
+             WHERE anthropic_response IS NULL AND agg_response IS NOT NULL",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect()
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(%error, "anthropic backfill scan failed");
+            return;
+        }
+    };
+    let mut updated = 0usize;
+    for (request_id, format, agg) in rows {
+        let Ok(upstream) = serde_json::from_str::<Value>(&agg) else {
+            continue;
+        };
+        let Some(anthropic) = crate::derive::replay_anthropic(&format, &upstream) else {
+            continue;
+        };
+        let result = db.with(|conn| {
+            conn.execute(
+                "UPDATE exchanges SET anthropic_response = ?2 WHERE request_id = ?1",
+                params![request_id, anthropic.to_string()],
+            )
+        });
+        match result {
+            Ok(_) => updated += 1,
+            Err(error) => warn!(%error, "anthropic backfill update failed"),
+        }
+    }
+    if updated > 0 {
+        info!(updated, "backfilled anthropic-view responses");
+    }
 }
 
 fn apply_response(db: &Db, request_id: &str, entry: &Value) -> Result<(), String> {
@@ -287,7 +343,7 @@ fn apply_response(db: &Db, request_id: &str, entry: &Value) -> Result<(), String
                error_message = ?7, resp_headers = ?8, resp_body = ?9, resp_bytes = ?10, resp_truncated = ?11,
                agg_response = ?12, finish_reason = ?13,
                input_tokens = ?14, output_tokens = ?15, cached_tokens = ?16, reasoning_tokens = ?17,
-               preview = ?18, updated_at = ?19
+               preview = ?18, updated_at = ?19, anthropic_response = ?20
              WHERE request_id = ?1",
             params![
                 request_id,
@@ -315,6 +371,7 @@ fn apply_response(db: &Db, request_id: &str, entry: &Value) -> Result<(), String
                 derived.reasoning_tokens,
                 derived.preview,
                 now_unix(),
+                derived.anthropic_response.as_ref().map(Value::to_string),
             ],
         )
     })

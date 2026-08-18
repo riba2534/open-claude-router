@@ -1,14 +1,21 @@
 use bytes::Bytes;
-use open_claude_router::sse::{aggregate_chat_sse, aggregate_responses_sse};
+use open_claude_router::{
+    sse::{aggregate_chat_sse, aggregate_responses_sse},
+    transform::{transform_chat_json_response, transform_responses_json},
+};
 use serde_json::Value;
 
 const PREVIEW_CHARS: usize = 240;
 
 /// Values reconstructed from a terminal upstream response body, reusing the
 /// router's own SSE aggregators so the semantics match forwarding exactly.
+/// `anthropic_response` replays the router's response conversion on the
+/// aggregated upstream payload — the Anthropic-protocol view the client
+/// received (final-state equivalent for streams).
 #[derive(Default)]
 pub struct Derived {
     pub agg_response: Option<Value>,
+    pub anthropic_response: Option<Value>,
     pub finish_reason: Option<String>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -45,8 +52,18 @@ pub fn derive_response(
         "responses" => extract_responses(&final_json),
         _ => extract_chat(&final_json),
     };
+    derived.anthropic_response = replay_anthropic(format, &final_json);
     derived.agg_response = Some(final_json);
     derived
+}
+
+/// Replays the router's own response transform to produce the client-side
+/// (Anthropic Messages) view of the upstream response.
+pub fn replay_anthropic(format: &str, upstream: &Value) -> Option<Value> {
+    match format {
+        "responses" => transform_responses_json(upstream, false).ok(),
+        _ => transform_chat_json_response(upstream, false).ok(),
+    }
 }
 
 fn is_sse(content_type: &str, body_text: Option<&str>) -> bool {
@@ -85,6 +102,7 @@ fn extract_chat(response: &Value) -> Derived {
     }
     Derived {
         agg_response: None,
+        anthropic_response: None,
         finish_reason: choice
             .and_then(|choice| choice.get("finish_reason"))
             .and_then(Value::as_str)
@@ -139,6 +157,7 @@ fn extract_responses(response: &Value) -> Derived {
     }
     Derived {
         agg_response: None,
+        anthropic_response: None,
         finish_reason: finish,
         input_tokens: int_at(usage, "/input_tokens"),
         output_tokens: int_at(usage, "/output_tokens"),
@@ -206,6 +225,25 @@ mod tests {
         assert_eq!(derived.preview.as_deref(), Some("hi there"));
         assert_eq!(derived.finish_reason.as_deref(), Some("stop"));
         assert_eq!(derived.input_tokens, Some(3));
+    }
+
+    #[test]
+    fn chat_response_is_replayed_into_anthropic_view() {
+        let body = json!({
+            "id": "c1",
+            "model": "m",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "hello"}
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2}
+        });
+        let derived = derive_response("chat-completions", "application/json", Some(&body), None);
+        let anthropic = derived.anthropic_response.expect("anthropic view");
+        assert_eq!(anthropic["type"], "message");
+        assert_eq!(anthropic["role"], "assistant");
+        assert_eq!(anthropic["stop_reason"], "end_turn");
+        assert_eq!(anthropic["content"][0]["text"], "hello");
     }
 
     #[test]

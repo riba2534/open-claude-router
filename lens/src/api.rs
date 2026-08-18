@@ -597,7 +597,7 @@ fn build_detail(conn: &Connection, pricing: &PricingTable, id: &str) -> rusqlite
                 resp_headers, resp_body, resp_bytes, resp_truncated,
                 agg_response, finish_reason,
                 input_tokens, output_tokens, cached_tokens, reasoning_tokens, preview,
-                session_key, session_hint
+                session_key, session_hint, client_req_body, anthropic_response
          FROM exchanges WHERE request_id = ?1",
     )?;
     let mut rows = statement.query([id])?;
@@ -642,6 +642,8 @@ fn build_detail(conn: &Connection, pricing: &PricingTable, id: &str) -> rusqlite
         "preview": row.get::<_, Option<String>>(28)?,
         "session_key": row.get::<_, Option<String>>(29)?,
         "session_hint": row.get::<_, Option<String>>(30)?,
+        "client_req_body": row.get::<_, Option<String>>(31)?,
+        "anthropic_response": row.get::<_, Option<String>>(32)?,
         "cost_usd": cost,
     }))
 }
