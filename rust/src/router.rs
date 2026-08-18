@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use crate::{
     auth::{
         Endpoint, UpstreamConfig, UpstreamFormat, apply_effort_controls, check_embedded_mode_auth,
-        check_header_mode_auth, is_embedded_upstream_path, parse_access_tokens,
+        check_header_mode_auth, is_embedded_upstream_path, parse_access_tokens, parse_client_tag,
         parse_effort_levels, parse_effort_map, parse_embedded_upstream, parse_model_map,
         parse_upstream_config, parse_upstream_format, parse_upstream_headers,
         resolve_upstream_model,
@@ -321,6 +321,7 @@ async fn forward(
             model: outbound.get("model").cloned(),
             stream: wants_stream,
             client_ip,
+            client_tag: parse_client_tag(&headers),
             route_mode: route_mode.to_owned(),
         },
         Some(&payload),

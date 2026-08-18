@@ -137,8 +137,8 @@ fn apply_entry(db: &Db, entry: &Value) -> Result<(), String> {
     // shared metadata first.
     db.with(|conn| {
         conn.execute(
-            "INSERT INTO exchanges (request_id, ts, ts_unix, upstream_url, format, model, stream, client_ip, route_mode, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO exchanges (request_id, ts, ts_unix, upstream_url, format, model, stream, client_ip, client_tag, route_mode, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(request_id) DO NOTHING",
             params![
                 request_id,
@@ -149,6 +149,7 @@ fn apply_entry(db: &Db, entry: &Value) -> Result<(), String> {
                 model_name(entry.get("model")),
                 entry.get("stream").and_then(Value::as_bool).map(i64::from),
                 entry.get("client_ip").and_then(Value::as_str),
+                entry.get("client_tag").and_then(Value::as_str),
                 entry.get("route_mode").and_then(Value::as_str),
                 now_unix(),
             ],

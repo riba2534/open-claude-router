@@ -55,7 +55,8 @@ impl Db {
                session_hint      TEXT,
                updated_at        INTEGER,
                client_req_body   TEXT,
-               anthropic_response TEXT
+               anthropic_response TEXT,
+               client_tag        TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_exchanges_ts ON exchanges(ts_unix);
              CREATE TABLE IF NOT EXISTS ingest_state (
@@ -94,6 +95,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         ("updated_at", "updated_at INTEGER"),
         ("client_req_body", "client_req_body TEXT"),
         ("anthropic_response", "anthropic_response TEXT"),
+        ("client_tag", "client_tag TEXT"),
     ] {
         if !existing.iter().any(|column| column == name) {
             conn.execute(

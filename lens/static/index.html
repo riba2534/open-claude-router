@@ -241,6 +241,7 @@ const fmtMs = n => n == null ? "–" : n >= 10000 ? (n/1000).toFixed(1)+"s" : fm
 const fmtBytes = n => n == null ? "–" : n >= 1048576 ? (n/1048576).toFixed(1)+" MB" : n >= 1024 ? (n/1024).toFixed(1)+" KB" : n+" B";
 const fmtTime = ts => { if(!ts) return "–"; const d = new Date(ts); return d.toLocaleString("zh-CN",{hour12:false,month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}); };
 const shortId = id => id ? id.slice(0,8) : "–";
+const clientLabel = r => r.client_tag || r.client_ip || "–";
 const pretty = v => { try { return JSON.stringify(typeof v === "string" ? JSON.parse(v) : v, null, 2); } catch { return String(v); } };
 const fmtUSD = v => {
   if(v == null) return "–";
@@ -528,8 +529,8 @@ async function renderOverview(){
         ${d.by_status.map(s => `<tr><td>${s.status >= 400 ? `<span class="chip bad">${s.status}</span>` : `<span class="chip good">${s.status}</span>`}</td><td class="num">${fmtInt(s.count)}</td></tr>`).join("") || `<tr><td colspan="2" class="empty">无数据</td></tr>`}
       </table>
       <table class="data" style="margin-top:14px">
-        <tr><th>client ip</th><th>次数</th></tr>
-        ${d.by_client.map(c => `<tr><td class="mono">${esc(c.client_ip)}</td><td class="num">${fmtInt(c.count)}</td></tr>`).join("")}
+        <tr><th>client</th><th>次数</th></tr>
+        ${d.by_client.map(c => `<tr><td class="mono">${esc(c.client)}</td><td class="num">${fmtInt(c.count)}</td></tr>`).join("")}
       </table></div></div>
     </div>`;
 }
@@ -554,11 +555,12 @@ async function renderList(){
       <span class="muted num">共 ${fmtInt(d.total)} 条</span>
     </div>
     <div class="panel" style="padding:6px 10px"><div class="tbl-scroll"><table class="data">
-      <tr><th>时间</th><th>id</th><th>模型</th><th>协议</th><th>结果</th><th>耗时</th><th>in/out tk</th><th>费用</th><th>大小</th><th>预览</th></tr>
+      <tr><th>时间</th><th>id</th><th>模型</th><th>client</th><th>协议</th><th>结果</th><th>耗时</th><th>in/out tk</th><th>费用</th><th>大小</th><th>预览</th></tr>
       ${d.rows.map(r => `<tr class="row" data-id="${esc(r.request_id)}">
         <td class="num" style="white-space:nowrap">${fmtTime(r.ts)}</td>
         <td class="mono">${shortId(r.request_id)}</td>
         <td class="mono">${esc(r.model || "–")}</td>
+        <td class="mono">${esc(clientLabel(r))}</td>
         <td>${fmtChip(r.format)}${streamChip(r.stream)}</td>
         <td>${outcomeChip(r)}</td>
         <td class="num">${fmtMs(r.duration_ms)}</td>
@@ -566,7 +568,7 @@ async function renderList(){
         <td class="num">${fmtUSD(r.cost_usd)}</td>
         <td class="num" style="white-space:nowrap">${fmtBytes(r.req_bytes)} → ${fmtBytes(r.resp_bytes)}</td>
         <td class="muted" style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.preview || "")}</td>
-      </tr>`).join("") || `<tr><td colspan="10"><div class="empty">窗口内没有请求。向 Router 发几条流量后这里会自动出现。</div></td></tr>`}
+      </tr>`).join("") || `<tr><td colspan="11"><div class="empty">窗口内没有请求。向 Router 发几条流量后这里会自动出现。</div></td></tr>`}
     </table></div></div>
     <div class="pager">
       <button class="btn ghost" id="pg-prev" ${listState.offset<=0?"disabled":""}>上一页</button>
@@ -599,7 +601,7 @@ async function renderSessions(){
           <td class="num">${fmtInt(s.input_tokens)} / ${fmtInt(s.output_tokens)}</td>
           <td class="num">${fmtUSD(s.cost_usd)}</td>
           <td class="mono" style="font-size:11.5px">${esc(s.models || "–")}</td>
-          <td class="mono">${esc(s.client_ip || "–")}</td>
+          <td class="mono">${esc(s.client_tag || s.client_ip || "–")}</td>
         </tr>`;
       }).join("") || `<tr><td colspan="9"><div class="empty">窗口内没有会话。同一客户端、同一 system 提示词、同一开场消息的连续请求会被归为一个会话。</div></td></tr>`}
     </table></div></div>
@@ -944,7 +946,7 @@ async function renderDetail(id){
       <span class="num">${fmtMs(d.duration_ms)}</span>
       <span class="num">${fmtUSD(d.cost_usd)}</span>
       <span class="mono muted">${esc(d.model || "")}</span>
-      <span class="mono muted">${esc(d.client_ip || "")} → ${esc((d.upstream_url || "").replace(/^https?:\/\//, ""))}</span>
+      <span class="mono muted">${esc(d.client_tag || d.client_ip || "")}${d.client_tag && d.client_ip ? ` <span class="muted" style="font-size:11px">(${esc(d.client_ip)})</span>` : ""} → ${esc((d.upstream_url || "").replace(/^https?:\/\//, ""))}</span>
       <span class="num muted">${fmtTime(d.ts)}</span>
       ${d.session_key ? `<a href="#/s/${esc(d.session_key)}" class="chip info">↗ 所属会话</a>` : ""}
       <button class="btn ghost" id="replay-curl" style="padding:3px 12px;font-size:12px">重放 curl</button>

@@ -102,6 +102,7 @@ pub struct ExchangeMetadata {
     pub model: Option<Value>,
     pub stream: bool,
     pub client_ip: Option<String>,
+    pub client_tag: Option<String>,
     pub route_mode: String,
 }
 
@@ -113,6 +114,7 @@ pub struct Exchange {
     pub stream: bool,
     pub started_at: Instant,
     client_ip: Option<String>,
+    client_tag: Option<String>,
     route_mode: String,
     phase: &'static str,
     terminal_recorded: bool,
@@ -209,6 +211,7 @@ impl ModelInteractionLogger {
             stream: metadata.stream,
             started_at: Instant::now(),
             client_ip: metadata.client_ip,
+            client_tag: metadata.client_tag,
             route_mode: metadata.route_mode,
             phase: "waiting_for_upstream_response",
             terminal_recorded: false,
@@ -544,6 +547,7 @@ fn base_entry(exchange: &Exchange, event: &str) -> Value {
         "model":exchange.model,
         "stream":exchange.stream,
         "client_ip":exchange.client_ip,
+        "client_tag":exchange.client_tag,
         "route_mode":exchange.route_mode
     })
 }
@@ -797,6 +801,7 @@ mod tests {
                 model: None,
                 stream: true,
                 client_ip: Some("203.0.113.8".into()),
+                client_tag: Some("stream-caller".into()),
                 route_mode: "header".into(),
             },
             None,
@@ -821,6 +826,7 @@ mod tests {
         assert_eq!(entry["complete"], false);
         assert_eq!(entry["protocol_complete"], false);
         assert_eq!(entry["client_ip"], "203.0.113.8");
+        assert_eq!(entry["client_tag"], "stream-caller");
         assert_eq!(entry["route_mode"], "header");
         assert!(entry.get("body_cancelled").is_none());
         let read_error = entry["read_error"]["message"].as_str().unwrap();
@@ -842,6 +848,7 @@ mod tests {
                 model: Some(json!("model-a")),
                 stream: true,
                 client_ip: Some("198.51.100.24".into()),
+                client_tag: Some("canary-a".into()),
                 route_mode: "embedded-path".into(),
             },
             None,
@@ -873,6 +880,7 @@ mod tests {
         assert_eq!(cancelled["stage"], "waiting_for_upstream_response");
         for entry in &entries {
             assert_eq!(entry["client_ip"], "198.51.100.24");
+            assert_eq!(entry["client_tag"], "canary-a");
             assert_eq!(entry["route_mode"], "embedded-path");
             assert_eq!(entry["request_id"], "cancelled-before-headers");
         }
@@ -892,6 +900,7 @@ mod tests {
                 model: Some(json!("m")),
                 stream: false,
                 client_ip: None,
+                client_tag: Some("cli-runner".into()),
                 route_mode: "header".into(),
             },
             Some(&json!({"model":"m","max_tokens":1})),
@@ -913,6 +922,9 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0]["event"], "client_request");
         assert_eq!(entries[0]["request_id"], "both-sides");
+        for entry in &entries {
+            assert_eq!(entry["client_tag"], "cli-runner");
+        }
         // The Full-mode body capture is bounded at 8 bytes in test_logger, so
         // the client payload arrives truncated as text rather than JSON.
         assert_eq!(entries[0]["body_truncated"], true);
@@ -934,6 +946,7 @@ mod tests {
                 model: None,
                 stream: true,
                 client_ip: None,
+                client_tag: None,
                 route_mode: "header".into(),
             },
             None,
@@ -958,6 +971,48 @@ mod tests {
         assert_eq!(response["complete"], false);
         assert_eq!(response["protocol_complete"], true);
         assert_eq!(response["body_cancelled"], true);
+        assert!(response["client_tag"].is_null());
+        fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_error_carries_client_tag() {
+        let directory =
+            std::env::temp_dir().join(format!("ocr-model-log-{}", uuid::Uuid::new_v4()));
+        let logger = test_logger(directory.clone(), LogMode::Metadata, 7);
+        let mut exchange = logger.begin(
+            ExchangeMetadata {
+                request_id: "transport-error".into(),
+                upstream_url: "https://upstream.example.com/v1".into(),
+                format: "chat-completions".into(),
+                model: None,
+                stream: false,
+                client_ip: None,
+                client_tag: Some("canary-b".into()),
+                route_mode: "header".into(),
+            },
+            None,
+            &json!({}),
+        );
+        logger.transport_error(&mut exchange, "connection refused");
+        logger.flush().await;
+
+        let path = directory.join(format!(
+            "model-interactions-{}.ndjson",
+            Utc::now().format("%Y-%m-%d")
+        ));
+        let entries = fs::read_to_string(path)
+            .await
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let error = entries
+            .iter()
+            .find(|entry| entry["event"] == "model_transport_error")
+            .unwrap();
+        assert_eq!(error["client_tag"], "canary-b");
+        assert_eq!(error["error"]["message"], "connection refused");
         fs::remove_dir_all(&directory).await.unwrap();
     }
 }

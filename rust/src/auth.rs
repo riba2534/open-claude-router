@@ -122,6 +122,16 @@ pub fn check_embedded_mode_auth(
     ))
 }
 
+/// Self-reported caller identity for the audit log. Never forwarded upstream;
+/// bounded so a hostile client cannot bloat log entries.
+pub fn parse_client_tag(headers: &HeaderMap) -> Option<String> {
+    let tag = header(headers, "x-ocr-client")?.trim();
+    if tag.is_empty() {
+        return None;
+    }
+    Some(tag.chars().take(120).collect())
+}
+
 pub fn parse_upstream_format(headers: &HeaderMap) -> Result<UpstreamFormat, ApiError> {
     let raw = header(headers, "x-upstream-format")
         .unwrap_or_default()
@@ -527,6 +537,27 @@ mod tests {
             "https://upstream.example.com/v1/chat/completions"
         );
         assert_eq!(upstream.authorization, "Custom abc");
+    }
+
+    #[test]
+    fn client_tag_is_trimmed_bounded_and_optional() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(parse_client_tag(&headers), None);
+
+        headers.insert("x-ocr-client", "  canary-a  ".parse().unwrap());
+        assert_eq!(parse_client_tag(&headers), Some("canary-a".into()));
+
+        headers.insert("x-ocr-client", "   ".parse().unwrap());
+        assert_eq!(parse_client_tag(&headers), None);
+
+        headers.insert("x-ocr-client", "x".repeat(300).parse().unwrap());
+        assert_eq!(parse_client_tag(&headers), Some("x".repeat(120)));
+
+        headers.insert(
+            "x-ocr-client",
+            HeaderValue::from_bytes(b"caf\xc3\xa9").unwrap(),
+        );
+        assert_eq!(parse_client_tag(&headers), None);
     }
 
     #[test]

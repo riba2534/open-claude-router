@@ -261,7 +261,7 @@ fn cost_for(
 
 const SUMMARY_COLUMNS: &str = "request_id, ts, model, format, stream, outcome, status, duration_ms,
     input_tokens, output_tokens, cached_tokens, reasoning_tokens, preview, client_ip, route_mode,
-    finish_reason, req_bytes, resp_bytes, cancel_stage, protocol_complete, session_key";
+    finish_reason, req_bytes, resp_bytes, cancel_stage, protocol_complete, session_key, client_tag";
 
 fn summary_row(row: &rusqlite::Row<'_>, pricing: &PricingTable) -> rusqlite::Result<Value> {
     let model = row.get::<_, Option<String>>(2)?;
@@ -290,10 +290,11 @@ fn summary_row(row: &rusqlite::Row<'_>, pricing: &PricingTable) -> rusqlite::Res
         "cancel_stage": row.get::<_, Option<String>>(18)?,
         "protocol_complete": row.get::<_, Option<i64>>(19)?,
         "session_key": row.get::<_, Option<String>>(20)?,
+        "client_tag": row.get::<_, Option<String>>(21)?,
         "cost_usd": cost,
     });
     // The stream query appends updated_at after the summary columns.
-    if let Ok(updated) = row.get::<_, Option<i64>>(21) {
+    if let Ok(updated) = row.get::<_, Option<i64>>(22) {
         value["updated_at"] = json!(updated);
     }
     Ok(value)
@@ -441,12 +442,12 @@ fn build_overview(
 
     let by_client = collect_rows(
         conn,
-        "SELECT COALESCE(client_ip,'(unknown)'), COUNT(*) FROM exchanges
+        "SELECT COALESCE(NULLIF(client_tag,''), client_ip, '(unknown)') AS client, COUNT(*) FROM exchanges
          WHERE ts_unix >= ?1 GROUP BY 1 ORDER BY 2 DESC LIMIT 10",
         &[SqlValue::from(since)],
         |row| {
             Ok(json!({
-                "client_ip": row.get::<_, String>(0)?,
+                "client": row.get::<_, String>(0)?,
                 "count": row.get::<_, i64>(1)?,
             }))
         },
@@ -563,7 +564,7 @@ fn build_sessions(
                 SUM(outcome = 'ok'), SUM(outcome IN ('http_error','transport_error')), SUM(outcome = 'cancelled'),
                 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                 COALESCE(SUM(duration_ms),0),
-                MAX(session_hint), MAX(client_ip), GROUP_CONCAT(DISTINCT model)
+                MAX(session_hint), MAX(client_ip), GROUP_CONCAT(DISTINCT model), MAX(client_tag)
          FROM exchanges WHERE ts_unix >= ?1 AND session_key IS NOT NULL
          GROUP BY session_key ORDER BY MAX(ts_unix) DESC LIMIT 200",
     )?;
@@ -587,6 +588,7 @@ fn build_sessions(
                 "hint": row.get::<_, Option<String>>(12)?,
                 "client_ip": row.get::<_, Option<String>>(13)?,
                 "models": row.get::<_, Option<String>>(14)?,
+                "client_tag": row.get::<_, Option<String>>(15)?,
                 "cost_usd": cost,
             }))
         })?
@@ -602,7 +604,7 @@ fn build_detail(conn: &Connection, pricing: &PricingTable, id: &str) -> rusqlite
                 resp_headers, resp_body, resp_bytes, resp_truncated,
                 agg_response, finish_reason,
                 input_tokens, output_tokens, cached_tokens, reasoning_tokens, preview,
-                session_key, session_hint, client_req_body, anthropic_response
+                session_key, session_hint, client_req_body, anthropic_response, client_tag
          FROM exchanges WHERE request_id = ?1",
     )?;
     let mut rows = statement.query([id])?;
@@ -649,6 +651,7 @@ fn build_detail(conn: &Connection, pricing: &PricingTable, id: &str) -> rusqlite
         "session_hint": row.get::<_, Option<String>>(30)?,
         "client_req_body": row.get::<_, Option<String>>(31)?,
         "anthropic_response": row.get::<_, Option<String>>(32)?,
+        "client_tag": row.get::<_, Option<String>>(33)?,
         "cost_usd": cost,
     }))
 }

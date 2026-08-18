@@ -786,6 +786,7 @@ async fn socket_peer_ip_and_route_mode_are_written_to_audit_log() {
         .header("content-type", "application/json")
         .header("x-upstream-url", format!("{base}/chat"))
         .header("x-upstream-authorization", "Bearer secret")
+        .header("x-ocr-client", "canary-a")
         .body(serde_json::to_vec(&anthropic_body(false)).unwrap())
         .send()
         .await
@@ -811,6 +812,7 @@ async fn socket_peer_ip_and_route_mode_are_written_to_audit_log() {
     let request_id = entries[0]["request_id"].clone();
     for entry in entries {
         assert_eq!(entry["client_ip"], "127.0.0.1");
+        assert_eq!(entry["client_tag"], "canary-a");
         assert_eq!(entry["route_mode"], "header");
         assert_eq!(entry["request_id"], request_id);
     }
