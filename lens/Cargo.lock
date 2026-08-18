@@ -875,6 +875,7 @@ dependencies = [
  "bytes",
  "chrono",
  "open-claude-router",
+ "percent-encoding",
  "rusqlite",
  "serde",
  "serde_json",

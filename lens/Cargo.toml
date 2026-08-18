@@ -10,6 +10,7 @@ open-claude-router = { path = "../rust" }
 axum = { version = "0.8", features = ["http2", "json"] }
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+percent-encoding = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

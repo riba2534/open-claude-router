@@ -5,8 +5,9 @@ const HASH_HEX_LEN: usize = 16;
 const HASH_SEPARATOR_LEN: usize = 1;
 const ALIAS_PREFIX_LIMIT: usize = OPENAI_IDENTIFIER_LIMIT - HASH_SEPARATOR_LEN - HASH_HEX_LEN;
 
+/// Deterministic mapping between Anthropic tool names and Chat-legal aliases.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ChatToolNameMap {
+pub struct ChatToolNameMap {
     forward: HashMap<String, String>,
     reverse: HashMap<String, String>,
 }

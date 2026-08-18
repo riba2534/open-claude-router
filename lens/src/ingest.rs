@@ -1,17 +1,31 @@
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rusqlite::params;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::{db::Db, derive::derive_response, session};
+use crate::{
+    db::Db,
+    derive::{ReplayContext, derive_response},
+    session,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Offset persistence cadence while streaming a log file: at least every this
+/// many lines or bytes, so a crash re-reads at most one batch and memory stays
+/// bounded by a single line instead of the whole unread tail.
+const INGEST_BATCH_LINES: usize = 2000;
+const INGEST_BATCH_BYTES: usize = 8 * 1024 * 1024;
+/// How often expired exchanges are deleted (see LENS_RETENTION_DAYS).
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// ingest_state key marking that the one-time startup backfills have already
+/// completed, so later starts skip the full-table rescans.
+const BACKFILL_MARKER: &str = "migration:v1";
 
 fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
@@ -22,20 +36,72 @@ fn now_unix() -> i64 {
 /// stopped and files removed by the router's retention sweep are forgotten.
 pub fn run(db: Db, dir: PathBuf) {
     info!(directory = %dir.display(), "lens ingester watching model interaction logs");
-    backfill_sessions(&db);
+    run_backfills(&db);
+    let retention_days = retention_days_from_env();
+    // 保留策略是删数据的行为，启动时明确宣告生效值，而不是等首次删除才可见。
+    if retention_days == 0 {
+        info!("exchange retention disabled (LENS_RETENTION_DAYS=0); lens.db grows unbounded");
+    } else {
+        info!(
+            retention_days,
+            "expired exchanges are deleted hourly (LENS_RETENTION_DAYS)"
+        );
+    }
+    let mut last_cleanup: Option<Instant> = None;
     loop {
-        if let Err(error) = scan_once(&db, &dir) {
-            warn!(%error, "ingest scan failed; retrying");
-        }
+        cleanup_expired(&db, retention_days, &mut last_cleanup);
+        scan_once(&db, &dir);
         std::thread::sleep(POLL_INTERVAL);
     }
 }
 
-fn scan_once(db: &Db, dir: &Path) -> Result<(), String> {
+/// LENS_RETENTION_DAYS caps how long exchanges stay in lens.db so the database
+/// cannot grow without bound. Default 30 days; 0 disables cleanup entirely.
+/// The ingester enforces it hourly with a plain DELETE — SQLite reuses the
+/// freed pages for new rows.
+fn retention_days_from_env() -> u64 {
+    let Some(raw) = std::env::var("LENS_RETENTION_DAYS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return 30;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(days) => days,
+        Err(_) => {
+            warn!(value = %raw, "LENS_RETENTION_DAYS must be an integer; using default 30");
+            30
+        }
+    }
+}
+
+fn cleanup_expired(db: &Db, retention_days: u64, last: &mut Option<Instant>) {
+    if retention_days == 0 {
+        return;
+    }
+    if last.is_some_and(|at| at.elapsed() < RETENTION_SWEEP_INTERVAL) {
+        return;
+    }
+    *last = Some(Instant::now());
+    let window = i64::try_from(retention_days)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(86_400);
+    let cutoff = now_unix().saturating_sub(window);
+    match db.with(|conn| conn.execute("DELETE FROM exchanges WHERE ts_unix < ?1", params![cutoff]))
+    {
+        Ok(deleted) if deleted > 0 => {
+            info!(deleted, retention_days, "removed exchanges past retention");
+        }
+        Ok(_) => {}
+        Err(error) => warn!(%error, "retention cleanup failed"),
+    }
+}
+
+fn scan_once(db: &Db, dir: &Path) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         // The directory appears once the router writes its first entry.
-        Err(_) => return Ok(()),
+        Err(_) => return,
     };
     let mut files: Vec<PathBuf> = entries
         .filter_map(Result::ok)
@@ -50,9 +116,11 @@ fn scan_once(db: &Db, dir: &Path) -> Result<(), String> {
         .collect();
     files.sort();
     for path in files {
-        ingest_file(db, &path).map_err(|error| format!("{}: {error}", path.display()))?;
+        // One unreadable file must not block ingestion of the others.
+        if let Err(error) = ingest_file(db, &path) {
+            warn!(path = %path.display(), %error, "failed to ingest log file; skipping");
+        }
     }
-    Ok(())
 }
 
 fn ingest_file(db: &Db, path: &Path) -> Result<(), String> {
@@ -83,42 +151,66 @@ fn ingest_file(db: &Db, path: &Path) -> Result<(), String> {
     let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
     file.seek(SeekFrom::Start(offset))
         .map_err(|error| error.to_string())?;
-    let mut buffer = Vec::with_capacity((size - offset) as usize);
-    file.read_to_end(&mut buffer)
-        .map_err(|error| error.to_string())?;
-    // Only consume complete lines; a partially flushed tail waits for the next poll.
-    let consumed = match buffer.iter().rposition(|byte| *byte == b'\n') {
-        Some(last_newline) => last_newline + 1,
-        None => return Ok(()),
-    };
+    // Stream line by line instead of reading the whole unread tail: first
+    // start against a large log must not buffer gigabytes, and the offset is
+    // persisted per batch so a crash resumes close to where it stopped.
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
     let mut applied = 0usize;
-    for line in buffer[..consumed].split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
+    let mut batch_lines = 0usize;
+    let mut batch_bytes = 0usize;
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
         }
-        match serde_json::from_slice::<Value>(line) {
-            Ok(entry) => {
-                if let Err(error) = apply_entry(db, &entry) {
-                    warn!(%error, "failed to apply log entry");
-                } else {
-                    applied += 1;
+        if line.last() != Some(&b'\n') {
+            // Partially flushed tail line: leave it for the next poll.
+            break;
+        }
+        offset += read as u64;
+        batch_lines += 1;
+        batch_bytes += read;
+        let trimmed = &line[..line.len() - 1];
+        if !trimmed.is_empty() {
+            match serde_json::from_slice::<Value>(trimmed) {
+                Ok(entry) => {
+                    if let Err(error) = apply_entry(db, &entry) {
+                        warn!(%error, "failed to apply log entry");
+                    } else {
+                        applied += 1;
+                    }
                 }
+                Err(error) => warn!(%error, "skipping malformed ndjson line"),
             }
-            Err(error) => warn!(%error, "skipping malformed ndjson line"),
+        }
+        if batch_lines >= INGEST_BATCH_LINES || batch_bytes >= INGEST_BATCH_BYTES {
+            persist_offset(db, &name, offset)?;
+            batch_lines = 0;
+            batch_bytes = 0;
         }
     }
-    let new_offset = offset + consumed as u64;
+    if batch_lines > 0 || batch_bytes > 0 {
+        persist_offset(db, &name, offset)?;
+    }
+    if applied > 0 {
+        info!(file = %name, applied, "ingested log entries");
+    }
+    Ok(())
+}
+
+fn persist_offset(db: &Db, name: &str, offset: u64) -> Result<(), String> {
     db.with(|conn| {
         conn.execute(
             "INSERT INTO ingest_state (file, offset) VALUES (?1, ?2)
              ON CONFLICT(file) DO UPDATE SET offset = excluded.offset",
-            params![name, new_offset as i64],
+            params![name, offset as i64],
         )
     })
     .map_err(|error| error.to_string())?;
-    if applied > 0 {
-        info!(file = %name, applied, "ingested log entries");
-    }
     Ok(())
 }
 
@@ -256,28 +348,87 @@ fn apply_request(db: &Db, request_id: &str, entry: &Value) -> Result<(), String>
     Ok(())
 }
 
-/// Computes session keys for rows ingested by lens builds that predate
-/// session threading. Runs once at startup; the volume is whatever the
-/// dashboard has accumulated, so a single pass is fine.
-fn backfill_sessions(db: &Db) {
-    let rows: Vec<(String, String, Option<String>, String)> = match db.with(|conn| {
-        conn.prepare(
-            "SELECT request_id, COALESCE(format,''), client_ip, req_body FROM exchanges
-             WHERE (session_key IS NULL OR session_hint LIKE '<system-reminder>%') AND req_body IS NOT NULL",
-        )?
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
-        .collect()
+/// One-time backfills for rows written by older lens builds. The marker row in
+/// ingest_state records completion, so later startups skip the full-table
+/// rescans entirely. Row-level failures (unparseable bodies) are warned about
+/// and never retried; only a failed scan leaves the marker unset so the next
+/// start can try again.
+fn run_backfills(db: &Db) {
+    let done = db
+        .with(|conn| {
+            conn.query_row(
+                "SELECT 1 FROM ingest_state WHERE file = ?1",
+                params![BACKFILL_MARKER],
+                |_| Ok(()),
+            )
+            .map(|()| true)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                other => Err(other),
+            })
+        })
+        .unwrap_or(false);
+    if done {
+        return;
+    }
+    let sessions = backfill_sessions(db);
+    let clients = backfill_client_sessions(db);
+    let anthropic = backfill_anthropic(db);
+    if sessions
+        && clients
+        && anthropic
+        && let Err(error) = db.with(|conn| {
+            conn.execute(
+                "INSERT INTO ingest_state (file, offset) VALUES (?1, 1)
+                 ON CONFLICT(file) DO UPDATE SET offset = excluded.offset",
+                params![BACKFILL_MARKER],
+            )
+        })
+    {
+        warn!(%error, "failed to record backfill completion; will rescan next start");
+    }
+}
+
+/// Backfills stream by collecting only the matching request ids and then
+/// fetching each row's bodies one at a time, so memory stays bounded by a
+/// single request body rather than the whole scan result.
+fn backfill_ids(db: &Db, scan_sql: &str, label: &str) -> Option<Vec<String>> {
+    match db.with(|conn| {
+        conn.prepare(scan_sql)?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect()
     }) {
-        Ok(rows) => rows,
+        Ok(ids) => Some(ids),
         Err(error) => {
-            warn!(%error, "session backfill scan failed");
-            return;
+            warn!(%error, "{label} backfill scan failed");
+            None
         }
+    }
+}
+
+/// Computes session keys for rows ingested by lens builds that predate
+/// session threading.
+fn backfill_sessions(db: &Db) -> bool {
+    let Some(ids) = backfill_ids(
+        db,
+        "SELECT request_id FROM exchanges
+         WHERE (session_key IS NULL OR session_hint LIKE '<system-reminder>%') AND req_body IS NOT NULL",
+        "session",
+    ) else {
+        return false;
     };
     let mut updated = 0usize;
-    for (request_id, format, client_ip, req_body) in rows {
+    for request_id in ids {
+        let row: rusqlite::Result<(String, Option<String>, String)> = db.with(|conn| {
+            conn.query_row(
+                "SELECT COALESCE(format,''), client_ip, req_body FROM exchanges WHERE request_id = ?1",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+        });
+        let Ok((format, client_ip, req_body)) = row else {
+            continue;
+        };
         let Ok(payload) = serde_json::from_str::<Value>(&req_body) else {
             continue;
         };
@@ -296,45 +447,34 @@ fn backfill_sessions(db: &Db) {
     if updated > 0 {
         info!(updated, "backfilled session keys");
     }
-    backfill_client_sessions(db);
-    backfill_anthropic(db);
+    true
 }
 
 /// Re-keys rows recorded before Claude Code session ids became the
 /// authoritative grouping: any exchange with a stored client request whose
 /// metadata carries a session_id is moved onto that key.
-fn backfill_client_sessions(db: &Db) {
-    type Row = (
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    );
-    let rows: Vec<Row> = match db.with(|conn| {
-        conn.prepare(
-            "SELECT request_id, client_req_body, session_key, client_tag, client_ip FROM exchanges
-             WHERE client_req_body IS NOT NULL",
-        )?
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })?
-        .collect()
-    }) {
-        Ok(rows) => rows,
-        Err(error) => {
-            warn!(%error, "client session backfill scan failed");
-            return;
-        }
+fn backfill_client_sessions(db: &Db) -> bool {
+    let Some(ids) = backfill_ids(
+        db,
+        "SELECT request_id FROM exchanges WHERE client_req_body IS NOT NULL",
+        "client session",
+    ) else {
+        return false;
     };
+    type Row = (String, Option<String>, Option<String>, Option<String>);
     let mut updated = 0usize;
-    for (request_id, body, current, tag, ip) in rows {
+    for request_id in ids {
+        let row: rusqlite::Result<Row> = db.with(|conn| {
+            conn.query_row(
+                "SELECT client_req_body, session_key, client_tag, client_ip FROM exchanges
+                 WHERE request_id = ?1",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+        });
+        let Ok((body, current, tag, ip)) = row else {
+            continue;
+        };
         let Ok(payload) = serde_json::from_str::<Value>(&body) else {
             continue;
         };
@@ -364,31 +504,40 @@ fn backfill_client_sessions(db: &Db) {
     if updated > 0 {
         info!(updated, "re-keyed exchanges onto Claude Code session ids");
     }
+    true
 }
 
 /// Replays the Anthropic-view response for rows ingested before dual-view
 /// support, using the aggregated upstream payload already stored.
-fn backfill_anthropic(db: &Db) {
-    let rows: Vec<(String, String, String)> = match db.with(|conn| {
-        conn.prepare(
-            "SELECT request_id, COALESCE(format,''), agg_response FROM exchanges
-             WHERE anthropic_response IS NULL AND agg_response IS NOT NULL",
-        )?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-        .collect()
-    }) {
-        Ok(rows) => rows,
-        Err(error) => {
-            warn!(%error, "anthropic backfill scan failed");
-            return;
-        }
+fn backfill_anthropic(db: &Db) -> bool {
+    let Some(ids) = backfill_ids(
+        db,
+        "SELECT request_id FROM exchanges
+         WHERE anthropic_response IS NULL AND agg_response IS NOT NULL",
+        "anthropic",
+    ) else {
+        return false;
     };
+    type Row = (String, String, Option<String>, Option<String>);
     let mut updated = 0usize;
-    for (request_id, format, agg) in rows {
+    for request_id in ids {
+        let row: rusqlite::Result<Row> = db.with(|conn| {
+            conn.query_row(
+                "SELECT COALESCE(format,''), agg_response, client_req_body, req_body
+                 FROM exchanges WHERE request_id = ?1",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+        });
+        let Ok((format, agg, client_req_body, req_body)) = row else {
+            continue;
+        };
         let Ok(upstream) = serde_json::from_str::<Value>(&agg) else {
             continue;
         };
-        let Some(anthropic) = crate::derive::replay_anthropic(&format, &upstream) else {
+        let replay =
+            ReplayContext::from_recorded(&format, client_req_body.as_deref(), req_body.as_deref());
+        let Some(anthropic) = crate::derive::replay_anthropic(&format, &upstream, &replay) else {
             continue;
         };
         let result = db.with(|conn| {
@@ -405,6 +554,7 @@ fn backfill_anthropic(db: &Db) {
     if updated > 0 {
         info!(updated, "backfilled anthropic-view responses");
     }
+    true
 }
 
 fn apply_response(db: &Db, request_id: &str, entry: &Value) -> Result<(), String> {
@@ -422,7 +572,13 @@ fn apply_response(db: &Db, request_id: &str, entry: &Value) -> Result<(), String
     let body_json = entry.get("body");
     let body_text = entry.get("body_text").and_then(Value::as_str);
     let derived = if outcome == "ok" {
-        derive_response(format, content_type, body_json, body_text)
+        // The request-side events for this exchange were ingested first (or
+        // were dropped by the router's bounded queue, in which case the
+        // context degrades to the defaults).
+        let (client_req_body, req_body) = recorded_request_bodies(db, request_id);
+        let replay =
+            ReplayContext::from_recorded(format, client_req_body.as_deref(), req_body.as_deref());
+        derive_response(format, content_type, body_json, body_text, &replay)
     } else {
         Default::default()
     };
@@ -497,6 +653,21 @@ fn apply_terminal(
     })
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+/// The stored request bodies for an exchange, used to rebuild the replay
+/// context (thinking omission flag and chat tool-name map) when its response
+/// arrives.
+fn recorded_request_bodies(db: &Db, request_id: &str) -> (Option<String>, Option<String>) {
+    db.with(|conn| {
+        conn.query_row(
+            "SELECT client_req_body, req_body FROM exchanges WHERE request_id = ?1",
+            params![request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .or(Ok((None, None)))
+    })
+    .unwrap_or((None, None))
 }
 
 /// Caller identity for scoping client-reported session ids: self-reported

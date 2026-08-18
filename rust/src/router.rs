@@ -139,7 +139,10 @@ async fn header_messages(
     forward(
         state,
         headers,
-        payload,
+        ClientBody {
+            wire_bytes: body.len(),
+            payload,
+        },
         format,
         upstream,
         canonical_client_ip(peer),
@@ -194,7 +197,10 @@ async fn fallback(
     forward(
         state,
         headers,
-        payload,
+        ClientBody {
+            wire_bytes: body.len(),
+            payload,
+        },
         format,
         upstream,
         canonical_client_ip(peer),
@@ -271,15 +277,26 @@ fn parse_json_body(bytes: &[u8]) -> Result<Value, ApiError> {
     Ok(payload)
 }
 
+/// Parsed client request body plus its raw wire length, so metadata-mode
+/// logging can report the received size without re-serializing the payload.
+struct ClientBody {
+    payload: Value,
+    wire_bytes: usize,
+}
+
 async fn forward(
     state: Arc<AppState>,
     headers: HeaderMap,
-    payload: Value,
+    client_body: ClientBody,
     format: UpstreamFormat,
     upstream: UpstreamConfig,
     client_ip: Option<String>,
     route_mode: &str,
 ) -> Result<Response, ApiError> {
+    let ClientBody {
+        payload,
+        wire_bytes,
+    } = client_body;
     let wants_stream = payload.get("stream").and_then(Value::as_bool) == Some(true);
     let omit_thinking =
         payload.pointer("/thinking/display").and_then(Value::as_str) == Some("omitted");
@@ -324,7 +341,7 @@ async fn forward(
             client_tag: parse_client_tag(&headers),
             route_mode: route_mode.to_owned(),
         },
-        Some(&payload),
+        Some((&payload, wire_bytes)),
         &outbound,
     );
     let upstream_response = match call_upstream(

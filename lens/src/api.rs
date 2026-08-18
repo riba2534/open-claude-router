@@ -11,6 +11,7 @@ use axum::{
     },
     routing::get,
 };
+use percent_encoding::percent_decode_str;
 use rusqlite::{Connection, params_from_iter, types::Value as SqlValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -58,9 +59,13 @@ async fn require_token(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     let from_query = request.uri().query().and_then(|query| {
-        query
-            .split('&')
-            .find_map(|pair| pair.strip_prefix("token=").map(str::to_owned))
+        query.split('&').find_map(|pair| {
+            // The dashboard sends encodeURIComponent(token), so the raw value
+            // must be percent-decoded before comparison or any token with
+            // reserved characters would never match.
+            pair.strip_prefix("token=")
+                .map(|value| percent_decode_str(value).decode_utf8_lossy().into_owned())
+        })
     });
     if from_header.as_deref() == Some(expected) || from_query.as_deref() == Some(expected) {
         next.run(request).await
@@ -189,20 +194,30 @@ async fn stream(State(state): State<Arc<LensState>>) -> impl IntoResponse {
         let mut cursor = chrono::Utc::now().timestamp();
         let mut seen: HashMap<String, String> = HashMap::new();
         loop {
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            // Exit as soon as the client disconnects instead of polling until
+            // the next row makes a send fail.
+            tokio::select! {
+                _ = tx.closed() => return,
+                _ = tokio::time::sleep(Duration::from_millis(1500)) => {}
+            }
             let since = cursor - 1;
-            let rows = state.db.with(|conn| {
-                collect_rows(
-                    conn,
-                    &format!(
-                        "SELECT {SUMMARY_COLUMNS}, updated_at FROM exchanges
-                         WHERE updated_at >= ? ORDER BY updated_at ASC LIMIT 200"
-                    ),
-                    &[SqlValue::from(since)],
-                    |row| summary_row(row, &state.pricing),
-                )
-            });
-            let Ok(Value::Array(rows)) = rows else {
+            // rusqlite queries are synchronous; keep them off the async workers.
+            let query_state = state.clone();
+            let rows = tokio::task::spawn_blocking(move || {
+                query_state.db.with(|conn| {
+                    collect_rows(
+                        conn,
+                        &format!(
+                            "SELECT {SUMMARY_COLUMNS}, updated_at FROM exchanges
+                             WHERE updated_at >= ? ORDER BY updated_at ASC LIMIT 200"
+                        ),
+                        &[SqlValue::from(since)],
+                        |row| summary_row(row, &query_state.pricing),
+                    )
+                })
+            })
+            .await;
+            let Ok(Ok(Value::Array(rows))) = rows else {
                 continue;
             };
             for row in rows {
@@ -423,8 +438,33 @@ fn build_overview(
         },
     )?;
 
+    // Totals must cover every model in the window: by_model below is capped at
+    // 20 rows for display, so summing it would under-count once more models
+    // are active. Cost is still priced per model before summing.
     let mut total_cost = 0.0;
     let mut total_savings = 0.0;
+    {
+        let mut statement = conn.prepare(&format!(
+            "SELECT COALESCE(model,'(unknown)'),
+                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(cached_tokens),0), COALESCE(SUM(reasoning_tokens),0)
+             FROM exchanges WHERE ts_unix >= ?{cf} GROUP BY 1"
+        ))?;
+        let rows = statement.query_map(params_from_iter(base_values.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (model, input, output, cached, reasoning) = row?;
+            total_cost += pricing.estimate_usd(&model, input, output, cached, reasoning);
+            total_savings += pricing.cache_savings_usd(&model, cached);
+        }
+    }
     let by_model = {
         let mut statement = conn.prepare(&format!(
             "SELECT COALESCE(model,'(unknown)'), COUNT(*),
@@ -457,13 +497,6 @@ fn build_overview(
                 }))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        for row in &rows {
-            total_cost += row.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
-            total_savings += row
-                .get("cache_savings_usd")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-        }
         Value::Array(rows)
     };
     totals["cost_usd"] = json!(total_cost);

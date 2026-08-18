@@ -21,7 +21,8 @@ pub fn transform_chat_json_response(
     )
 }
 
-pub(crate) fn transform_chat_json_response_with_tool_names(
+/// Chat response conversion that restores original tool names via `tool_names`.
+pub fn transform_chat_json_response_with_tool_names(
     payload: &Value,
     omit_thinking: bool,
     tool_names: &ChatToolNameMap,

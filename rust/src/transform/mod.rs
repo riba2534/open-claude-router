@@ -10,9 +10,14 @@ pub use response::{
 };
 pub use responses::{transform_responses_json, transform_responses_request};
 
-pub(crate) use identity::ChatToolNameMap;
-pub(crate) use request::{prepare_chat_request_with_tool_names, validate_final_outbound_request};
-pub(crate) use response::transform_chat_json_response_with_tool_names;
+// Exported for offline replay tooling (lens): rebuilding the exact tool-name
+// mapping lets a recorded upstream response be converted the same way the
+// client originally saw it.
+pub use identity::ChatToolNameMap;
+pub use request::prepare_chat_request_with_tool_names;
+pub use response::transform_chat_json_response_with_tool_names;
+
+pub(crate) use request::validate_final_outbound_request;
 
 use axum::http::StatusCode;
 

@@ -14,7 +14,10 @@ use tracing::{error, info};
 use url::Url;
 
 const MAX_BODY_READ_ERROR_CHARS: usize = 1024;
-const MAX_PENDING_WRITES: usize = 256;
+/// Sized in enqueued entries, not requests: `begin()` queues two entries per
+/// request (client_request + model_request), so 512 keeps headroom for 256
+/// in-flight requests before terminal entries start being dropped.
+const MAX_PENDING_WRITES: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogMode {
@@ -192,7 +195,8 @@ impl ModelInteractionLogger {
     }
 
     /// Starts an exchange record. `client_body` is the original Anthropic
-    /// Messages payload as received from the client; when provided it is
+    /// Messages payload as received from the client, paired with the raw
+    /// request body length the caller already measured; when provided it is
     /// logged as a separate `client_request` entry so operators can inspect
     /// both sides of the protocol conversion. It obeys the same mode and
     /// body-size bounds as every other entry and never includes credentials
@@ -200,7 +204,7 @@ impl ModelInteractionLogger {
     pub fn begin(
         &self,
         metadata: ExchangeMetadata,
-        client_body: Option<&Value>,
+        client_body: Option<(&Value, usize)>,
         outbound: &Value,
     ) -> Exchange {
         let exchange = Exchange {
@@ -218,18 +222,37 @@ impl ModelInteractionLogger {
             logger: self.clone(),
         };
         if self.config.enabled() {
-            if let Some(client_body) = client_body {
-                let serialized = serialize_body(client_body);
+            if let Some((client_body, received_bytes)) = client_body {
                 let mut entry = base_entry(&exchange, "client_request");
-                add_body(
-                    &mut entry,
-                    &serialized,
-                    serialized.len(),
-                    "application/json",
-                    &self.config,
-                );
+                if self.config.mode == LogMode::Metadata {
+                    // Metadata mode never emits body content, so skip the full
+                    // serialization and record the wire length the caller
+                    // already measured. Full mode keeps reporting the compact
+                    // serialized length so body_truncated stays consistent
+                    // with the captured bytes.
+                    add_body(
+                        &mut entry,
+                        &[],
+                        received_bytes,
+                        "application/json",
+                        &self.config,
+                    );
+                } else {
+                    let serialized = serialize_body(client_body);
+                    add_body(
+                        &mut entry,
+                        &serialized,
+                        serialized.len(),
+                        "application/json",
+                        &self.config,
+                    );
+                }
                 self.append(entry);
             }
+            // The outbound body exists only as parsed JSON here (reqwest
+            // serializes it independently when sending, behind a frozen
+            // interface), so one serialization is still required to give
+            // body_bytes a meaningful value even in Metadata mode.
             let serialized = serialize_body(outbound);
             let mut entry = base_entry(&exchange, "model_request");
             add_body(
@@ -903,7 +926,7 @@ mod tests {
                 client_tag: Some("cli-runner".into()),
                 route_mode: "header".into(),
             },
-            Some(&json!({"model":"m","max_tokens":1})),
+            Some((&json!({"model":"m","max_tokens":1}), 42)),
             &json!({"model":"m"}),
         );
         logger.response(&mut exchange, 200, json!({}), b"{}", true);
@@ -930,6 +953,55 @@ mod tests {
         assert_eq!(entries[0]["body_truncated"], true);
         assert_eq!(entries[1]["event"], "model_request");
         assert_eq!(entries[2]["event"], "model_response");
+        fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_client_request_records_wire_length_without_serializing() {
+        let directory =
+            std::env::temp_dir().join(format!("ocr-model-log-{}", uuid::Uuid::new_v4()));
+        let logger = test_logger(directory.clone(), LogMode::Metadata, 7);
+        let mut exchange = logger.begin(
+            ExchangeMetadata {
+                request_id: "metadata-lengths".into(),
+                upstream_url: "https://upstream.example.com/v1".into(),
+                format: "chat-completions".into(),
+                model: Some(json!("m")),
+                stream: false,
+                client_ip: None,
+                client_tag: None,
+                route_mode: "header".into(),
+            },
+            Some((&json!({"model":"m","max_tokens":1}), 999)),
+            &json!({"model":"m"}),
+        );
+        logger.response(&mut exchange, 200, json!({}), b"{}", true);
+        logger.flush().await;
+
+        let path = directory.join(format!(
+            "model-interactions-{}.ndjson",
+            Utc::now().format("%Y-%m-%d")
+        ));
+        let entries = fs::read_to_string(path)
+            .await
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let client = entries
+            .iter()
+            .find(|entry| entry["event"] == "client_request")
+            .unwrap();
+        // Metadata mode reports the raw wire length passed by the caller and
+        // never captures body content.
+        assert_eq!(client["body_bytes"], 999);
+        assert!(client.get("body").is_none());
+        assert!(client.get("body_text").is_none());
+        let request = entries
+            .iter()
+            .find(|entry| entry["event"] == "model_request")
+            .unwrap();
+        assert!(request["body_bytes"].as_u64().unwrap() > 0);
         fs::remove_dir_all(&directory).await.unwrap();
     }
 

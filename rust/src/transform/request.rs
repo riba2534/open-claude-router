@@ -375,7 +375,8 @@ pub fn prepare_chat_request(body: &mut Value) {
     let _ = prepare_chat_request_with_tool_names(body);
 }
 
-pub(crate) fn prepare_chat_request_with_tool_names(body: &mut Value) -> ChatToolNameMap {
+/// Chat-specific request preparation; returns the tool-name map it applied.
+pub fn prepare_chat_request_with_tool_names(body: &mut Value) -> ChatToolNameMap {
     let tool_names = ChatToolNameMap::new(collect_chat_tool_names(body));
     apply_chat_tool_names(body, &tool_names);
     scrub_cache_control(body);
