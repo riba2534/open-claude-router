@@ -89,7 +89,7 @@ flowchart LR
     Browser["浏览器"] --> Lens
 ```
 
-转发器把每次交换异步追加写入日志（fail-open，日志故障不改变转发行为），看板只读地 tail 日志入 SQLite 并提供 Web 界面。看板还原请求响应时直接复用转发器的协议转换代码（`lens` crate 以库依赖引用 `rust` crate），因此展示的 Anthropic 响应与线上真实返回同源。任一侧故障不影响另一侧；`LENS_ENABLED=false` 时只启动转发器。
+转发器把每次交换异步追加写入日志（fail-open，日志故障不改变转发行为），看板只读地 tail 日志入 SQLite 并提供 Web 界面。两个进程的地位并不对等：**转发器退出会结束容器**（交给编排层重启），而**看板退出只损失看板**——entrypoint 会带退避原地重启它（`LENS_MAX_RESTARTS` 次后放弃），转发全程不受影响。看板还原请求响应时直接复用转发器的协议转换代码（`lens` crate 以库依赖引用 `rust` crate），因此展示的 Anthropic 响应与线上真实返回同源。任一侧故障不影响另一侧；`LENS_ENABLED=false` 时只启动转发器。
 
 ## 快速开始
 
@@ -139,7 +139,7 @@ Linux / macOS：
 
 ```bash
 # 把版本和平台替换成 Release 页面中的实际值
-VERSION=v0.7.4
+VERSION=v0.7.5
 PLATFORM=linux-amd64
 ARCHIVE="open-claude-router-${VERSION}-${PLATFORM}.tar.gz"
 
@@ -156,7 +156,7 @@ cd "open-claude-router-${VERSION}-${PLATFORM}"
 Windows PowerShell：
 
 ```powershell
-$Version = "v0.7.4"
+$Version = "v0.7.5"
 $Platform = "windows-amd64" # Windows on ARM 使用 windows-arm64
 $Archive = "open-claude-router-$Version-$Platform.zip"
 
@@ -444,6 +444,8 @@ Claude Code 会自动追加 `/v1/messages`，服务端识别并砍掉这个后�
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `LENS_ENABLED` | `true` | 官方镜像 entrypoint 使用；设为 `false` / `0` / `no` / `off` 时只启动转发器，不启动看板 |
+| `LENS_MAX_RESTARTS` | `5` | 看板进程连续异常退出多少次后放弃重启（转发不受影响，容器继续运行） |
+| `LENS_RESTART_DELAY` | `5` | 看板进程异常退出后的重启退避秒数 |
 | `LENS_PORT` | `3458` | 看板监听端口 |
 | `LENS_HOST` | `0.0.0.0` | 看板监听地址；容器内保持 `0.0.0.0`，暴露范围用 `docker run -p` 控制 |
 | `LENS_DB_PATH` | `data/lens.db` | SQLite 文件路径（相对当前工作目录）；官方镜像对应 `/app/data/lens.db` |
