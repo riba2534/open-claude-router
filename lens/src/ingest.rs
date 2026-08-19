@@ -31,6 +31,24 @@ fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// Upserts one body column. Bodies arrive across several log entries for the
+/// same request, so each write has to create the row or update just its column.
+fn store_body(
+    conn: &rusqlite::Connection,
+    request_id: &str,
+    column: &str,
+    body: Option<&str>,
+) -> rusqlite::Result<usize> {
+    // `column` is a literal from this module, never user input.
+    conn.execute(
+        &format!(
+            "INSERT INTO exchange_bodies (request_id, {column}) VALUES (?1, ?2)
+             ON CONFLICT(request_id) DO UPDATE SET {column} = excluded.{column}"
+        ),
+        params![request_id, body],
+    )
+}
+
 /// Tails every model-interactions-*.ndjson file in the log directory with a
 /// per-file byte offset persisted in SQLite, so restarts resume where they
 /// stopped and files removed by the router's retention sweep are forgotten.
@@ -87,8 +105,16 @@ fn cleanup_expired(db: &Db, retention_days: u64, last: &mut Option<Instant>) {
         .unwrap_or(i64::MAX)
         .saturating_mul(86_400);
     let cutoff = now_unix().saturating_sub(window);
-    match db.with(|conn| conn.execute("DELETE FROM exchanges WHERE ts_unix < ?1", params![cutoff]))
-    {
+    match db.with(|conn| {
+        // Bodies first: they are matched through `exchanges`, so dropping the
+        // metadata first would strand them.
+        conn.execute(
+            "DELETE FROM exchange_bodies WHERE request_id IN
+               (SELECT request_id FROM exchanges WHERE ts_unix < ?1)",
+            params![cutoff],
+        )?;
+        conn.execute("DELETE FROM exchanges WHERE ts_unix < ?1", params![cutoff])
+    }) {
         Ok(deleted) if deleted > 0 => {
             info!(deleted, retention_days, "removed exchanges past retention");
         }
@@ -294,18 +320,18 @@ fn apply_client_request(db: &Db, request_id: &str, entry: &Value) -> Result<(), 
         });
     db.with(|conn| {
         conn.execute(
-            "UPDATE exchanges SET client_req_body = ?2, updated_at = ?3,
-                    session_key = COALESCE(?4, session_key),
-                    session_hint = COALESCE(?5, session_hint)
+            "UPDATE exchanges SET updated_at = ?2,
+                    session_key = COALESCE(?3, session_key),
+                    session_hint = COALESCE(?4, session_hint)
              WHERE request_id = ?1",
             params![
                 request_id,
-                body,
                 now_unix(),
                 session.as_ref().map(|session| session.key.clone()),
                 session.as_ref().and_then(|session| session.hint.clone()),
             ],
-        )
+        )?;
+        store_body(conn, request_id, "client_req_body", body.as_deref())
     })
     .map_err(|error| error.to_string())?;
     Ok(())
@@ -326,13 +352,12 @@ fn apply_request(db: &Db, request_id: &str, entry: &Value) -> Result<(), String>
     });
     db.with(|conn| {
         conn.execute(
-            "UPDATE exchanges SET req_body = ?2, req_bytes = ?3, req_truncated = ?4,
-                    session_key = COALESCE(session_key, ?5),
-                    session_hint = COALESCE(session_hint, ?6), updated_at = ?7
+            "UPDATE exchanges SET req_bytes = ?2, req_truncated = ?3,
+                    session_key = COALESCE(session_key, ?4),
+                    session_hint = COALESCE(session_hint, ?5), updated_at = ?6
              WHERE request_id = ?1",
             params![
                 request_id,
-                body,
                 entry.get("body_bytes").and_then(Value::as_i64),
                 entry
                     .get("body_truncated")
@@ -342,7 +367,8 @@ fn apply_request(db: &Db, request_id: &str, entry: &Value) -> Result<(), String>
                 session.as_ref().and_then(|session| session.hint.clone()),
                 now_unix(),
             ],
-        )
+        )?;
+        store_body(conn, request_id, "req_body", body.as_deref())
     })
     .map_err(|error| error.to_string())?;
     Ok(())
@@ -411,8 +437,8 @@ fn backfill_ids(db: &Db, scan_sql: &str, label: &str) -> Option<Vec<String>> {
 fn backfill_sessions(db: &Db) -> bool {
     let Some(ids) = backfill_ids(
         db,
-        "SELECT request_id FROM exchanges
-         WHERE (session_key IS NULL OR session_hint LIKE '<system-reminder>%') AND req_body IS NOT NULL",
+        "SELECT e.request_id FROM exchanges e JOIN exchange_bodies b ON b.request_id = e.request_id
+         WHERE (e.session_key IS NULL OR e.session_hint LIKE '<system-reminder>%') AND b.req_body IS NOT NULL",
         "session",
     ) else {
         return false;
@@ -421,7 +447,9 @@ fn backfill_sessions(db: &Db) -> bool {
     for request_id in ids {
         let row: rusqlite::Result<(String, Option<String>, String)> = db.with(|conn| {
             conn.query_row(
-                "SELECT COALESCE(format,''), client_ip, req_body FROM exchanges WHERE request_id = ?1",
+                "SELECT COALESCE(e.format,''), e.client_ip, b.req_body
+                 FROM exchanges e JOIN exchange_bodies b ON b.request_id = e.request_id
+                 WHERE e.request_id = ?1",
                 params![request_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -456,7 +484,7 @@ fn backfill_sessions(db: &Db) -> bool {
 fn backfill_client_sessions(db: &Db) -> bool {
     let Some(ids) = backfill_ids(
         db,
-        "SELECT request_id FROM exchanges WHERE client_req_body IS NOT NULL",
+        "SELECT request_id FROM exchange_bodies WHERE client_req_body IS NOT NULL",
         "client session",
     ) else {
         return false;
@@ -466,8 +494,9 @@ fn backfill_client_sessions(db: &Db) -> bool {
     for request_id in ids {
         let row: rusqlite::Result<Row> = db.with(|conn| {
             conn.query_row(
-                "SELECT client_req_body, session_key, client_tag, client_ip FROM exchanges
-                 WHERE request_id = ?1",
+                "SELECT b.client_req_body, e.session_key, e.client_tag, e.client_ip
+                 FROM exchanges e JOIN exchange_bodies b ON b.request_id = e.request_id
+                 WHERE e.request_id = ?1",
                 params![request_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -512,7 +541,7 @@ fn backfill_client_sessions(db: &Db) -> bool {
 fn backfill_anthropic(db: &Db) -> bool {
     let Some(ids) = backfill_ids(
         db,
-        "SELECT request_id FROM exchanges
+        "SELECT request_id FROM exchange_bodies
          WHERE anthropic_response IS NULL AND agg_response IS NOT NULL",
         "anthropic",
     ) else {
@@ -523,8 +552,9 @@ fn backfill_anthropic(db: &Db) -> bool {
     for request_id in ids {
         let row: rusqlite::Result<Row> = db.with(|conn| {
             conn.query_row(
-                "SELECT COALESCE(format,''), agg_response, client_req_body, req_body
-                 FROM exchanges WHERE request_id = ?1",
+                "SELECT COALESCE(e.format,''), b.agg_response, b.client_req_body, b.req_body
+                 FROM exchanges e JOIN exchange_bodies b ON b.request_id = e.request_id
+                 WHERE e.request_id = ?1",
                 params![request_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -542,7 +572,8 @@ fn backfill_anthropic(db: &Db) -> bool {
         };
         let result = db.with(|conn| {
             conn.execute(
-                "UPDATE exchanges SET anthropic_response = ?2 WHERE request_id = ?1",
+                "INSERT INTO exchange_bodies (request_id, anthropic_response) VALUES (?1, ?2)
+                 ON CONFLICT(request_id) DO UPDATE SET anthropic_response = excluded.anthropic_response",
                 params![request_id, anthropic.to_string()],
             )
         });
@@ -590,30 +621,29 @@ fn apply_response(db: &Db, request_id: &str, entry: &Value) -> Result<(), String
         conn.execute(
             "UPDATE exchanges SET
                outcome = ?2, status = ?3, duration_ms = ?4, complete = ?5, protocol_complete = ?6,
-               error_message = ?7, resp_headers = ?8, resp_body = ?9, resp_bytes = ?10, resp_truncated = ?11,
-               agg_response = ?12, finish_reason = ?13,
-               input_tokens = ?14, output_tokens = ?15, cached_tokens = ?16, reasoning_tokens = ?17,
-               preview = ?18, updated_at = ?19, anthropic_response = ?20
+               error_message = ?7, resp_bytes = ?8, resp_truncated = ?9, finish_reason = ?10,
+               input_tokens = ?11, output_tokens = ?12, cached_tokens = ?13, reasoning_tokens = ?14,
+               preview = ?15, updated_at = ?16
              WHERE request_id = ?1",
             params![
                 request_id,
                 outcome,
                 status,
                 entry.get("duration_ms").and_then(Value::as_i64),
-                entry.get("complete").and_then(Value::as_bool).map(i64::from),
+                entry
+                    .get("complete")
+                    .and_then(Value::as_bool)
+                    .map(i64::from),
                 entry
                     .get("protocol_complete")
                     .and_then(Value::as_bool)
                     .map(i64::from),
                 read_error,
-                entry.get("headers").map(Value::to_string),
-                body_string(entry),
                 entry.get("body_bytes").and_then(Value::as_i64),
                 entry
                     .get("body_truncated")
                     .and_then(Value::as_bool)
                     .map(i64::from),
-                derived.agg_response.as_ref().map(Value::to_string),
                 derived.finish_reason,
                 derived.input_tokens,
                 derived.output_tokens,
@@ -621,6 +651,22 @@ fn apply_response(db: &Db, request_id: &str, entry: &Value) -> Result<(), String
                 derived.reasoning_tokens,
                 derived.preview,
                 now_unix(),
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO exchange_bodies
+               (request_id, resp_headers, resp_body, agg_response, anthropic_response)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(request_id) DO UPDATE SET
+               resp_headers = excluded.resp_headers,
+               resp_body = excluded.resp_body,
+               agg_response = excluded.agg_response,
+               anthropic_response = excluded.anthropic_response",
+            params![
+                request_id,
+                entry.get("headers").map(Value::to_string),
+                body_string(entry),
+                derived.agg_response.as_ref().map(Value::to_string),
                 derived.anthropic_response.as_ref().map(Value::to_string),
             ],
         )
@@ -700,5 +746,73 @@ fn model_name(model: Option<&Value>) -> Option<String> {
         Value::String(name) => Some(name.clone()),
         Value::Null => None,
         other => Some(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed(db: &Db, request_id: &str, ts_unix: i64) {
+        db.with(|conn| {
+            conn.execute(
+                "INSERT INTO exchanges (request_id, ts_unix, model) VALUES (?1, ?2, 'm')",
+                params![request_id, ts_unix],
+            )?;
+            conn.execute(
+                "INSERT INTO exchange_bodies (request_id, req_body) VALUES (?1, 'body')",
+                params![request_id],
+            )
+        })
+        .unwrap();
+    }
+
+    fn counts(db: &Db) -> (i64, i64) {
+        db.with(|conn| {
+            Ok((
+                conn.query_row("SELECT COUNT(*) FROM exchanges", [], |row| row.get(0))?,
+                conn.query_row("SELECT COUNT(*) FROM exchange_bodies", [], |row| row.get(0))?,
+            ))
+        })
+        .unwrap()
+    }
+
+    /// Bodies live in their own table now, so retention has to reach both or
+    /// expired payloads would sit on disk forever with nothing pointing at them.
+    #[test]
+    fn retention_removes_bodies_along_with_their_exchange() {
+        let path = std::env::temp_dir().join(format!("lens-retention-{}.db", uuid::Uuid::new_v4()));
+        let db = Db::open(&path).unwrap();
+        let now = now_unix();
+        seed(&db, "fresh", now - 3_600);
+        seed(&db, "expired", now - 5 * 86_400);
+        assert_eq!(counts(&db), (2, 2));
+
+        let mut last = None;
+        cleanup_expired(&db, 2, &mut last);
+
+        assert_eq!(counts(&db), (1, 1), "expired body must go with its row");
+        db.with(|conn| {
+            let kept: String =
+                conn.query_row("SELECT request_id FROM exchange_bodies", [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(kept, "fresh");
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retention_disabled_keeps_everything() {
+        let path =
+            std::env::temp_dir().join(format!("lens-retention-off-{}.db", uuid::Uuid::new_v4()));
+        let db = Db::open(&path).unwrap();
+        seed(&db, "ancient", 0);
+        let mut last = None;
+        cleanup_expired(&db, 0, &mut last);
+        assert_eq!(counts(&db), (1, 1));
+        let _ = std::fs::remove_file(&path);
     }
 }

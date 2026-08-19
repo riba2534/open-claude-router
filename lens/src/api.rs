@@ -576,7 +576,11 @@ fn build_list(
         values.push(SqlValue::from(client.to_owned()));
     }
     if let Some(term) = params.q.as_deref().filter(|value| !value.is_empty()) {
-        clauses.push("(request_id LIKE ? OR preview LIKE ? OR req_body LIKE ?)".into());
+        clauses.push(
+            "(request_id LIKE ? OR preview LIKE ? OR request_id IN
+                (SELECT request_id FROM exchange_bodies WHERE req_body LIKE ?))"
+                .into(),
+        );
         let pattern = format!("%{term}%");
         values.push(SqlValue::from(pattern.clone()));
         values.push(SqlValue::from(pattern.clone()));
@@ -689,14 +693,17 @@ fn build_sessions(
 
 fn build_detail(conn: &Connection, pricing: &PricingTable, id: &str) -> rusqlite::Result<Value> {
     let mut statement = conn.prepare(
-        "SELECT request_id, ts, upstream_url, format, model, stream, client_ip, route_mode,
-                req_body, req_bytes, req_truncated,
-                outcome, status, duration_ms, complete, protocol_complete, cancel_stage, error_message,
-                resp_headers, resp_body, resp_bytes, resp_truncated,
-                agg_response, finish_reason,
-                input_tokens, output_tokens, cached_tokens, reasoning_tokens, preview,
-                session_key, session_hint, client_req_body, anthropic_response, client_tag
-         FROM exchanges WHERE request_id = ?1",
+        // The only query that needs bodies, so it is the only one that joins
+        // them back in; every list and aggregate stays on the metadata table.
+        "SELECT e.request_id, e.ts, e.upstream_url, e.format, e.model, e.stream, e.client_ip, e.route_mode,
+                b.req_body, e.req_bytes, e.req_truncated,
+                e.outcome, e.status, e.duration_ms, e.complete, e.protocol_complete, e.cancel_stage, e.error_message,
+                b.resp_headers, b.resp_body, e.resp_bytes, e.resp_truncated,
+                b.agg_response, e.finish_reason,
+                e.input_tokens, e.output_tokens, e.cached_tokens, e.reasoning_tokens, e.preview,
+                e.session_key, e.session_hint, b.client_req_body, b.anthropic_response, e.client_tag
+         FROM exchanges e LEFT JOIN exchange_bodies b ON b.request_id = e.request_id
+         WHERE e.request_id = ?1",
     )?;
     let mut rows = statement.query([id])?;
     let Some(row) = rows.next()? else {

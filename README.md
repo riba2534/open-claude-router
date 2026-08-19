@@ -139,7 +139,7 @@ Linux / macOS：
 
 ```bash
 # 把版本和平台替换成 Release 页面中的实际值
-VERSION=v0.7.2
+VERSION=v0.7.3
 PLATFORM=linux-amd64
 ARCHIVE="open-claude-router-${VERSION}-${PLATFORM}.tar.gz"
 
@@ -156,7 +156,7 @@ cd "open-claude-router-${VERSION}-${PLATFORM}"
 Windows PowerShell：
 
 ```powershell
-$Version = "v0.7.2"
+$Version = "v0.7.3"
 $Platform = "windows-amd64" # Windows on ARM 使用 windows-arm64
 $Archive = "open-claude-router-$Version-$Platform.zip"
 

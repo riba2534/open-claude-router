@@ -328,6 +328,9 @@ function showCopyModal(title, text){
 
 /* ---------- live stream (SSE) ---------- */
 let es = null, streamTimer = null;
+const REDRAW_MIN_MS = 5000;
+let lastRedraw = 0;
+
 function connectStream(force){
   if(es && !force) return;
   if(es){ es.close(); es = null; }
@@ -337,10 +340,13 @@ function connectStream(force){
   es.onopen = () => dot.classList.add("on");
   es.onerror = () => { dot.classList.remove("on"); };
   es.onmessage = () => {
-    // 收到任何新事件：对当前列表类视图做去抖重渲染（详情页不动）
+    // 收到任何新事件：对当前列表类视图做去抖重渲染（详情页不动）。
+    // 繁忙部署每秒都有新请求，纯去抖会让页面一直重渲染——上一次还没画完
+    // 下一次又来了，所以再压一道最小间隔，两次重渲染之间至少隔 REDRAW_MIN_MS。
     if((location.hash || "#/").startsWith("#/r/")) return;
     clearTimeout(streamTimer);
-    streamTimer = setTimeout(route, 400);
+    const wait = Math.max(400, REDRAW_MIN_MS - (Date.now() - lastRedraw));
+    streamTimer = setTimeout(route, wait);
   };
 }
 
@@ -1087,6 +1093,7 @@ function unhash(value){
 }
 
 async function route(){
+  lastRedraw = Date.now();
   const hash = location.hash || "#/";
   document.getElementById("nav-overview").classList.toggle("on", hash === "#/" || hash === "");
   document.getElementById("nav-requests").classList.toggle("on", hash.startsWith("#/requests") || hash.startsWith("#/r/"));
