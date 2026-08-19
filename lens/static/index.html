@@ -647,7 +647,7 @@ async function renderSessionDetail(key){
     api(`/api/sessions?hours=${hours}`),
   ]);
   const s = sessions.sessions.find(x => x.session_key === key);
-  const rows = list.rows.slice().reverse(); // 会话内按时间正序
+  const rows = list.rows; // 会话内也是最新在前，和请求/会话列表一致
   $view.innerHTML = `
     <h2 class="vh"><a href="#/sessions">← 会话列表</a></h2>
     ${s ? `<div class="meta-bar">
@@ -662,7 +662,7 @@ async function renderSessionDetail(key){
     <div class="panel" style="padding:6px 10px"><div class="tbl-scroll"><table class="data">
       <tr><th>#</th><th>时间</th><th>协议</th><th>结果</th><th>耗时</th><th>in/out tk</th><th>费用</th><th>预览</th></tr>
       ${rows.map((r, i) => `<tr class="row" data-id="${esc(r.request_id)}">
-        <td class="num muted">${i + 1}</td>
+        <td class="num muted">${(s ? s.count : rows.length) - i}</td>
         <td class="num" style="white-space:nowrap">${fmtTime(r.ts)}</td>
         <td>${fmtChip(r.format)}${streamChip(r.stream)}</td>
         <td>${outcomeChip(r)}</td>
