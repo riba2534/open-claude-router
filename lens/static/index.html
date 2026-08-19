@@ -670,7 +670,7 @@ async function renderSessionDetail(key){
         <td class="num">${r.input_tokens != null ? fmtInt(r.input_tokens)+" / "+fmtInt(r.output_tokens) : "–"}</td>
         <td class="num">${fmtUSD(r.cost_usd)}</td>
         <td class="muted" style="max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.preview || r.cancel_stage || "")}</td>
-      </tr>`).join("")}
+      </tr>`).join("") || `<tr><td colspan="8" class="empty">当前时间窗内没有这个会话的请求，试试把右上角时间窗调大</td></tr>`}
     </table></div></div>`;
   $view.querySelectorAll("tr.row[data-id]").forEach(tr => tr.onclick = () => { location.hash = "#/r/" + tr.dataset.id; });
 }
@@ -1076,15 +1076,25 @@ async function renderDetail(id){
 }
 
 /* ---------- router ---------- */
+// A shared link can arrive percent-encoded (session keys contain a colon),
+// while an in-app click writes the raw key. Decode only when it round-trips:
+// a client tag may legitimately contain a bare '%', which would throw.
+function unhash(value){
+  try {
+    const decoded = decodeURIComponent(value);
+    return encodeURIComponent(decoded) === value ? decoded : value;
+  } catch { return value; }
+}
+
 async function route(){
   const hash = location.hash || "#/";
   document.getElementById("nav-overview").classList.toggle("on", hash === "#/" || hash === "");
   document.getElementById("nav-requests").classList.toggle("on", hash.startsWith("#/requests") || hash.startsWith("#/r/"));
   document.getElementById("nav-sessions").classList.toggle("on", hash.startsWith("#/sessions") || hash.startsWith("#/s/"));
   try {
-    if(hash.startsWith("#/r/")) await renderDetail(hash.slice(4));
+    if(hash.startsWith("#/r/")) await renderDetail(unhash(hash.slice(4)));
     else if(hash.startsWith("#/requests")) await renderList();
-    else if(hash.startsWith("#/s/")) await renderSessionDetail(hash.slice(4));
+    else if(hash.startsWith("#/s/")) await renderSessionDetail(unhash(hash.slice(4)));
     else if(hash.startsWith("#/sessions")) await renderSessions();
     else await renderOverview();
   } catch(err) {
