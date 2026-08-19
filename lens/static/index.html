@@ -205,6 +205,10 @@ pre.code { background:var(--code-bg); border:1px solid var(--line); border-radiu
 .overlay .row { display:flex; gap:10px; justify-content:flex-end; }
 .err-note { background:var(--bad-soft); color:var(--bad); border-radius:7px; padding:8px 12px; font-size:12.5px; margin-bottom:8px; overflow-wrap:anywhere; }
 .warn-note { background:var(--warn-soft); color:var(--warn); border-radius:7px; padding:8px 12px; font-size:12.5px; margin-bottom:8px; }
+.bigtext > pre.code { margin-bottom:0; border-bottom-left-radius:0; border-bottom-right-radius:0; }
+.big-more { display:flex; align-items:center; gap:8px; flex-wrap:wrap; background:var(--surface-2); border:1px solid var(--line); border-top:0; border-radius:0 0 7px 7px; padding:7px 12px; margin-bottom:6px; font-size:11.5px; color:var(--muted); font-family:var(--mono); }
+.big-more .btn { padding:2px 10px; font-size:11.5px; margin-left:auto; }
+.big-more .btn + .btn { margin-left:0; }
 h2.vh { font-size:18px; margin:6px 0 14px; }
 </style>
 </head>
@@ -442,6 +446,47 @@ function jsonTree(v, depth){
 function mdBlock(text){
   return `<div class="tb" data-alt="RAW"><button class="tb-toggle">RAW</button><div class="tb-a md">${renderMd(text)}</div><pre class="code tb-b" hidden>${esc(text)}</pre></div>`;
 }
+/* ---------- 大文本：分块渲染，永不静默截断 ----------
+   一个几 MB 的 SSE 流一次性塞进 <pre> 会让浏览器卡住，但截掉就等于数据看不见。
+   折中是先铺首屏，剩下的由用户按需展开——完整内容始终留在 bigStore 里可取。 */
+const BIG_FIRST = 200000, BIG_STEP = 500000;
+const bigStore = new Map();
+let bigSeq = 0;
+
+function bigText(text, cls){
+  const t = String(text ?? "");
+  const klass = "code" + (cls ? " " + cls : "");
+  if(t.length <= BIG_FIRST) return `<pre class="${klass}">${esc(t)}</pre>`;
+  const id = "big" + (++bigSeq);
+  bigStore.set(id, t);
+  return `<div class="bigtext" data-big="${id}" data-shown="${BIG_FIRST}">`
+    + `<pre class="${klass}">${esc(t.slice(0, BIG_FIRST))}</pre>${bigFooter(id, BIG_FIRST, t.length)}</div>`;
+}
+
+function bigFooter(id, shown, total){
+  return `<div class="big-more" data-big-id="${id}">已显示 ${fmtInt(shown)} / ${fmtInt(total)} 字符`
+    + `<button class="btn ghost big-step">再加载 ${fmtInt(BIG_STEP)}</button>`
+    + `<button class="btn ghost big-all">全部展开</button></div>`;
+}
+
+document.addEventListener("click", e => {
+  const btn = e.target.closest(".big-step, .big-all");
+  if(!btn) return;
+  const wrap = btn.closest(".bigtext");
+  const full = bigStore.get(wrap.dataset.big);
+  if(full === undefined) return;
+  const shown = Number(wrap.dataset.shown) || 0;
+  const next = btn.classList.contains("big-all")
+    ? full.length
+    : Math.min(full.length, shown + BIG_STEP);
+  // 追加文本节点：浏览器自己处理转义，也不必重新渲染已经显示的部分。
+  wrap.querySelector("pre").appendChild(document.createTextNode(full.slice(shown, next)));
+  wrap.dataset.shown = String(next);
+  const footer = wrap.querySelector(".big-more");
+  if(next >= full.length) footer.remove();
+  else footer.outerHTML = bigFooter(wrap.dataset.big, next, full.length);
+});
+
 function jsonBlock(source, maxHeight){
   const style = maxHeight ? ` style="max-height:${maxHeight}px;overflow-y:auto"` : "";
   let value;
@@ -931,7 +976,7 @@ function renderSseTimeline(raw, format){
         <span class="idx">${start}${count > 1 ? "–" + (start + count - 1) : ""}</span>
         <span class="ev">${esc(g.label)}${count > 1 ? " ×" + count : ""}</span>
         <span class="sum">${esc(String(merged).slice(0, 160))}</span></div>
-      <pre class="code" hidden>${esc(g.items.slice(0, 50).map(e => (e.event ? "event: " + e.event + "\n" : "") + "data: " + e.data).join("\n\n"))}${count > 50 ? "\n\n… 其余 " + (count - 50) + " 条略" : ""}</pre></div>`;
+      <div hidden>${bigText(g.items.map(e => (e.event ? "event: " + e.event + "\n" : "") + "data: " + e.data).join("\n\n"))}</div></div>`;
   }).join("") + `</div>`;
 }
 
@@ -947,6 +992,7 @@ function activateTabs(root){
   });
 }
 async function renderDetail(id){
+  bigStore.clear();
   const d = await api(`/api/requests/${id}`);
   let reqJson = null, aggJson = null, clientJson = null, anthJson = null;
   try { reqJson = d.req_body ? JSON.parse(d.req_body) : null; } catch {}
@@ -1022,7 +1068,7 @@ async function renderDetail(id){
         <div class="pane" data-pane="rawresp" hidden>
           ${d.resp_headers ? `<div class="muted mono" style="font-size:11px;margin-bottom:4px">headers</div>${jsonBlock(d.resp_headers)}` : ""}
           <div class="muted mono" style="font-size:11px;margin:6px 0 4px">上游原始响应体 · ${fmtBytes(d.resp_bytes)}</div>
-          ${!d.resp_body ? `<div class="empty">(无)</div>` : d.stream ? `<pre class="code">${esc(d.resp_body.length > 200000 ? d.resp_body.slice(0,200000) + "\n\n…（截断显示）" : d.resp_body)}</pre>` : jsonBlock(d.resp_body)}
+          ${!d.resp_body ? `<div class="empty">(无)</div>` : d.stream ? bigText(d.resp_body) : jsonBlock(d.resp_body)}
         </div>
       </div>
     </section>
