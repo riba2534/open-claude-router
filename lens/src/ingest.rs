@@ -622,8 +622,9 @@ fn apply_response(db: &Db, request_id: &str, entry: &Value) -> Result<(), String
             "UPDATE exchanges SET
                outcome = ?2, status = ?3, duration_ms = ?4, complete = ?5, protocol_complete = ?6,
                error_message = ?7, resp_bytes = ?8, resp_truncated = ?9, finish_reason = ?10,
-               input_tokens = ?11, output_tokens = ?12, cached_tokens = ?13, reasoning_tokens = ?14,
-               preview = ?15, updated_at = ?16
+               input_tokens = ?11, output_tokens = ?12, cached_tokens = ?13,
+               cache_write_tokens = ?14, reasoning_tokens = ?15,
+               preview = ?16, updated_at = ?17
              WHERE request_id = ?1",
             params![
                 request_id,
@@ -648,6 +649,7 @@ fn apply_response(db: &Db, request_id: &str, entry: &Value) -> Result<(), String
                 derived.input_tokens,
                 derived.output_tokens,
                 derived.cached_tokens,
+                derived.cache_write_tokens,
                 derived.reasoning_tokens,
                 derived.preview,
                 now_unix(),

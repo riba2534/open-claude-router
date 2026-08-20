@@ -53,6 +53,7 @@ async fn main() {
         db,
         pricing: pricing::PricingTable::from_env(),
         access_token,
+        overview_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     }));
     let listener = TcpListener::bind((host.as_str(), port))
         .await

@@ -17,6 +17,14 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LongContextPricing {
+    /// Apply the multipliers only when a single request exceeds this input count.
+    pub threshold: i64,
+    pub input_multiplier: f64,
+    pub output_multiplier: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelPrice {
     /// Substring pattern; a trailing SQL-style `%` is accepted and trimmed.
     pub pattern: String,
@@ -29,6 +37,17 @@ pub struct ModelPrice {
     pub cache_creation: f64,
     #[serde(default)]
     pub reasoning: f64,
+    #[serde(default)]
+    pub long_context: Option<LongContextPricing>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TokenUsage {
+    pub input: i64,
+    pub output: i64,
+    pub cached: i64,
+    pub reasoning: i64,
+    pub cache_creation: i64,
 }
 
 /// Fallback when no pattern matches (Claude Sonnet-class rates).
@@ -40,17 +59,26 @@ static FALLBACK: ModelPrice = ModelPrice {
     cache_read: 0.3,
     cache_creation: 3.75,
     reasoning: 15.0,
+    long_context: None,
 };
 
 pub struct PricingTable {
     entries: Vec<ModelPrice>,
 }
 
+impl Default for PricingTable {
+    fn default() -> Self {
+        Self {
+            entries: default_entries(),
+        }
+    }
+}
+
 impl PricingTable {
     /// Defaults come from the built-in table (see the module header for how
     /// the prices are sourced and overridden).
     pub fn from_env() -> Self {
-        let mut entries = default_entries();
+        let mut entries = Self::default().entries;
         if let Ok(raw) = std::env::var("LENS_PRICING_JSON")
             && !raw.trim().is_empty()
         {
@@ -83,12 +111,17 @@ impl PricingTable {
         best
     }
 
-    /// Estimated cost in USD from the raw OpenAI-style counters
+    pub fn long_context_threshold(&self, model: &str) -> Option<i64> {
+        self.matched(model)
+            .and_then(|price| price.long_context.as_ref())
+            .map(|tier| tier.threshold.max(0))
+    }
+
+    /// Estimated cost for one request in USD from the raw OpenAI-style counters
     /// (`input` includes `cached`; `output` includes `reasoning`).
     /// `cache_creation` is the fifth, disjoint bucket — it is never part of
-    /// `input`, so it is not deducted from it. Upstream OpenAI-protocol usage
-    /// does not report a cache-write count, so lens currently always passes 0;
-    /// the term exists to keep the five-bucket formula complete.
+    /// `input`, so it is not deducted from it. Older exchanges and upstreams
+    /// that omit `cache_write_tokens` pass 0 for that bucket.
     pub fn estimate_usd(
         &self,
         model: &str,
@@ -98,30 +131,76 @@ impl PricingTable {
         reasoning: i64,
         cache_creation: i64,
     ) -> f64 {
+        let long_context = self
+            .long_context_threshold(model)
+            .is_some_and(|threshold| input.max(0) > threshold);
+        self.estimate_usd_for_context(
+            model,
+            TokenUsage {
+                input,
+                output,
+                cached,
+                reasoning,
+                cache_creation,
+            },
+            long_context,
+        )
+    }
+
+    /// Prices token totals already partitioned into one context tier. This is
+    /// used by aggregate queries so the sum of many short requests does not
+    /// accidentally cross the per-request long-context threshold.
+    pub fn estimate_usd_for_context(
+        &self,
+        model: &str,
+        usage: TokenUsage,
+        long_context: bool,
+    ) -> f64 {
         let price = self.matched(model).unwrap_or(&FALLBACK);
-        let cached = cached.clamp(0, input.max(0));
-        let reasoning = reasoning.clamp(0, output.max(0));
-        let cache_creation = cache_creation.max(0);
-        let input_uncached = input.max(0) - cached;
-        let output_plain = output.max(0) - reasoning;
+        let cached = usage.cached.clamp(0, usage.input.max(0));
+        let reasoning = usage.reasoning.clamp(0, usage.output.max(0));
+        let cache_creation = usage.cache_creation.max(0);
+        let input_uncached = usage.input.max(0) - cached;
+        let output_plain = usage.output.max(0) - reasoning;
+        let (input_multiplier, output_multiplier) = long_context
+            .then_some(())
+            .and(price.long_context.as_ref())
+            .map(|tier| {
+                (
+                    tier.input_multiplier.max(0.0),
+                    tier.output_multiplier.max(0.0),
+                )
+            })
+            .unwrap_or((1.0, 1.0));
         let reasoning_rate = if price.reasoning > 0.0 {
             price.reasoning
         } else {
             price.output
         };
-        (input_uncached as f64 * price.input
+        ((input_uncached as f64 * price.input
             + cached as f64 * price.cache_read
-            + cache_creation as f64 * price.cache_creation
-            + output_plain as f64 * price.output
-            + reasoning as f64 * reasoning_rate)
+            + cache_creation as f64 * price.cache_creation)
+            * input_multiplier
+            + (output_plain as f64 * price.output + reasoning as f64 * reasoning_rate)
+                * output_multiplier)
             / 1e6
     }
 
-    /// Cost-breakdown extra: money saved versus paying full input price
-    /// for the cached reads, clamped at zero.
-    pub fn cache_savings_usd(&self, model: &str, cached: i64) -> f64 {
+    /// Cost-breakdown extra: money saved versus paying full input price for
+    /// cached reads in a token bucket already partitioned by context tier.
+    pub fn cache_savings_usd_for_context(
+        &self,
+        model: &str,
+        cached: i64,
+        long_context: bool,
+    ) -> f64 {
         let price = self.matched(model).unwrap_or(&FALLBACK);
-        (cached.max(0) as f64 * (price.input - price.cache_read) / 1e6).max(0.0)
+        let input_multiplier = long_context
+            .then_some(())
+            .and(price.long_context.as_ref())
+            .map(|tier| tier.input_multiplier.max(0.0))
+            .unwrap_or(1.0);
+        (cached.max(0) as f64 * (price.input - price.cache_read) * input_multiplier / 1e6).max(0.0)
     }
 }
 
@@ -142,7 +221,34 @@ fn entry(
         cache_read,
         cache_creation,
         reasoning,
+        long_context: None,
     }
+}
+
+fn long_context_entry(
+    pattern: &str,
+    display: &str,
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_creation: f64,
+    reasoning: f64,
+) -> ModelPrice {
+    let mut price = entry(
+        pattern,
+        display,
+        input,
+        output,
+        cache_read,
+        cache_creation,
+        reasoning,
+    );
+    price.long_context = Some(LongContextPricing {
+        threshold: 272_000,
+        input_multiplier: 2.0,
+        output_multiplier: 1.5,
+    });
+    price
 }
 
 fn default_entries() -> Vec<ModelPrice> {
@@ -265,7 +371,10 @@ fn default_entries() -> Vec<ModelPrice> {
         entry("gpt-4.1", "GPT-4.1", 2.0, 8.0, 0.0, 0.0, 0.0),
         entry("gpt-4.1-mini", "GPT-4.1 Mini", 0.4, 1.6, 0.0, 0.0, 0.0),
         entry("gpt-4.1-nano", "GPT-4.1 Nano", 0.1, 0.4, 0.0, 0.0, 0.0),
-        entry("gpt-5.6", "GPT-5.6", 5.0, 30.0, 0.5, 0.0, 30.0),
+        long_context_entry("gpt-5.6-luna", "GPT-5.6 Luna", 0.2, 1.2, 0.02, 0.25, 1.2),
+        long_context_entry("gpt-5.6-terra", "GPT-5.6 Terra", 2.0, 12.0, 0.2, 2.5, 12.0),
+        long_context_entry("gpt-5.6-sol", "GPT-5.6 Sol", 5.0, 30.0, 0.5, 6.25, 30.0),
+        long_context_entry("gpt-5.6", "GPT-5.6 Sol", 5.0, 30.0, 0.5, 6.25, 30.0),
         entry("gpt-5.5", "GPT-5.5", 5.0, 30.0, 0.5, 0.0, 30.0),
         entry("gpt-5.4", "GPT-5.4", 2.5, 15.0, 0.25, 0.0, 15.0),
         entry("gpt-5.3", "GPT-5.3", 1.75, 14.0, 0.175, 0.0, 14.0),
@@ -368,7 +477,15 @@ mod tests {
         );
         assert_eq!(
             table.matched("deployment-gpt-5.6-2026").unwrap().display,
-            "GPT-5.6"
+            "GPT-5.6 Sol"
+        );
+        assert_eq!(
+            table.matched("openai/gpt-5.6-luna").unwrap().display,
+            "GPT-5.6 Luna"
+        );
+        assert_eq!(
+            table.matched("openai/gpt-5.6-terra").unwrap().display,
+            "GPT-5.6 Terra"
         );
         assert_eq!(table.matched("gpt-5-mini-x").unwrap().display, "GPT-5 Mini");
         assert_eq!(table.matched("o1-pro-high").unwrap().display, "o1 Pro");
@@ -388,16 +505,32 @@ mod tests {
     #[test]
     fn buckets_are_normalized_before_pricing() {
         let table = table();
-        // gpt-5.6: in 5.0, out 30.0, cache_read 0.5, reasoning 30.0.
+        // gpt-5.5: in 5.0, out 30.0, cache_read 0.5, reasoning 30.0.
         // 1M prompt (400k cached) + 500k completion (100k reasoning):
         // uncached 600k*5 + cached 400k*0.5 + plain 400k*30 + reasoning 100k*30
-        let usd = table.estimate_usd("gpt-5.6-2026", 1_000_000, 500_000, 400_000, 100_000, 0);
+        let usd = table.estimate_usd("gpt-5.5-2026", 1_000_000, 500_000, 400_000, 100_000, 0);
         assert!((usd - (0.6 * 5.0 + 0.4 * 0.5 + 0.4 * 30.0 + 0.1 * 30.0)).abs() < 1e-9);
         // Folded-reasoning rule (table reasoning price 0, e.g. gpt-4o) keeps
         // the total equal to completion*output.
         let folded = table.estimate_usd("gpt-4o-2024", 0, 500_000, 0, 100_000, 0);
         let flat = table.estimate_usd("gpt-4o-2024", 0, 500_000, 0, 0, 0);
         assert!((folded - flat).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gpt_5_6_long_context_rates_apply_to_each_request() {
+        let table = table();
+        let at_threshold = table.estimate_usd("gpt-5.6-luna", 272_000, 100_000, 72_000, 0, 0);
+        let expected_short =
+            ((272_000 - 72_000) as f64 * 0.2 + 72_000.0 * 0.02 + 100_000.0 * 1.2) / 1e6;
+        assert!((at_threshold - expected_short).abs() < 1e-9);
+
+        let long = table.estimate_usd("gpt-5.6-luna", 300_000, 100_000, 100_000, 25_000, 10_000);
+        let expected_long =
+            (((300_000 - 100_000) as f64 * 0.2 + 100_000.0 * 0.02 + 10_000.0 * 0.25) * 2.0
+                + 100_000.0 * 1.2 * 1.5)
+                / 1e6;
+        assert!((long - expected_long).abs() < 1e-9);
     }
 
     #[test]
@@ -433,7 +566,11 @@ mod tests {
     fn cache_savings_use_the_input_minus_cache_read_delta() {
         let table = table();
         // claude-sonnet-4: (3.0 - 0.3) per MTok saved on cached reads.
-        let saved = table.cache_savings_usd("claude-sonnet-4-20250514", 2_000_000);
+        let saved =
+            table.cache_savings_usd_for_context("claude-sonnet-4-20250514", 2_000_000, false);
         assert!((saved - 5.4).abs() < 1e-9);
+
+        let luna_long = table.cache_savings_usd_for_context("gpt-5.6-luna", 100_000, true);
+        assert!((luna_long - 0.036).abs() < 1e-9);
     }
 }

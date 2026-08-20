@@ -133,6 +133,7 @@ pre.code { background:var(--code-bg); border:1px solid var(--line); border-radiu
 .usage-track i { display:block; height:100%; }
 .u-in { background:var(--accent); }
 .u-cache { background:var(--accent); opacity:.35; }
+.u-write { background:var(--warn); opacity:.55; }
 .u-out { background:var(--good); }
 .u-think { background:var(--warn); }
 .legend { display:flex; gap:14px; font-size:11px; color:var(--muted); font-family:var(--mono); margin-top:4px; flex-wrap:wrap; }
@@ -588,7 +589,7 @@ async function renderOverview(){
       <div class="card"><div class="k">成功率</div><div class="v">${okRate}</div><div class="s">HTTP 错 ${fmtInt(t.http_error)} · 传输错 ${fmtInt(t.transport_error)}</div></div>
       <div class="card"><div class="k">取消</div><div class="v">${fmtInt(t.cancelled)}</div><div class="s">客户端提前断开</div></div>
       <div class="card"><div class="k">时延 P50 / P95</div><div class="v">${fmtMs(d.latency.p50)}</div><div class="s">P95 ${fmtMs(d.latency.p95)} · P99 ${fmtMs(d.latency.p99)}</div></div>
-      <div class="card"><div class="k">输入 tokens</div><div class="v">${fmtInt(t.input_tokens)}</div><div class="s">cached ${fmtInt(t.cached_tokens)}</div></div>
+      <div class="card"><div class="k">输入 tokens</div><div class="v">${fmtInt(t.input_tokens)}</div><div class="s">cached ${fmtInt(t.cached_tokens)} · written ${fmtInt(t.cache_write_tokens)}</div></div>
       <div class="card"><div class="k">输出 tokens</div><div class="v">${fmtInt(t.output_tokens)}</div><div class="s">reasoning ${fmtInt(t.reasoning_tokens)}</div></div>
       <div class="card"><div class="k">估算费用</div><div class="v">${fmtUSD(t.cost_usd)}</div><div class="s">缓存节省 ${fmtUSD(t.cache_savings_usd)}</div></div>
     </div>
@@ -603,7 +604,7 @@ async function renderOverview(){
     <div class="grid2">
       <div class="panel"><h3>按模型</h3><div class="tbl-scroll"><table class="data">
         <tr><th>模型</th><th>请求</th><th>in / out tokens</th><th>费用</th><th>均耗时</th><th>错误</th><th>取消</th></tr>
-        ${d.by_model.map(m => `<tr><td class="mono">${esc(m.model)}</td><td class="num">${fmtInt(m.count)}</td><td class="num">${fmtInt(m.input_tokens)} / ${fmtInt(m.output_tokens)}</td><td class="num">${fmtUSD(m.cost_usd)}</td><td class="num">${fmtMs(m.avg_ms)}</td><td class="num">${fmtInt(m.errors)}</td><td class="num">${fmtInt(m.cancelled)}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">无数据</td></tr>`}
+        ${d.by_model.map(m => `<tr><td class="mono">${esc(m.model)}</td><td class="num">${fmtInt(m.count)}</td><td class="num">${fmtInt(m.input_tokens)} / ${fmtInt(m.output_tokens)}<div class="muted" style="font-size:10.5px">cache ${fmtInt(m.cached_tokens)} · write ${fmtInt(m.cache_write_tokens)}</div></td><td class="num">${fmtUSD(m.cost_usd)}</td><td class="num">${fmtMs(m.avg_ms)}</td><td class="num">${fmtInt(m.errors)}</td><td class="num">${fmtInt(m.cancelled)}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">无数据</td></tr>`}
       </table></div></div>
       <div class="panel"><h3>状态码 / 调用方</h3><div class="tbl-scroll"><table class="data">
         <tr><th>HTTP 状态</th><th>次数</th></tr>
@@ -876,12 +877,13 @@ function renderParams(p){
 
 /* ---------- response reconstruction ---------- */
 function usageBar(d){
-  const inTok = d.input_tokens || 0, out = d.output_tokens || 0, cache = d.cached_tokens || 0, think = d.reasoning_tokens || 0;
-  const total = inTok + out;
+  const inTok = d.input_tokens || 0, out = d.output_tokens || 0, cache = d.cached_tokens || 0,
+        write = d.cache_write_tokens || 0, think = d.reasoning_tokens || 0;
+  const total = inTok + write + out;
   if(!total) return "";
   const seg = (v, cls) => v > 0 ? `<i class="${cls}" style="width:${(100 * v / total).toFixed(2)}%"></i>` : "";
-  return `<div class="usage-wrap"><div class="usage-row"><span>tokens</span><span class="usage-track">${seg(inTok - cache,"u-in")}${seg(cache,"u-cache")}${seg(out - think,"u-out")}${seg(think,"u-think")}</span><span class="num">${fmtInt(total)}</span></div>
-  <div class="legend"><span><i class="u-in"></i>input ${fmtInt(inTok - cache)}</span><span><i class="u-cache"></i>cached ${fmtInt(cache)}</span><span><i class="u-out"></i>output ${fmtInt(out - think)}</span><span><i class="u-think"></i>reasoning ${fmtInt(think)}</span></div></div>`;
+  return `<div class="usage-wrap"><div class="usage-row"><span>tokens</span><span class="usage-track">${seg(inTok - cache,"u-in")}${seg(cache,"u-cache")}${seg(write,"u-write")}${seg(out - think,"u-out")}${seg(think,"u-think")}</span><span class="num">${fmtInt(total)}</span></div>
+  <div class="legend"><span><i class="u-in"></i>input ${fmtInt(inTok - cache)}</span><span><i class="u-cache"></i>cached ${fmtInt(cache)}</span><span><i class="u-write"></i>cache write ${fmtInt(write)}</span><span><i class="u-out"></i>output ${fmtInt(out - think)}</span><span><i class="u-think"></i>reasoning ${fmtInt(think)}</span></div></div>`;
 }
 function renderAggChat(agg){
   const choice = (agg.choices || [])[0] || {};

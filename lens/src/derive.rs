@@ -23,6 +23,7 @@ pub struct Derived {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cached_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
     pub reasoning_tokens: Option<i64>,
     pub preview: Option<String>,
 }
@@ -173,6 +174,7 @@ fn extract_chat(response: &Value) -> Derived {
         input_tokens: int_at(usage, "/prompt_tokens"),
         output_tokens: int_at(usage, "/completion_tokens"),
         cached_tokens: int_at(usage, "/prompt_tokens_details/cached_tokens"),
+        cache_write_tokens: int_at(usage, "/prompt_tokens_details/cache_write_tokens"),
         reasoning_tokens: int_at(usage, "/completion_tokens_details/reasoning_tokens"),
         preview: non_empty_preview(preview),
     }
@@ -225,6 +227,7 @@ fn extract_responses(response: &Value) -> Derived {
         input_tokens: int_at(usage, "/input_tokens"),
         output_tokens: int_at(usage, "/output_tokens"),
         cached_tokens: int_at(usage, "/input_tokens_details/cached_tokens"),
+        cache_write_tokens: int_at(usage, "/input_tokens_details/cache_write_tokens"),
         reasoning_tokens: int_at(usage, "/output_tokens_details/reasoning_tokens"),
         preview: non_empty_preview(preview),
     }
@@ -262,7 +265,7 @@ mod tests {
             "usage": {
                 "prompt_tokens": 12,
                 "completion_tokens": 5,
-                "prompt_tokens_details": {"cached_tokens": 4},
+                "prompt_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 3},
                 "completion_tokens_details": {"reasoning_tokens": 2}
             }
         });
@@ -277,9 +280,36 @@ mod tests {
         assert_eq!(derived.input_tokens, Some(12));
         assert_eq!(derived.output_tokens, Some(5));
         assert_eq!(derived.cached_tokens, Some(4));
+        assert_eq!(derived.cache_write_tokens, Some(3));
         assert_eq!(derived.reasoning_tokens, Some(2));
         assert_eq!(derived.preview.as_deref(), Some("hello world"));
         assert!(derived.agg_response.is_some());
+    }
+
+    #[test]
+    fn responses_json_body_yields_cache_write_usage() {
+        let body = json!({
+            "status": "completed",
+            "output": [],
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 6,
+                "input_tokens_details": {"cached_tokens": 8, "cache_write_tokens": 5},
+                "output_tokens_details": {"reasoning_tokens": 2}
+            }
+        });
+        let derived = derive_response(
+            "responses",
+            "application/json",
+            Some(&body),
+            None,
+            &ReplayContext::default(),
+        );
+        assert_eq!(derived.input_tokens, Some(20));
+        assert_eq!(derived.output_tokens, Some(6));
+        assert_eq!(derived.cached_tokens, Some(8));
+        assert_eq!(derived.cache_write_tokens, Some(5));
+        assert_eq!(derived.reasoning_tokens, Some(2));
     }
 
     #[test]

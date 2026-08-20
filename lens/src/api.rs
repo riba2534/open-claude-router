@@ -1,4 +1,9 @@
-use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json, Router,
@@ -17,13 +22,30 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::{db::Db, pricing::PricingTable};
+use crate::{
+    db::Db,
+    pricing::{PricingTable, TokenUsage},
+};
 
 pub struct LensState {
     pub db: Db,
     pub pricing: PricingTable,
     pub access_token: Option<String>,
+    pub overview_cache: tokio::sync::Mutex<HashMap<OverviewCacheKey, CachedOverview>>,
 }
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct OverviewCacheKey {
+    hours: i64,
+    client: Option<String>,
+}
+
+pub struct CachedOverview {
+    expires_at: Instant,
+    value: Value,
+}
+
+const OVERVIEW_CACHE_TTL: Duration = Duration::from_secs(2);
 
 pub fn build_app(state: Arc<LensState>) -> Router {
     let api = Router::new()
@@ -110,6 +132,50 @@ fn client_filter(client: Option<&str>) -> (String, Vec<SqlValue>) {
     }
 }
 
+/// Builds a bound SQL CASE expression that classifies each exchange into its
+/// model's short/long context tier. Exact model values come from the database;
+/// the pricing table still owns substring matching and threshold selection.
+fn context_tier_case(
+    conn: &Connection,
+    pricing: &PricingTable,
+    filter_suffix: &str,
+    filter_values: &[SqlValue],
+) -> rusqlite::Result<(String, Vec<SqlValue>)> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT DISTINCT COALESCE(model,'(unknown)')
+         FROM exchanges WHERE ts_unix >= ?{filter_suffix}"
+    ))?;
+    let models = statement
+        .query_map(params_from_iter(filter_values.iter()), |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut arms = Vec::new();
+    let mut values = Vec::new();
+    for model in models {
+        let Some(threshold) = pricing.long_context_threshold(&model) else {
+            continue;
+        };
+        arms.push(
+            "WHEN ? THEN CASE WHEN COALESCE(input_tokens,0) > ? THEN 1 ELSE 0 END".to_owned(),
+        );
+        values.push(SqlValue::from(model));
+        values.push(SqlValue::from(threshold));
+    }
+    if arms.is_empty() {
+        Ok(("0".to_owned(), values))
+    } else {
+        Ok((
+            format!(
+                "CASE COALESCE(model,'(unknown)') {} ELSE 0 END",
+                arms.join(" ")
+            ),
+            values,
+        ))
+    }
+}
+
 #[derive(Deserialize)]
 struct ListParams {
     hours: Option<i64>,
@@ -127,10 +193,34 @@ async fn overview(
     Query(params): Query<OverviewParams>,
 ) -> Result<Json<Value>, ApiFailure> {
     let hours = params.hours.unwrap_or(24).clamp(1, 24 * 90);
-    run_query(state.clone(), move |conn, pricing| {
-        build_overview(conn, pricing, hours, params.client.as_deref())
+    let client = params.client.filter(|value| !value.is_empty());
+    let key = OverviewCacheKey {
+        hours,
+        client: client.clone(),
+    };
+    // Holding this async mutex across the blocking query intentionally makes
+    // concurrent cache misses single-flight instead of queueing duplicate full
+    // database scans on Lens's shared SQLite connection.
+    let mut cache = state.overview_cache.lock().await;
+    let now = Instant::now();
+    if let Some(cached) = cache.get(&key)
+        && cached.expires_at > now
+    {
+        return Ok(Json(cached.value.clone()));
+    }
+    cache.retain(|_, cached| cached.expires_at > now);
+    let result = run_query(state.clone(), move |conn, pricing| {
+        build_overview(conn, pricing, hours, client.as_deref())
     })
-    .await
+    .await?;
+    cache.insert(
+        key,
+        CachedOverview {
+            expires_at: Instant::now() + OVERVIEW_CACHE_TTL,
+            value: result.0.clone(),
+        },
+    );
+    Ok(result)
 }
 
 async fn list_requests(
@@ -293,26 +383,26 @@ fn cost_for(
     input: Option<i64>,
     output: Option<i64>,
     cached: Option<i64>,
+    cache_write: Option<i64>,
     reasoning: Option<i64>,
 ) -> Option<f64> {
     if input.is_none() && output.is_none() {
         return None;
     }
-    // OpenAI-protocol usage carries no cache-write counter; the fifth bucket
-    // is always 0 here (see `PricingTable::estimate_usd`).
     Some(pricing.estimate_usd(
         model.unwrap_or_default(),
         input.unwrap_or(0),
         output.unwrap_or(0),
         cached.unwrap_or(0),
         reasoning.unwrap_or(0),
-        0,
+        cache_write.unwrap_or(0),
     ))
 }
 
 const SUMMARY_COLUMNS: &str = "request_id, ts, model, format, stream, outcome, status, duration_ms,
     input_tokens, output_tokens, cached_tokens, reasoning_tokens, preview, client_ip, route_mode,
-    finish_reason, req_bytes, resp_bytes, cancel_stage, protocol_complete, session_key, client_tag";
+    finish_reason, req_bytes, resp_bytes, cancel_stage, protocol_complete, session_key, client_tag,
+    cache_write_tokens";
 
 fn summary_row(row: &rusqlite::Row<'_>, pricing: &PricingTable) -> rusqlite::Result<Value> {
     let model = row.get::<_, Option<String>>(2)?;
@@ -320,7 +410,16 @@ fn summary_row(row: &rusqlite::Row<'_>, pricing: &PricingTable) -> rusqlite::Res
     let output = row.get::<_, Option<i64>>(9)?;
     let cached = row.get::<_, Option<i64>>(10)?;
     let reasoning = row.get::<_, Option<i64>>(11)?;
-    let cost = cost_for(pricing, model.as_deref(), input, output, cached, reasoning);
+    let cache_write = row.get::<_, Option<i64>>(22)?;
+    let cost = cost_for(
+        pricing,
+        model.as_deref(),
+        input,
+        output,
+        cached,
+        cache_write,
+        reasoning,
+    );
     let mut value = json!({
         "request_id": row.get::<_, String>(0)?,
         "ts": row.get::<_, Option<String>>(1)?,
@@ -332,6 +431,9 @@ fn summary_row(row: &rusqlite::Row<'_>, pricing: &PricingTable) -> rusqlite::Res
         "duration_ms": row.get::<_, Option<i64>>(7)?,
         "input_tokens": input,
         "output_tokens": output,
+        "cached_tokens": cached,
+        "cache_write_tokens": cache_write,
+        "reasoning_tokens": reasoning,
         "preview": row.get::<_, Option<String>>(12)?,
         "client_ip": row.get::<_, Option<String>>(13)?,
         "route_mode": row.get::<_, Option<String>>(14)?,
@@ -345,13 +447,352 @@ fn summary_row(row: &rusqlite::Row<'_>, pricing: &PricingTable) -> rusqlite::Res
         "cost_usd": cost,
     });
     // The stream query appends updated_at after the summary columns.
-    if let Ok(updated) = row.get::<_, Option<i64>>(22) {
+    if let Ok(updated) = row.get::<_, Option<i64>>(23) {
         value["updated_at"] = json!(updated);
     }
     Ok(value)
 }
 
+const ONE_PASS_OVERVIEW_THRESHOLD: i64 = 100_000;
+
+#[derive(Clone, Copy, Default)]
+struct UsageTotals {
+    input: i64,
+    output: i64,
+    cached: i64,
+    cache_write: i64,
+    reasoning: i64,
+}
+
+impl UsageTotals {
+    fn add(&mut self, usage: TokenUsage) {
+        self.input += usage.input;
+        self.output += usage.output;
+        self.cached += usage.cached;
+        self.cache_write += usage.cache_creation;
+        self.reasoning += usage.reasoning;
+    }
+
+    fn as_pricing_usage(self) -> TokenUsage {
+        TokenUsage {
+            input: self.input,
+            output: self.output,
+            cached: self.cached,
+            reasoning: self.reasoning,
+            cache_creation: self.cache_write,
+        }
+    }
+}
+
+#[derive(Default)]
+struct OverviewModelTotals {
+    count: i64,
+    input: i64,
+    output: i64,
+    cached: i64,
+    cache_write: i64,
+    reasoning: i64,
+    duration_sum: i64,
+    duration_count: i64,
+    errors: i64,
+    cancelled: i64,
+    long_threshold: Option<i64>,
+    pricing_tiers: [UsageTotals; 2],
+}
+
+#[derive(Default)]
+struct OverviewSeriesTotals {
+    ok: i64,
+    error: i64,
+    cancelled: i64,
+    input: i64,
+    output: i64,
+}
+
+#[derive(Default)]
+struct OverviewTotals {
+    count: i64,
+    ok: i64,
+    http_error: i64,
+    transport_error: i64,
+    cancelled: i64,
+    pending: i64,
+    input: i64,
+    output: i64,
+    cached: i64,
+    cache_write: i64,
+    reasoning: i64,
+}
+
 fn build_overview(
+    conn: &Connection,
+    pricing: &PricingTable,
+    hours: i64,
+    client: Option<&str>,
+) -> rusqlite::Result<Value> {
+    let since = since_unix(hours);
+    let (cf, cf_values) = client_filter(client);
+    let mut values = vec![SqlValue::from(since)];
+    values.extend(cf_values);
+    let count = conn.query_row(
+        &format!("SELECT COUNT(*) FROM exchanges WHERE ts_unix >= ?{cf}"),
+        params_from_iter(values.iter()),
+        |row| row.get::<_, i64>(0),
+    )?;
+    // Client filtering currently has no dedicated expression index, so every
+    // multi-query aggregate would rescan the whole time window. One pass wins
+    // even when the matching client itself has relatively few rows.
+    if client.is_some() || count >= ONE_PASS_OVERVIEW_THRESHOLD {
+        build_overview_one_pass(conn, pricing, hours, client)
+    } else {
+        build_overview_multi_query(conn, pricing, hours, client)
+    }
+}
+
+fn build_overview_one_pass(
+    conn: &Connection,
+    pricing: &PricingTable,
+    hours: i64,
+    client: Option<&str>,
+) -> rusqlite::Result<Value> {
+    let since = since_unix(hours);
+    let (cf, cf_values) = client_filter(client);
+    let bucket: i64 = match hours {
+        ..=2 => 60,
+        3..=6 => 300,
+        7..=24 => 900,
+        _ => 3600,
+    };
+    let mut values = vec![SqlValue::from(since)];
+    values.extend(cf_values);
+
+    let mut totals = OverviewTotals::default();
+    let mut durations = Vec::new();
+    let mut series_by_bucket: HashMap<i64, OverviewSeriesTotals> = HashMap::new();
+    let mut models: HashMap<String, OverviewModelTotals> = HashMap::new();
+    let mut status_counts: HashMap<i64, i64> = HashMap::new();
+    let mut client_counts: HashMap<String, i64> = HashMap::new();
+
+    let mut statement = conn.prepare(&format!(
+        "SELECT ts_unix, COALESCE(model,'(unknown)'),
+                COALESCE(input_tokens,0), COALESCE(output_tokens,0),
+                COALESCE(cached_tokens,0), COALESCE(cache_write_tokens,0),
+                COALESCE(reasoning_tokens,0), COALESCE(outcome,''),
+                status, duration_ms, {CLIENT_EXPR}
+         FROM exchanges WHERE ts_unix >= ?{cf}"
+    ))?;
+    let mut rows = statement.query(params_from_iter(values.iter()))?;
+    while let Some(row) = rows.next()? {
+        let ts_unix = row.get::<_, i64>(0)?;
+        let model = row.get_ref(1)?.as_str().unwrap_or("(unknown)");
+        let input = row.get::<_, i64>(2)?;
+        let output = row.get::<_, i64>(3)?;
+        let cached = row.get::<_, i64>(4)?;
+        let cache_write = row.get::<_, i64>(5)?;
+        let reasoning = row.get::<_, i64>(6)?;
+        let outcome = row.get_ref(7)?.as_str().unwrap_or("");
+        let status = row.get::<_, Option<i64>>(8)?;
+        let duration = row.get::<_, Option<i64>>(9)?;
+        let client_name = row.get_ref(10)?.as_str().unwrap_or("(unknown)");
+
+        totals.count += 1;
+        totals.input += input;
+        totals.output += output;
+        totals.cached += cached;
+        totals.cache_write += cache_write;
+        totals.reasoning += reasoning;
+        match outcome {
+            "ok" => totals.ok += 1,
+            "http_error" => totals.http_error += 1,
+            "transport_error" => totals.transport_error += 1,
+            "cancelled" => totals.cancelled += 1,
+            "pending" => totals.pending += 1,
+            _ => {}
+        }
+
+        let series = series_by_bucket
+            .entry((ts_unix / bucket) * bucket)
+            .or_default();
+        series.input += input;
+        series.output += output;
+        match outcome {
+            "ok" => series.ok += 1,
+            "http_error" | "transport_error" => series.error += 1,
+            "cancelled" => series.cancelled += 1,
+            _ => {}
+        }
+
+        if !models.contains_key(model) {
+            models.insert(
+                model.to_owned(),
+                OverviewModelTotals {
+                    long_threshold: pricing.long_context_threshold(model),
+                    ..Default::default()
+                },
+            );
+        }
+        let model_totals = models.get_mut(model).expect("model inserted above");
+        model_totals.count += 1;
+        model_totals.input += input;
+        model_totals.output += output;
+        model_totals.cached += cached;
+        model_totals.cache_write += cache_write;
+        model_totals.reasoning += reasoning;
+        if matches!(outcome, "http_error" | "transport_error") {
+            model_totals.errors += 1;
+        }
+        if outcome == "cancelled" {
+            model_totals.cancelled += 1;
+        }
+        if outcome == "ok"
+            && let Some(duration) = duration
+        {
+            durations.push(duration);
+            model_totals.duration_sum += duration;
+            model_totals.duration_count += 1;
+        }
+        let normalized = TokenUsage {
+            input: input.max(0),
+            output: output.max(0),
+            cached: cached.clamp(0, input.max(0)),
+            reasoning: reasoning.clamp(0, output.max(0)),
+            cache_creation: cache_write.max(0),
+        };
+        let tier = usize::from(
+            model_totals
+                .long_threshold
+                .is_some_and(|threshold| normalized.input > threshold),
+        );
+        model_totals.pricing_tiers[tier].add(normalized);
+
+        if matches!(outcome, "ok" | "http_error") {
+            *status_counts.entry(status.unwrap_or(0)).or_default() += 1;
+        }
+        if let Some(count) = client_counts.get_mut(client_name) {
+            *count += 1;
+        } else {
+            client_counts.insert(client_name.to_owned(), 1);
+        }
+    }
+
+    durations.sort_unstable();
+    let percentile = |fraction: f64| -> Value {
+        if durations.is_empty() {
+            return Value::Null;
+        }
+        let index = ((durations.len() as f64 - 1.0) * fraction).round() as usize;
+        json!(durations[index])
+    };
+    let latency = json!({
+        "p50": percentile(0.50),
+        "p95": percentile(0.95),
+        "p99": percentile(0.99),
+        "max": durations.last().copied().map(Value::from).unwrap_or(Value::Null),
+    });
+
+    let mut series = series_by_bucket.into_iter().collect::<Vec<_>>();
+    series.sort_unstable_by_key(|(bucket, _)| *bucket);
+    let series = Value::Array(
+        series
+            .into_iter()
+            .map(|(bucket, values)| {
+                json!({
+                    "t": bucket,
+                    "ok": values.ok,
+                    "error": values.error,
+                    "cancelled": values.cancelled,
+                    "input_tokens": values.input,
+                    "output_tokens": values.output,
+                })
+            })
+            .collect(),
+    );
+
+    let mut total_cost = 0.0;
+    let mut total_savings = 0.0;
+    let mut by_model = Vec::with_capacity(models.len());
+    for (model, values) in models {
+        let mut cost = 0.0;
+        let mut savings = 0.0;
+        for (tier, usage) in values.pricing_tiers.into_iter().enumerate() {
+            cost += pricing.estimate_usd_for_context(&model, usage.as_pricing_usage(), tier == 1);
+            savings += pricing.cache_savings_usd_for_context(&model, usage.cached, tier == 1);
+        }
+        total_cost += cost;
+        total_savings += savings;
+        let avg_ms =
+            (values.duration_count > 0).then_some(values.duration_sum / values.duration_count);
+        by_model.push(json!({
+            "model": model,
+            "count": values.count,
+            "input_tokens": values.input,
+            "output_tokens": values.output,
+            "cached_tokens": values.cached,
+            "cache_write_tokens": values.cache_write,
+            "reasoning_tokens": values.reasoning,
+            "avg_ms": avg_ms,
+            "errors": values.errors,
+            "cancelled": values.cancelled,
+            "cost_usd": cost,
+            "cache_savings_usd": savings,
+        }));
+    }
+    by_model.sort_by(|left, right| {
+        right["count"]
+            .as_i64()
+            .cmp(&left["count"].as_i64())
+            .then_with(|| left["model"].as_str().cmp(&right["model"].as_str()))
+    });
+    by_model.truncate(20);
+
+    let mut by_status = status_counts.into_iter().collect::<Vec<_>>();
+    by_status
+        .sort_unstable_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let by_status = Value::Array(
+        by_status
+            .into_iter()
+            .map(|(status, count)| json!({"status": status, "count": count}))
+            .collect(),
+    );
+
+    let mut by_client = client_counts.into_iter().collect::<Vec<_>>();
+    by_client
+        .sort_unstable_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    by_client.truncate(10);
+    let by_client = Value::Array(
+        by_client
+            .into_iter()
+            .map(|(client, count)| json!({"client": client, "count": count}))
+            .collect(),
+    );
+
+    Ok(json!({
+        "totals": {
+            "count": totals.count,
+            "ok": totals.ok,
+            "http_error": totals.http_error,
+            "transport_error": totals.transport_error,
+            "cancelled": totals.cancelled,
+            "pending": totals.pending,
+            "input_tokens": totals.input,
+            "output_tokens": totals.output,
+            "cached_tokens": totals.cached,
+            "cache_write_tokens": totals.cache_write,
+            "reasoning_tokens": totals.reasoning,
+            "cost_usd": total_cost,
+            "cache_savings_usd": total_savings,
+        },
+        "latency": latency,
+        "series": series,
+        "by_model": by_model,
+        "by_status": by_status,
+        "by_client": by_client,
+        "bucket_seconds": bucket,
+        "hours": hours,
+    }))
+}
+
+fn build_overview_multi_query(
     conn: &Connection,
     pricing: &PricingTable,
     hours: i64,
@@ -374,7 +815,8 @@ fn build_overview(
                 SUM(outcome = 'ok'), SUM(outcome = 'http_error'),
                 SUM(outcome = 'transport_error'), SUM(outcome = 'cancelled'), SUM(outcome = 'pending'),
                 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                COALESCE(SUM(cached_tokens),0), COALESCE(SUM(reasoning_tokens),0)
+                COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                COALESCE(SUM(reasoning_tokens),0)
          FROM exchanges WHERE ts_unix >= ?{cf}"
         ),
         params_from_iter(base_values.iter()),
@@ -389,7 +831,8 @@ fn build_overview(
                 "input_tokens": row.get::<_, i64>(6)?,
                 "output_tokens": row.get::<_, i64>(7)?,
                 "cached_tokens": row.get::<_, i64>(8)?,
-                "reasoning_tokens": row.get::<_, i64>(9)?,
+                "cache_write_tokens": row.get::<_, i64>(9)?,
+                "reasoning_tokens": row.get::<_, i64>(10)?,
             }))
         },
     )?;
@@ -441,38 +884,63 @@ fn build_overview(
         },
     )?;
 
-    // Totals must cover every model in the window: by_model below is capped at
-    // 20 rows for display, so summing it would under-count once more models
-    // are active. Cost is still priced per model before summing.
-    let mut total_cost = 0.0;
-    let mut total_savings = 0.0;
+    // Partition by each model's per-request context tier in SQL, then price the
+    // small set of aggregate buckets in Rust. This preserves exact tiering
+    // without moving every exchange across the SQLite boundary.
+    let mut cost_by_model: HashMap<String, (f64, f64)> = HashMap::new();
     {
+        let (tier_case, tier_values) = context_tier_case(conn, pricing, &cf, &base_values)?;
+        let mut cost_values = tier_values;
+        cost_values.extend(base_values.iter().cloned());
         let mut statement = conn.prepare(&format!(
-            "SELECT COALESCE(model,'(unknown)'),
+            "SELECT COALESCE(model,'(unknown)'), {tier_case} AS long_context,
                     COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                    COALESCE(SUM(cached_tokens),0), COALESCE(SUM(reasoning_tokens),0)
-             FROM exchanges WHERE ts_unix >= ?{cf} GROUP BY 1"
+                    COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                    COALESCE(SUM(reasoning_tokens),0)
+             FROM exchanges WHERE ts_unix >= ?{cf} GROUP BY 1, 2"
         ))?;
-        let rows = statement.query_map(params_from_iter(base_values.iter()), |row| {
+        let rows = statement.query_map(params_from_iter(cost_values.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(1)? != 0,
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?;
         for row in rows {
-            let (model, input, output, cached, reasoning) = row?;
-            total_cost += pricing.estimate_usd(&model, input, output, cached, reasoning, 0);
-            total_savings += pricing.cache_savings_usd(&model, cached);
+            let (model, long_context, input, output, cached, cache_write, reasoning) = row?;
+            let estimate = cost_by_model.entry(model.clone()).or_default();
+            estimate.0 += pricing.estimate_usd_for_context(
+                &model,
+                TokenUsage {
+                    input,
+                    output,
+                    cached,
+                    reasoning,
+                    cache_creation: cache_write,
+                },
+                long_context,
+            );
+            estimate.1 += pricing.cache_savings_usd_for_context(&model, cached, long_context);
         }
     }
+    let total_cost = cost_by_model
+        .values()
+        .map(|estimate| estimate.0)
+        .sum::<f64>();
+    let total_savings = cost_by_model
+        .values()
+        .map(|estimate| estimate.1)
+        .sum::<f64>();
     let by_model = {
         let mut statement = conn.prepare(&format!(
             "SELECT COALESCE(model,'(unknown)'), COUNT(*),
                     COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                    COALESCE(SUM(cached_tokens),0), COALESCE(SUM(reasoning_tokens),0),
+                    COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                    COALESCE(SUM(reasoning_tokens),0),
                     CAST(AVG(CASE WHEN outcome='ok' THEN duration_ms END) AS INTEGER),
                     SUM(outcome IN ('http_error','transport_error')),
                     SUM(outcome = 'cancelled')
@@ -484,17 +952,20 @@ fn build_overview(
                 let input: i64 = row.get(2)?;
                 let output: i64 = row.get(3)?;
                 let cached: i64 = row.get(4)?;
-                let reasoning: i64 = row.get(5)?;
-                let cost = pricing.estimate_usd(&model, input, output, cached, reasoning, 0);
-                let savings = pricing.cache_savings_usd(&model, cached);
+                let cache_write: i64 = row.get(5)?;
+                let reasoning: i64 = row.get(6)?;
+                let (cost, savings) = cost_by_model.get(&model).copied().unwrap_or_default();
                 Ok(json!({
                     "model": model,
                     "count": row.get::<_, i64>(1)?,
                     "input_tokens": input,
                     "output_tokens": output,
-                    "avg_ms": row.get::<_, Option<i64>>(6)?,
-                    "errors": row.get::<_, Option<i64>>(7)?.unwrap_or(0),
-                    "cancelled": row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                    "cached_tokens": cached,
+                    "cache_write_tokens": cache_write,
+                    "reasoning_tokens": reasoning,
+                    "avg_ms": row.get::<_, Option<i64>>(7)?,
+                    "errors": row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                    "cancelled": row.get::<_, Option<i64>>(9)?.unwrap_or(0),
                     "cost_usd": cost,
                     "cache_savings_usd": savings,
                 }))
@@ -626,34 +1097,6 @@ fn build_sessions(
     let (cf, cf_values) = client_filter(client);
     let mut base_values: Vec<SqlValue> = vec![SqlValue::from(since)];
     base_values.extend(cf_values.iter().cloned());
-    // Sessions can mix models (main model plus background helpers), so cost is
-    // priced per (session, model) split and then summed.
-    let mut costs: HashMap<String, f64> = HashMap::new();
-    {
-        let mut statement = conn.prepare(&format!(
-            "SELECT session_key, COALESCE(model,''),
-                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                    COALESCE(SUM(cached_tokens),0), COALESCE(SUM(reasoning_tokens),0)
-             FROM exchanges WHERE ts_unix >= ?1 AND session_key IS NOT NULL{cf}
-             GROUP BY session_key, model"
-        ))?;
-        let rows = statement.query_map(params_from_iter(base_values.iter()), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-            ))
-        })?;
-        for row in rows {
-            let (key, model, input, output, cached, reasoning) = row?;
-            *costs.entry(key).or_default() +=
-                pricing.estimate_usd(&model, input, output, cached, reasoning, 0);
-        }
-    }
-
     let mut statement = conn.prepare(&format!(
         "SELECT session_key, MIN(ts_unix), MAX(ts_unix), MIN(ts), MAX(ts), COUNT(*),
                 SUM(outcome = 'ok'), SUM(outcome IN ('http_error','transport_error')), SUM(outcome = 'cancelled'),
@@ -663,10 +1106,9 @@ fn build_sessions(
          FROM exchanges WHERE ts_unix >= ?1 AND session_key IS NOT NULL{cf}
          GROUP BY session_key ORDER BY MAX(ts_unix) DESC LIMIT 200"
     ))?;
-    let rows = statement
+    let mut rows = statement
         .query_map(params_from_iter(base_values.iter()), |row| {
             let key: String = row.get(0)?;
-            let cost = costs.get(&key).copied();
             Ok(json!({
                 "session_key": key,
                 "first_unix": row.get::<_, i64>(1)?,
@@ -684,10 +1126,54 @@ fn build_sessions(
                 "client_ip": row.get::<_, Option<String>>(13)?,
                 "models": row.get::<_, Option<String>>(14)?,
                 "client_tag": row.get::<_, Option<String>>(15)?,
-                "cost_usd": cost,
+                "cost_usd": Value::Null,
             }))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+
+    // Only the 200 sessions returned above need a cost. Pricing their member
+    // exchanges directly is exact and lets the session index avoid aggregating
+    // every historical session in the selected window.
+    if !rows.is_empty() {
+        let keys = rows
+            .iter()
+            .filter_map(|row| row["session_key"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        let placeholders = std::iter::repeat_n("?", keys.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut cost_values = base_values.clone();
+        cost_values.extend(keys.iter().cloned().map(SqlValue::from));
+        let mut costs: HashMap<String, f64> = HashMap::new();
+        let mut statement = conn.prepare(&format!(
+            "SELECT session_key, COALESCE(model,''),
+                    COALESCE(input_tokens,0), COALESCE(output_tokens,0),
+                    COALESCE(cached_tokens,0), COALESCE(cache_write_tokens,0),
+                    COALESCE(reasoning_tokens,0)
+             FROM exchanges WHERE ts_unix >= ?{cf}
+               AND session_key IN ({placeholders})"
+        ))?;
+        let mut cost_rows = statement.query(params_from_iter(cost_values.iter()))?;
+        while let Some(row) = cost_rows.next()? {
+            let key = row.get::<_, String>(0)?;
+            let model = row.get::<_, String>(1)?;
+            *costs.entry(key).or_default() += pricing.estimate_usd(
+                &model,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(5)?,
+            );
+        }
+        for row in &mut rows {
+            if let Some(key) = row["session_key"].as_str()
+                && let Some(cost) = costs.get(key)
+            {
+                row["cost_usd"] = json!(cost);
+            }
+        }
+    }
     Ok(json!({"sessions": rows}))
 }
 
@@ -701,7 +1187,8 @@ fn build_detail(conn: &Connection, pricing: &PricingTable, id: &str) -> rusqlite
                 b.resp_headers, b.resp_body, e.resp_bytes, e.resp_truncated,
                 b.agg_response, e.finish_reason,
                 e.input_tokens, e.output_tokens, e.cached_tokens, e.reasoning_tokens, e.preview,
-                e.session_key, e.session_hint, b.client_req_body, b.anthropic_response, e.client_tag
+                e.session_key, e.session_hint, b.client_req_body, b.anthropic_response, e.client_tag,
+                e.cache_write_tokens
          FROM exchanges e LEFT JOIN exchange_bodies b ON b.request_id = e.request_id
          WHERE e.request_id = ?1",
     )?;
@@ -714,7 +1201,16 @@ fn build_detail(conn: &Connection, pricing: &PricingTable, id: &str) -> rusqlite
     let output = row.get::<_, Option<i64>>(25)?;
     let cached = row.get::<_, Option<i64>>(26)?;
     let reasoning = row.get::<_, Option<i64>>(27)?;
-    let cost = cost_for(pricing, model.as_deref(), input, output, cached, reasoning);
+    let cache_write = row.get::<_, Option<i64>>(34)?;
+    let cost = cost_for(
+        pricing,
+        model.as_deref(),
+        input,
+        output,
+        cached,
+        cache_write,
+        reasoning,
+    );
     Ok(json!({
         "request_id": row.get::<_, String>(0)?,
         "ts": row.get::<_, Option<String>>(1)?,
@@ -743,6 +1239,7 @@ fn build_detail(conn: &Connection, pricing: &PricingTable, id: &str) -> rusqlite
         "input_tokens": input,
         "output_tokens": output,
         "cached_tokens": cached,
+        "cache_write_tokens": cache_write,
         "reasoning_tokens": reasoning,
         "preview": row.get::<_, Option<String>>(28)?,
         "session_key": row.get::<_, Option<String>>(29)?,
@@ -765,4 +1262,80 @@ fn collect_rows(
         .query_map(params_from_iter(values.iter()), |row| map(row))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Value::Array(rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+
+    #[test]
+    fn overview_prices_long_context_per_request_before_aggregation() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE exchanges (
+                request_id TEXT PRIMARY KEY,
+                ts TEXT,
+                ts_unix INTEGER,
+                model TEXT,
+                outcome TEXT,
+                status INTEGER,
+                duration_ms INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cached_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                reasoning_tokens INTEGER,
+                client_tag TEXT,
+                client_ip TEXT,
+                session_key TEXT,
+                session_hint TEXT
+            );",
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        for (id, input, output, cached, cache_write) in [
+            ("short-1", 200_000, 10_000, 50_000, 0),
+            ("short-2", 200_000, 0, 0, 0),
+            ("long", 300_000, 20_000, 100_000, 10_000),
+        ] {
+            conn.execute(
+                "INSERT INTO exchanges (
+                    request_id, ts, ts_unix, model, outcome, status, duration_ms,
+                    input_tokens, output_tokens, cached_tokens, cache_write_tokens,
+                    reasoning_tokens, client_tag, session_key, session_hint
+                 ) VALUES (?1, datetime(?2, 'unixepoch'), ?2, 'openai/gpt-5.6-luna',
+                           'ok', 200, 1, ?3, ?4, ?5, ?6, 0, 'test', 'session-1', 'hint')",
+                params![id, now, input, output, cached, cache_write],
+            )
+            .unwrap();
+        }
+
+        let overview = build_overview(&conn, &PricingTable::default(), 24, None).unwrap();
+        let total_cost = overview["totals"]["cost_usd"].as_f64().unwrap();
+        let model_cost = overview["by_model"][0]["cost_usd"].as_f64().unwrap();
+        let savings = overview["totals"]["cache_savings_usd"].as_f64().unwrap();
+
+        assert_eq!(overview["totals"]["count"], 3);
+        assert_eq!(overview["totals"]["cache_write_tokens"], 10_000);
+        assert!((total_cost - 0.208).abs() < 1e-9);
+        assert!((model_cost - 0.208).abs() < 1e-9);
+        assert!((savings - 0.045).abs() < 1e-9);
+
+        let one_pass = build_overview_one_pass(&conn, &PricingTable::default(), 24, None).unwrap();
+        assert_eq!(one_pass["totals"]["count"], overview["totals"]["count"]);
+        assert_eq!(
+            one_pass["totals"]["input_tokens"],
+            overview["totals"]["input_tokens"]
+        );
+        assert_eq!(one_pass["series"], overview["series"]);
+        assert_eq!(one_pass["by_model"], overview["by_model"]);
+        assert_eq!(one_pass["by_status"], overview["by_status"]);
+        assert_eq!(one_pass["by_client"], overview["by_client"]);
+
+        let sessions = build_sessions(&conn, &PricingTable::default(), 24, None).unwrap();
+        assert_eq!(sessions["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(sessions["sessions"][0]["session_key"], "session-1");
+        assert!((sessions["sessions"][0]["cost_usd"].as_f64().unwrap() - 0.208).abs() < 1e-9);
+    }
 }

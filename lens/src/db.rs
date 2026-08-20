@@ -45,6 +45,7 @@ impl Db {
                input_tokens      INTEGER,
                output_tokens     INTEGER,
                cached_tokens     INTEGER,
+               cache_write_tokens INTEGER,
                reasoning_tokens  INTEGER,
                preview           TEXT,
                session_key       TEXT,
@@ -97,8 +98,8 @@ impl Db {
 const EXCHANGE_COLUMNS: &str = "request_id, ts, ts_unix, upstream_url, format, model, stream,
     client_ip, route_mode, req_bytes, req_truncated, outcome, status, duration_ms, complete,
     protocol_complete, cancel_stage, error_message, resp_bytes, resp_truncated, finish_reason,
-    input_tokens, output_tokens, cached_tokens, reasoning_tokens, preview, session_key,
-    session_hint, updated_at, client_tag";
+    input_tokens, output_tokens, cached_tokens, cache_write_tokens, reasoning_tokens, preview,
+    session_key, session_hint, updated_at, client_tag";
 
 /// Body columns that used to live in `exchanges` and now form `exchange_bodies`.
 const BODY_COLUMNS: [&str; 6] = [
@@ -131,6 +132,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         ("session_hint", "session_hint TEXT"),
         ("updated_at", "updated_at INTEGER"),
         ("client_tag", "client_tag TEXT"),
+        ("cache_write_tokens", "cache_write_tokens INTEGER"),
     ] {
         if !existing.iter().any(|column| column == name) {
             conn.execute(
@@ -238,6 +240,10 @@ mod tests {
             for moved in BODY_COLUMNS {
                 assert!(!names.iter().any(|name| name == moved), "{moved} still on exchanges");
             }
+            assert!(
+                names.iter().any(|name| name == "cache_write_tokens"),
+                "new usage columns must be added before the legacy table is rebuilt"
+            );
             // Bodies moved across intact.
             let (req, resp, agg): (String, String, String) = conn
                 .query_row(
